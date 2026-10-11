@@ -10,6 +10,18 @@ Idempotent: run it after every codegen.
 import pathlib, sys
 
 path = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "generated/rexglue.cmake")
+
+# The PS5's 16 KB pages: like Windows and arm64 macOS, guest addresses from
+# 0xE0000000 sit 0x1000 higher in host memory (rex::memory::detail::
+# PhysicalHostOffset). Older codegen templates leave the PS5 out.
+pch = path.parent / "default" / "svr2011_pch.h"
+if pch.exists():
+    t = pch.read_text()
+    old = "#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)\n"
+    if old in t:
+        pch.write_text(t.replace(old, "#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64) || REX_PLATFORM_PS5\n"))
+        print(f"{pch}: 0xE0000000 host offset on the PS5")
+
 s = path.read_text()
 if "[ps5 port]" in s:
     print(f"{path}: already patched")
