@@ -1,0 +1,271 @@
+# WWE SmackDown vs. Raw 2011 PC Port: features
+
+Everything the port adds to the game, as of v2.0.2 (4 October 2026).
+"New in 2.0" marks what this release adds; "Experimental" marks what is
+still being tested.
+
+## Platforms
+
+- **Windows** PC: the recompiled game, Direct3D 12 (or Vulkan: *Experimental*).
+- **Steam Deck / Linux** through Proton: Deck defaults, updates without `tar.exe`.
+- **Android** phones and tablets (arm64, Vulkan): the APK is released beside the PC game and is all a player needs (it installs the game from their own disc image on the phone), landscape only, 720p default render scale on phones. Runs the screen at 60 Hz on 120 Hz phones. *(60 Hz: new in 2.0.)*
+- **Laptops with two GPUs** use the fast GPU, and one GPU for both renderers.
+
+## Graphics and performance
+
+- **Native renderer**: the game's Direct3D calls drawn on plume (Direct3D 12 or Vulkan) instead of the emulated Xenos GPU. Falls back to the emulated renderer when stuck or when its shaders are missing.
+- **Resolutions** from 720p (the console's) to 4K, anti-aliasing, VSync, steady 60 fps.
+- **FRAME RATE** (*30 fps: Experimental*): 30 or 60 fps (DISPLAY tab and the launcher's Settings). The game always runs its own 60 Hz timing (its world steps once per 60 Hz tick, drawing once a frame), so speed and physics stay right at 30 fps and on a slow PC. 30 applies in matches; menus always run at 60. VSync off no longer makes the game run too fast. *(New in 2.0; 9e529d3, 224faa9, 0b15618.)*
+- **60 fps entrances and cutscenes** (the game's 30 fps scenes run its own 60 fps mode), optional.
+- **Any screen shape**: matches and entrances fill ultrawide, 16:10, Steam Deck and foldable screens. Menus stay 16:9.
+- **GRAPHICS page** in game: *My WWE → Options → Graphics*, DISPLAY and QUALITY tabs.
+- **Display modes**: WINDOWED, BORDERLESS and FULL SCREEN (exclusive); **F11** switches window / full screen. *(New in 2.0.)*
+- **Sharp wide shots**: the game's own soft filter (made for 720p) blurred wrestlers in wide shots at higher resolutions; off by default, with a SOFT FILTER option to bring it back. *(New in 2.0.)*
+- **DEPTH OF FIELD** and **MOTION BLUR** options (QUALITY tab). *(New in 2.0.)*
+- **Shader work done ahead**: compiled pipelines saved between runs (D3D12 pipeline library, Vulkan pipeline cache), the 298 known pipelines built in the menus with a progress bar ("Prepare graphics"), and shaders shipped as one pack file per API. *(New in 2.0.)*
+- **Performance work**: XMP 10 ms throttle removed (39 to 60 fps), GPU waits yield the CPU, cheaper register writes, threaded command recording on phones, cheaper per-draw work in heavy entrances, texture checks back off.
+- **Entrance frame drops fixed**: since v1.0.3, entrances could fall to single digits as they started (graphics copied back to the game's memory that it never reads); now only the images the game reads are copied. *(New in 2.0.)*
+- **Rendering fixes**: Superstar Threads attire colours, saved outfits, Tyson Kidd's portrait, MATCH HIGHLIGHTS free space.
+- **Created Superstar portraits**: FINALIZE now stores a real portrait (they were black or garbled), so menus and Community Creations previews show the superstar. *(New in 2.0.)*
+- **Custom GPU drivers on Android** (*Experimental*; Mesa Turnip and Qualcomm packages through libadrenotools), with crash and start-up checks that fall back to the phone's driver. *(New in 2.0.)*
+- **Frame-time logs**: median / slow-frame figures every 5 s, and on phones the thermal state and CPU clocks (for stutter reports). *(New in 2.0.)*
+
+## Game additions
+
+- **User entrance music**: *Create An Entrance → Music → USER PLAYLIST* plays songs from the `Music` folder, on Windows and Android. *(Android: new in 2.0.)*
+- **User entrance movies**: *Create An Entrance → Movie → USER MOVIES*, any video turned into a Bink titantron movie by the launcher's movie maker; movies fill the big screen, with the superstar's bottom strip.
+- **10 HD logos** per Created Superstar instead of 2 (`Saves\.logos`).
+- **Paint Tool: 10 pages of 20 logos** (200 instead of 20); grid edges change pages, the Superstar logo picker scrolls all pages. *(New in 2.0.)*
+- **Divas against male superstars**: pick a diva, switch back to WWE SUPERSTARS and pick a man; the match plays normally. *(New in 2.0.)*
+- **Managers playable**: the "?" tile on character select is now an **M** tile named EXTRA; it opens a list of Stephanie McMahon, Theodore Long, Hornswoggle, Paul Bearer and Tiffany (instead of the random pick), and they wrestle full matches. *(New in 2.0.)*
+- **More match types** in the PLAY menus: Falls Count Anywhere (1v1, tornado tag, triple threat, fatal 4-way), 15- and 25-man Royal Rumble, 6-man Lumberjack, Backstage brawls for triple threat, fatal 4-way and 6-man (7 areas), and **FREE-ROAMING BACKSTAGE** (Road to WrestleMania's whole backstage, all rooms, with a closer backstage camera; *Experimental*) in every BACKSTAGE list. *(New in 2.0.)*
+- **Replays can be switched off**: REPLAYS (DISPLAY tab) skips the instant replays after finishers and the highlights at the end of a match. Highlights that stall (seen on a Steam Deck: a won match never ended) are skipped after 8 s. *(New in 2.0.)*
+- **Five languages**: English, French, German, Spanish, Italian, in the launcher and in game; **LANGUAGE** has its own entry in *My WWE → Options*. *(Own entry: new in 2.0.)*
+- **Achievements page**: *My WWE → Achievements*, console-style, tracked by the port. Since it was added, B did nothing in *My WWE → Options*; fixed, existing installs are repaired at start-up. *(Fix: new in 2.0.)*
+- **DLC** counts as fully licensed (Bret Hart and the rest).
+- **Discord Rich Presence**: menus, entrances, matches.
+
+## Online *(new in 2.0)*
+
+- **Online matches, peer to peer**: Player Matches between games with no server needed on a LAN; over the internet a direct connection first (each game's public address; a **Friends** list of addresses in the launcher's Online tab), else through the server's relay, going direct as soon as it can. Both games step the match together (lockstep). Created Superstars, with their Paint Tool logos, can be used in online matches (63aabc9). Tested: two games on one PC, and PC <-> phone through sho-ti.me. ***Experimental*** *(leaderboards on the server to come).*
+- **Community Creations** works again on the port's own server (https://sho-ti.me/svr), with player accounts (name and password).
+- Upload and download Created Superstars (with their extra logos), Paint Tool logos (all 200 slots), highlight reels and more.
+- **Superstars bring their entrance**: an uploaded Superstar carries its custom song and entrance movie (shrunk for upload); downloads put them in `Music` and `Custom Movies`. Movies on Android: not yet tested on a phone.
+- The game's GameSpy traffic goes through a relay in the port; Android uses its own https bridge.
+- Xbox LIVE texts and prompts removed from the menus.
+- Server: `port/server/server.py`, with an admin dashboard and the match relay (`relay.py`).
+
+## Input
+
+- **Keyboard controls**: the PC keyboard plays as player 1 (alongside a controller). *(New in 2.0.)*
+- **Type on the PC keyboard** wherever the game shows its on-screen keyboard.
+- **Ctrl+C / Ctrl+V in Story Designer lists**: copy the moment, show or moment group under the cursor and paste it at the cursor (a moment on ADD is added at the end), as the game's own COPY/PASTE does, with a short notice. *(New in 2.0.5.)*
+- **Ctrl+V / Ctrl+C in text fields**: paste the PC clipboard into the game's on-screen keyboard (story and superstar names...; accented letters and curly quotes typed as plain ones, kept to the field's length), or copy the field's text out. *(New in 2.0.5.)*
+- **Story Designer copy and paste** (the game's own): press A on a moment for MOMENT MANAGEMENT - COPY/PASTE, COPY/PASTE MULTIPLE (several moments into another show or path), DELETE, INSERT; shows and moment groups have a copy too. Divas and male superstars can share scenes and matches (*mixed gender*). *(Mixed gender in Story Designer: new in 2.0.5.)*
+- **On-screen touch controller** (Android default, any touch screen): MENU and MATCH layouts that switch automatically, an editor to rearrange it, and a **KEYBOARD** button that opens the phone's keyboard while the game's keyboard is up. Hidden as soon as a real controller is connected, with any controller backend; a touch shows it again for 15 s. *(KEYBOARD, controller hiding on every backend: new in 2.0.)*
+- Controllers through SDL.
+
+## Saves
+
+- Every save is a **plain file** in `Saves` (headers in `Saves\.info`), easy to back up and share; old saves are moved over automatically.
+- Copied saves without headers load again.
+
+## Launcher (Windows)
+
+- **Install** from the Xbox 360 disc image (ISO / XISO) or a game package.
+- **Updates itself** from GitHub releases.
+- **Settings**: renderer, resolution, VSync, input, audio, FPS counter, language, "Prepare graphics in the menus".
+- **Online tab**: sign in, create an account, sign out; Server: Default or Custom; **Friends** (addresses to find for online matches). *(New in 2.0.)*
+- **Saves**: backups, export, import, delete, and the **saves folder** (keep two installs' saves apart or shared; `saves_folder` in `svr2011.toml`, read by the game too). *(2.0.1.)*
+- **DLC**: add packages or folders, checked before install.
+- **Paint Tool**: the 10 pages of logos, import any image, export PNGs.
+- **Movies**: the movie maker for custom entrance movies.
+- **Android**: install over USB, or **Create APK Package** (the game and the app in one folder).
+
+## Android app *(new in 2.0)*
+
+- A launcher on the phone with the same tabs as the PC one: Play, Settings, Online, Saves, Paint Tool, DLC, Movies, Install, plus updates and the Graphics driver choice.
+- Installs the game from a disc image or a package on the phone.
+
+## New in 2.0.6
+
+- **Camel clutch crash fixed** (and stray "teleports"): with Sabu, the Sandman or another mod that adds submissions or taunts, any superstar's camel clutch could stretch both wrestlers into spikes and crash the game - the move-pack merge shifted the game's own submission / taunt motions out of place. New motions now go after the game's own (existing merges rebuild once).
+- **The Sandman bundled** (from SvR 2008): his model and official renders, theme, titantron, a 69-move set with his two 2008 finishers, and his **crowd entrance** - walking through the crowd with a beer can and the Singapore cane, as in SvR 2008 (mods can now add whole entrances: move-pack `pacentry` lines, built into an overlay copy; the game's files are never changed).
+- **Direct3D 11** for PCs whose graphics card or driver can't run Direct3D 12 or Vulkan: DX11 cards (feature level 11) and older DX10 cards (feature level 10, e.g. GeForce 8-300 / Radeon HD 2000-4000 era, untested on real hardware), and Windows 8.1. The graphics API AUTO tries Direct3D 12, then Vulkan, then Direct3D 11; or pick DIRECT3D 11 in GRAPHICS → DISPLAY → GRAPHICS API or the launcher's Settings. It renders at 1x by default there (2x-4x can still be chosen). Windows 7 isn't supported.
+- **72 superstar mod slots** (was 50), using more of the game's blank superstar records.
+- **Superstar height** (`height=` in a mod, 0.80-1.25; the Mod Maker's Superstar page has a slider with a live preview) - for converted superstars that came out the wrong size.
+- **SvR 2010 superstars' moves that leave the opponent on the mat** (e.g. Jeff Hardy's Hurricanrana 8) keep them down like the game's own moves - they got straight back up; 15 bundled superstars updated. When two packs carry the same move, the first one read now always wins, and the log names which.
+- **SvR 2010 superstars' corner moves**: moves on an opponent sitting in the corner (e.g. Umaga's Running Knee) no longer lift them above the turnbuckle; 17 bundled superstars updated.
+- **Three Stages of Hell after REMATCH** starts again at fall 1 (a rematch kept the last match's score and ended after one fall), and each new stage is announced in the middle of the screen ("FALL 2 - FALLS COUNT ANYWHERE").
+- **The port's match HUD looks like the game's own** (a slanted black panel with a white rim and a red edge, bold italic text) and only shows while the match is running - not on the select or versus screens, in entrances, replays, pauses or end screens. A Universe run-in waiting outside no longer counts as a side in the score.
+- **Mystery Opponent**: the "?" picture can't stay on screen into the match (it waited for an entrance sound that doesn't always play).
+- **The M tile on the character select reads MODS** (was EXTRA).
+- **SmackDown 1999 arena 1.1**: the barricade's four corners are joined again (they were squashed, leaving gaps where the stands showed through); the WWE '13 arena converter fixed.
+- **Weapons Everywhere: CPUs wrestle too** - after using a weapon a CPU waits 25 s before going for another (they had kept re-arming all match).
+- **Lumberjacks keep attacking** a wrestler who stays on the floor (at most one attack every 3 s; each lumberjack rests 6 s) - they stopped after two before.
+
+## New in 2.0.5
+
+### Matches
+- **Three Stages of Hell** in every mode (ONE ON ONE, TWO ON TWO, TRIPLE THREAT, FATAL-4-WAY → EXTREME RULES; 6-MAN and HANDICAP rows): best of three falls in one match - a normal fall, then Falls Count Anywhere, then Last Man Standing (in 6-man: No Disqualification) - with the damage carried through and every side's score at the top of the screen. In team matches a fall counts for the team that scored it.
+- **Championship Scramble** (FATAL-4-WAY): the game's own cut match, restored. Pick the title, five superstars take part, a new one enters every minute, whoever scores a fall becomes the interim champion, and whoever holds the title at the 5:00 bell after the last entry wins.
+- **Mystery Opponent** (ONE ON ONE → NORMAL MATCH → MYSTERY OPPONENT): the CPU picks your opponent in secret. It shows as "?" on the select, VS and loading screens and is revealed when it comes out last in the entrances, which can't be skipped.
+- **Elimination** in TRIPLE THREAT and FATAL-4-WAY (normal, Falls Count Anywhere, Extreme Rules): a pin or give up eliminates that wrestler, who leaves, and the match goes on until one is left.
+- **Match Creator: everything allowed**: every greyed-out option is free in every match type, as far as the game engine can play it. Combinations that crashed or froze in a 240-match test stay locked: over the top rope in tag / 6-man, the inferno ring outside normal 1v1 / Triple Threat / Fatal 4-Way, cage / cell / inferno rings and new win conditions in ladder / TLC, the chamber ring, Royal Rumble, Elimination Chamber and backstage.
+- **Lumberjacks attack**: a wrestler who lands on the floor is grabbed by the nearest lumberjacks (two at most) and slammed or thrown down; their interference no longer ends the match by DQ.
+- **Weapons Everywhere in every mode** (also TWO ON TWO, TRIPLE THREAT, FATAL-4-WAY, 6-MAN and HANDICAP): weapons lying in and around the ring at the bell, no disqualification (6-man: chairs and hand weapons only).
+- **Weapons Everywhere: the CPU uses the weapons lying around** (chairs, trash cans, guitars, ladders, tables) instead of walking past them to search under the ring; it searches under the ring only when nothing is near.
+- **Match types as mods**: each match type the port adds (Falls Count Anywhere, Championship Scramble, 15 / 25-man Royal Rumble, Lumberjack, Free-Roaming Backstage, Backstage for 3 / 4 / 6, Weapons Everywhere, Slobber Knocker, Three Stages of Hell, Elimination, Mystery Opponent) is a bundled mod on the Mods tab, switched on. Untick one and its rows leave the menus at the next start, with no gaps.
+
+### Arenas and mods
+- **The Mod Maker** (launcher → Mods → Open Mod Maker): make your own **arenas** (a 3D arena editor), **backstage rooms**, **superstars**, **move packs**, **crowd signs**, **media packs** and **match type** switches as `.svrmod` files, saved as projects you can reopen. It also browses the game's files (textures, models, motions, text), plays the game's animations, exports renders and icons, swaps your Created Superstars' pictures, and converts WWE '13 arenas / superstars, SvR 2010 superstars and moves and SvR 2008 backstage areas. A manual is built in.
+- **Made with** column on the Mods tab: each mod says what made it (Mod Maker, the port's tools) - or **non-Mod Maker** for mods made some other way.
+- **Bigger title belts**: championship belts are 1.2x their old size (they looked small on this game's superstars), in entrances, on the shoulder or waist and in hand; `title_belt_scale` (1.0 = the original size).
+- **Sabu bundled** (from SvR 2008): his model with two attires (including the turban), renders, theme, titantron and his SvR 2008 moves as a move pack, with 2011's own Sabu entrance; installed switched off like the other bundled superstars.
+- **Practice Arena**: the training ring from the start of the game, as a real arena on the DOWNLOADED ARENAS page (empty seats; installed switched off like the other bundled mods).
+- **Three more WWE '13 arenas bundled**: SmackDown 1999, Royal Rumble 1998 and King of the Ring 1998 (installed switched off).
+- **Arena mods**: VS-screen theme pictures of any size can be swapped.
+- **Texture packs and dumps** (like Dolphin's; the launcher's Texture packs tab, Android's Settings): dump the game's textures as PNGs named after the game's own texture names, and load packs of replacements (PNG or DDS, any resolution); you choose which pack wins.
+
+### Menus and graphics
+- **Graphics menus reorganised** (MY WWE → OPTIONS): **CONTROLS** has its own row above GRAPHICS, and the GRAPHICS page has three tabs - DISPLAY, GRAPHICS and **ADV. GRAPHICS**:
+  - **Crowd on / off** for every device (it was Mali-only): OFF plays arenas with empty seats - faster on weak PCs and phones (from the next start; the crowd-less copies are made once in the background).
+  - **Shadows on / off** for every device: OFF skips the real-time shadows (about 70 fewer draws a frame); Mali mode turns them off by itself.
+  - Effect detail, depth of field, motion blur, soft filter and prepare graphics moved there.
+  - **480p**: an 854 x 480 window, and 360P / 480P render resolutions (the scene drawn smaller and scaled up, for weak devices).
+- **Texture quality** (GRAPHICS → GRAPHICS → TEXTURES, and both launchers' Settings): MEDIUM / LOW use the game's own half / quarter-size copies of big textures - less memory and faster loading; menus and text stay sharp. Changes apply at once.
+- **BACKGROUNDS** (MY WWE → OPTIONS → BACKGROUNDS): switch each of the main menu's 12 background pictures on or off; the menu moves on to the next one that's on after every match or mode (all off: all play).
+- **Fast start**: skip the logo movies at launch (straight to the Start Screen) and / or the practice ring after it (straight to the main menu). Both off by default; on the launcher's Play tab, in the Android app's settings (Game) and in GRAPHICS → DISPLAY → FAST START.
+- **MY MUSIC** (MY WWE → JUKEBOX): the songs in your Music folder play in the menu shuffle with the game's own songs, or instead of them (switch songs on / off as usual). On PC and Android.
+- **Shift, Ctrl or Alt alone as a control** (MY WWE → OPTIONS → CONTROLS: tap it while the page waits for a key), e.g. Shift to run; holding it doesn't block the other keys.
+- **Copy and paste with the keyboard**: Ctrl+V pastes the clipboard into the game's text fields and Ctrl+C copies a field's text. In the Story Designer, Ctrl+C / Ctrl+V also copy and paste moments, shows and moment groups.
+- **Story Designer: Divas and male superstars together** (with mixed-gender matches on, the default): mixed matches and scenes are allowed, and both are offered in the superstar lists.
+- **Community Creations: your own stories upload** (they were refused as "created by a different player"; only downloaded stories are now).
+
+### Launcher and Android
+- **The launcher shows who made it and where it's free** (PC and Android): "Launcher - Version … - By KaikoClanworth - Download free at github.com/KaikoClanworth1/wwe-svr2011-pc", with the link one click / tap away.
+- **Report a problem asks what happened** (PC and Android): what kind of problem, how often, what happened and what you were doing just before; the report carries that description and tells you to post it as a new thread in the Discord's **bug-svr11** forum.
+- **Android installs the bundled mods itself**: after the disc install, after an update, or from the Mods tab's Get bundled mods (the release's SvR2011-Mods zip); new bundles come switched off except the match types, and your choices are kept. The Mods tab's switches are red when on.
+- **Android 10 and 11** phones and tablets are supported (Android 12 was needed before), as are tablets on older Linux kernels, and the game folder can be in the app's own storage (an SD card used as internal storage).
+- 🧪 **Mali GPUs** (older drivers): the Native renderer runs there; Mali mode plays arenas without the crowd and shadows, at half resolution with low textures, so a Mali-G52 tablet plays matches at about 23 fps (it couldn't before; the first start makes the crowd-less arena copies once, about a minute). Android builds are tuned for Cortex-A53 CPUs.
+- **Touch controls** draw on top of the port's own pages (GRAPHICS, JUKEBOX, ACHIEVEMENTS...), and quick taps count.
+
+### Fixes
+- **Several controllers: whoever presses START plays with the profile** - pressing START on a second pad or the keyboard at the title screen no longer says "You are not currently signed in with a profile"; that controller becomes player 1 (saves and achievements work) and the others stay players 2-4.
+- 🧪 **A freeze mid-match** (the match stops moving; seen most at 30 fps, on phones and in big matches such as Royal Rumbles): a timing race in the game's own per-character job system lost a request when the game ran extra updates to catch up. The lost request is now noticed and asked for again.
+- **Universe with superstar mods**: Universe no longer books superstar mods (their ids ran past its 150-superstar table into the rivalries and match cards - the likely crash); mods stay playable everywhere else. Resetting Universe clears mod data an older save holds.
+- **Fatal 4-Way / Triple Threat Elimination crash**: when a wrestler was eliminated, a CPU still aiming at them could crash the match.
+- **Replays and match highlights at 30 fps** no longer freeze the picture (the wrestlers stood still while the sound went on).
+- **Pin counts at 30 fps / on slow PCs and phones**: a referee's count no longer stops partway when the game runs two updates a frame.
+- **Arena select pages**: all 20 banners show at once after a page turn, and opening the arena select again after a pick starts at page 1 with the right arenas (tiles showed the wrong ones).
+- **SvR 2010 superstar mods hit properly**: some strikes made no impact sound or reaction (and many stock moves above them lost their hit data); every bundled SvR 2010 superstar is fixed.
+- **SvR 2010 superstars under damage**: their neck, chest and shoulders no longer darken all over as they take damage (a "tank top").
+- **Superstars the included mods are built from are selectable again** (Stone Cold, Matt Hardy, Mr. McMahon, William Regal and the others). Saves made by 2.0.3 / 2.0.4 are fixed as they load.
+- **Create a Team** lists real superstars again (mods made it show nameless "DEFAULT" generics).
+- **One Hurricane**: the bundled Hurricane mod (a second select tile without his video, intro or music) is retired, and copies installed by 2.0.4 are switched off once. The Hurricane under the M tile stays.
+- **Backstage mods** no longer crash the match load when a move pack is installed.
+- **Arena mods can't damage the game's own arena files any more**: a custom arena on another arena's slot could, in rare cases, write through to that slot's original file in `pacg` (e.g. bg06.pac). If an arena looks wrong, run Verify game files in the launcher to repair it.
+- **Superstar Threads**: a painted attire the game builds again after a match is no longer drawn with parts of the earlier build.
+- **Everything unlocked again for players who played 2.0.1 / 2.0.2 online**: a leftover Online Axxess package kept the Fan Axxess unlocks from applying; it is removed at start.
+- **AMD graphics cards on Vulkan**: the Native renderer uses 32-bit float depth where AMD's driver has no 24-bit depth + stencil buffer (it couldn't start before).
+- **Older Windows 10 (1809 / LTSC 2019)** starts on Vulkan when the graphics API is on its default (Direct3D 12 here needs Windows 10 2004 or newer).
+- **Android with the graphics API set to anything but Vulkan** (e.g. "any" copied from a PC config) now starts on Vulkan.
+- **USER MOVIES with accents in the name** (e.g. "Peña") now show in Create An Entrance; the titantron makers give a clear message when something fails.
+- **No internet addresses in logs or report zips**: IP addresses are masked in the game's logs and blanked in Report a problem zips.
+
+## New in 2.0.4
+
+- **Bundled mods come switched off**: a fresh install (or a bundle new to this game folder) installs them unticked on the Mods tab; tick the ones you want. An update of a bundled mod keeps its on / off.
+- **Your installed copies of the port's mods are kept up to date**: when an update brings a newer version of a bundled mod you already have (even one you installed by hand), it's installed over yours and stays on or off as you had it. A copy newer than the port's is left alone.
+- **Everything unlocked from the start - now your choice** (launcher, Settings, Game: *Everything unlocked from the start*; on by default, as before): off, the locked superstars, arenas and items unlock as you play, as on a console without the Fan Axxess bonus. All DLC stays (its superstars, arenas, costumes, Bret Hart). Works with your existing save too; turn it back on any time. `unlock_everything` in the settings file.
+- **Create A Moveset no longer crashes on SvR 2010 superstars** (Jeff Hardy and the others): their moves show in the editor's lists, and a move the editor can't find no longer crashes it.
+
+## New in 2.0.3
+
+- **Bring your Xbox 360 save over** (launcher, Saves tab: *Import Xbox 360 save...*): pick the 360 save folder (5451085D, from a USB drive or a save download) and its saves - Created Superstars, Paint Tool logos, replays, created content and the main save - go into a save preset of their own (3a55cc3).
+- **Import someone else's Created Superstar** (launcher, Saves tab: *Import Superstar...*): pick their .cas files (from a PC save or an Xbox 360 save, as they are) and each goes into a free slot; its Paint Tool logos are added to free Paint Tool slots (logos you already have are left out). Your saves are backed up first (09f38fe).
+- **Save presets** (launcher, Saves tab): whole sets of saves to switch between (a 360 save, a fresh start, ...); *New...* starts one empty or as a copy of the saves in use (3a55cc3).
+- **Verify game files** (launcher, Install tab): checks every file the game disc installed against the disc's sizes and checksums, with a green tick when they're all fine. Damaged files (a bad copy or extraction - they can crash the game while it loads) are listed; **Repair** sets them aside so **Install** copies them again (Install skips files that already have the right size). `--verify <game folder>` does the same without a window.
+- **Jukebox** (*My WWE → Jukebox*): turn each of the 19 menu songs (10 original entrance themes, 9 menu themes) on or off; the menus then only play songs that are on (a song turned off while it plays stops, and another starts), and with all off they're silent. **Preview** (X) plays the chosen song now. It shows the song playing now. Saved as `jukebox_off` in the settings file. Song names are the soundtrack rips' (the game has none).
+- **M tile in Match Creator** opens the managers list too (it gave a random superstar) (e5bd675).
+- **Finisher freezes and won matches with no ending fixed** (Android, slower devices; Steel Cage, Match Creator and others): on frames with two world updates the characters' job could start twice; now once a frame, as on the console. Tested at simulated phone speed (2f1233e).
+- **Match-end logging**: each step of the ending is logged, and a step waiting over 10 s says what it waits on; the match line has the right names; FULL SPEED is in the settings line (2f1233e).
+- **Won matches that never ended, fixed for real** (Steel Cage escape and others, Android): the replay helper ran only one of two jobs sent before it woke, and the ending waited forever on the other; it now runs every queued job. Tested on the Fold (c3fb4da).
+- Safety net: if the ending still waits 8 s on the replay helper, it goes on without it (no highlight clips that match) (282aa39).
+- A guard for a rare crash at 30 fps on PC (untested against the crash itself) (2f1233e).
+- **Built-in graphics drivers for Adreno 710 / 720 / 722** (Android): two Mesa Turnip drivers that players found run the game well (vauzi's v4.1, recommended, and v4.0) come with the app. On those GPUs the launcher offers v4.1 once by itself, and **Settings, Graphics driver** has a button for each. These phones' own drivers are often too old for the Native renderer (a Redmi Pad Pro's Adreno 710 driver: Vulkan 1.1), so they ran the slower Emulated one. The launcher shows the phone's GPU there, and problem reports include it (8d2b399; `port/android/drivers/README.md`).
+- 🧪 **Mali GPUs: alpha mode** (Android, untested - no Mali phone yet): a **Mali GPU (alpha)** card in Settings, and Play asks to turn it on first. It turns off the emulator's need for geometry shaders and line drawing, which Mali lacks; without that the game couldn't start at all. The Native renderer decodes DXT textures on the CPU on GPUs that can't read them (Mali). Every log now has a **GPU report** (device, features, formats) that tells what a GPU is missing (ff90d80, 8d2b399).
+
+- **Mods**: a **Mods** tab in the launcher installs mods (.svrmod): custom **arenas** (with their own VS screen, ring and ropes), **superstar mods** (72 slots, theme and movie, shown with a MODDED badge), **crowd sign** packs and **media** packs (themes, videos). Mods live in `Mods\` (Arenas, Superstars, Signs, Media). Bundled: 22 superstars (SvR 2010 ports, Hornswoggle) and the RAW IS WAR arena (WWE '13). The Mod Maker came in 2.0.5; the SvR 2008 backstage areas aren't released yet. Docs: `port/docs/ARENA_MOD_MAKER_PLAN.md`, `SUPERSTAR_MODS.md`, `CROWD_SIGNS.md`, `MEDIA_MODS.md`.
+- The M tile's EXTRA list: Stephanie McMahon, Theodore Long, Paul Bearer, Tiffany and The Hurricane (Hornswoggle removed: broken).
+
+## New in 2.0.2
+
+- **FULL SPEED** (GRAPHICS → DISPLAY; on by default, as before): off, the game makes one world update a frame like the Xbox 360, so a device that can't reach 60 slows down instead of catching up (30 FPS then plays at half speed). A workaround to try for the remaining freeze on some phones (31234c4).
+- **Freeze reports**: the thread dump a freeze writes no longer faults (it flooded 2.0.1 Android logs), so the next freeze log shows which thread holds it (57975df).
+
+- **ONLINE overlay on Android**: an ONLINE button in the touch MENU layout (beside EDIT) opens it (d592e58; not yet tried on a phone).
+
+## New in 2.0.1
+
+- **Character select texture flashes fixed**: moving the cursor could show the next superstar for a moment with the last one's textures (Jimmy Snuka in John Cena's jeans).
+
+- **ONLINE overlay** (F1, or BACK + RB; or X INVITE FRIENDS in a lobby): friends with who's online, invites to public or private sessions, and accepting them (the session comes first in CUSTOM MATCH search) (7861d84; the live server needs a restart for invites).
+
+- **Freeze fix**: entrances and finishers could freeze for good on slower PCs and phones (a deadlock in 2.0's 60 Hz timing when a frame needed extra world updates); fixed (c181189).
+- **Keyboard controls page**: *GRAPHICS → CONTROLS* rebinds every input (add a key, clear, reset to defaults), saved and applied at once; works with a pad too (7feb9b8).
+- **Better logs and problem reports**: the log starts with the version, build and settings; crashes are written into the log; Android now has crash reports; menu choices are logged by name; freezes dump every game thread; each match logs its rule, arena and wrestlers; **Report a problem** (launcher Play tab and the Android app) makes one zip of the logs, crash reports and settings, without the online password (a09766e, c181189).
+
+- **Friends list** in the launcher's Online tab (PC and Android): add / remove friends, see who's online, in an online match or offline (195917e; server /api/friends, eb2e1e9).
+- **Online logos fixed**: a Created Superstar's extra High Resolution logos now come from its owner when the server supplies the Superstar (6178e5e).
+- **Community Creations uploads**: multi-part uploads (2 MB parts) were always refused; fixed. **Server dashboard** (/svr) shows its totals and relay metrics again (eb2e1e9; the live server needs a restart).
+- **Lumberjack (partly)**: now 2 wrestlers and 4 lumberjacks, all starting on the floor around the ring; they still walk in and brawl (the game has no lumberjack AI; a custom version is planned in docs/MATCH_TYPES_RESEARCH.md) (8a8298e).
+- **Free-roaming backstage**: the CPU now moves and fights (played as the Parking Lot rule over the whole backstage), and the camera is pulled back (70412c3).
+
+- **Anti-aliasing levels**: OFF / 2x / 3x / 4x supersampling (4, 9 or 16 samples a pixel; GRAPHICS → QUALITY and the launcher's Settings), within the 4x render scale cap (4d363c8).
+- **Android drivers** (cb15eb3): **driver variables** (e.g. `FD_DEV_FEATURES=enable_tp_ubwc_flag_hint=1`, the fix for HyperOS 3's glitches with Turnip; a one-tap "HyperOS 3 fix" button); any driver zip (with or without `meta.json`) or a bare `.so` can be added, and zips labelled oddly by file managers show up in the picker; a `gpu_driver` set by hand to a file in Download is copied into the app's storage before loading. *Experimental (not yet tried on a phone).*
+
+- **Android black screen on APK-only installs fixed**: the app saved its settings on Play before the game had ever run, so the game's defaults (its GPU plugin among them) were never written and nothing could draw. The game now adds any default a settings file lacks, which also repairs phones that already have the broken file.
+
+- **Saves folder** can be chosen in the launcher's Saves tab (17c9df4).
+- **Online without Online Axxess**: players whose DLC lacks THQ's online pass got "Information related to your trial period couldn't be retrieved" on ONLINE; the port now supplies just that pass when online is on and no installed package has it (cdf6346). No paid unlocks are granted.
+- **Match-only behaviour no longer switches on in the ONLINE menu** (30 fps, touch MATCH layout, wide view, Discord): it waits until a match is running (60182bb).
+
+## Requests
+
+Requested 1 October 2026:
+
+- [x] Keyboard controls (play with the PC keyboard). *(6f64494)*
+- [x] Android: a KEYBOARD button that opens the phone's keyboard for typing. *(c366c12)*
+- [x] F11 toggles fullscreen. *(6f64494)*
+- [x] Language selector as its own button under *Options*. *(6f64494)*
+- [x] Windowed, borderless and fullscreen choices in *Options*. *(6f64494)*
+- [ ] Android stuttering: 60 Hz screen and frame-time / thermal / clock logs added (c366c12); about 20-25% of frames still take 20-28 ms on the phone (2% on PC) - still open, waiting for a log from a bad session.
+- [x] Android: custom songs from the `Music` folder, as on Windows. *(8d0de6b)*
+- [x] Divas against male superstars: remove the restriction, matches play normally. *(7903c71)*
+- [x] Managers playable and selectable in the modes: the "?" tile opens them. *(63d9358)*
+- [x] Limit Breaking session: research unused match types in the game files (docs/MATCH_TYPES_RESEARCH.md, 247a26e).
+- [x] Online session: uploaded superstars carry their custom movies and music (into `Custom Movies` / `Music` on download). *(44c6b30, Android movies 27a1ff7)*
+
+Requested later on 1 October 2026:
+
+- [x] Entrances dropping to single-digit fps since the update. *(2188b98)*
+- [ ] Textures turn black at the start of a match with entrances off: not reproduced in three tests; waiting for the reporter's log, version and screenshot.
+- [x] Replays can be switched off completely. *(63d9358)*
+- [x] Managers: the "?" tile shows an "M" (tile and banner, from the user's art) and reads EXTRA instead of RANDOM.
+- [ ] Match types: 50-man Royal Rumble - the engine holds 30 people in a match (not done).
+- [x] Match types: Lumberjack, Falls Count Anywhere, Backstage for triple threat / fatal 4-way / 6-man, 15- and 25-man Rumble. *(7b7e952)*
+- [x] Road to WrestleMania's whole backstage as a fighting area: FREE-ROAMING BACKSTAGE, all rooms, backstage camera, working AI. *(Limit Breaking, d773d35)*
+- [x] Graphics options: depth of field, motion blur. *(c76de77)*
+- [x] Blurry image in wide shots above 720p: the game's soft filter, now off by default. *(c76de77)*
+- [ ] Test the Android entrance movies (Community Creations) on a phone.
+
+Requested 2 October 2026:
+
+- [x] Frame rate choices (Limit Breaking, 1d0fa31; SDK side f3c397d). The user's play test found 30 fps broke physics and 120+ ran too fast; redone with the game's own 60 Hz timing (9e529d3), now 30 or 60 only (224faa9).
+- [ ] Test 30 fps fully. The first version (1d0fa31) passed the automated checks but the user's play test found broken physics. The redone version is in Game Files (224faa9): in the practice ring it shows 30 fps with the game stepping 60 times a second and walking at the same speed as at 60. The user's play test then found an odd running animation and laggy menus at 30: fixed in 0b15618 (characters' animation stepped per tick; menus at 60, 30 only in matches), in Game Files (ff79af7). Found in the check: with entrances off a match stayed at 60 (the "in a match" switch only happened when entrances start); fixed in 322e5fb (a match-load hook switches frame rate, touch layout, wide screen and Discord together, with or without entrances); in Game Files, checked: an entrances-off match draws 30 frames a second while the game steps 60 times. Waiting on the user's play test.
+- [x] B did nothing in *My WWE → Options* (out of order menu records since ACHIEVEMENTS).
+- [x] The APK released beside the PC game, all an Android player needs: `package.ps1` also writes `SvR2011-Android-v<version>.apk` (the name the app's updater looks for); README updated.
+- [x] A connected controller hides the on-screen controller (it only worked when SDL saw the pad, never with the XInput backend). *(b249724)*
+- [ ] Online: peer-to-peer matches, leaderboards on the VPS, P2P working even with the VPS down. Lockstep (0a0c585); more fixes in progress (Online session). LAN play works: two games find each other, share a Player Match lobby and play a synced One on One, no server needed *(Online, b93b434; from PR #3's reusable parts)*. Internet matches (61c6f10): direct first (STUN public address, and a **Friends** list of addresses in the launcher's Online tab), else through the server's relay; while relayed the games keep trying to go direct. Tested PC <-> phone through sho-ti.me (a synced match). Game ports moved +20000 for Android (e56a8e7). Still to do: leaderboards on the server; checking internet play with the server down (direct + Friends only).
+- [x] Steam Deck: a won match never ended (player's log, v1.0.x). The match-end highlights waited forever for the replay recorder; now they're skipped after 8 s and the match goes on to the celebration and results, with the recorder's state logged. Waiting for a log from the player on the next build to find why the Deck's recorder stalls. *(Limit Breaking, c43d482)*
