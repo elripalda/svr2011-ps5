@@ -109,7 +109,10 @@ constexpr int kFrameRates[] = {30, 60};
 constexpr int kNumFrameRates = 2;
 enum Tab { kDisplayTab, kGraphicsTab, kAdvancedTab, kTabs };
 const char* kTabNames[kTabs] = {"DISPLAY", "GRAPHICS", "ADV. GRAPHICS"};
-#if defined(__ANDROID__)
+#if defined(__PROSPERO__)
+// [ps5 port] (the TV is the window: no window size or mode; one renderer; no touch)
+const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kFpsCounter, kReplays, kFastStart},
+#elif defined(__ANDROID__)
 // (the phone: the window is the screen - no window size or mode)
 // (no RENDERER row: the phone draws natively on Vulkan, its only graphics API)
 const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kFpsCounter, kTouch, kReplays, kFastStart},

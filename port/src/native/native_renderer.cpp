@@ -121,7 +121,12 @@ REXCVAR_DEFINE_DOUBLE(native_render_scale, 1.0, "GPU",
                       "(0.5 = 640 x 360, scaled up to the screen; 0.25 - 1). The HUD and menus' 2D art "
                       "are drawn into the same scene, so they get softer too.");
 
-REXCVAR_DEFINE_INT32(native_max_scale, 4, "GPU",
+#if defined(__PROSPERO__)
+#define SVR2011_DEFAULT_MAX_SCALE 3  // [ps5 port] 2160P: the TV's own 4K (AUTO's 4x supersamples 2880p)
+#else
+#define SVR2011_DEFAULT_MAX_SCALE 4
+#endif
+REXCVAR_DEFINE_INT32(native_max_scale, SVR2011_DEFAULT_MAX_SCALE, "GPU",
                      "Native renderer: the largest render scale (1 = the Xbox 360's 720p, up to 4). "
                      "The scale follows the window; phones start at 1.");
 

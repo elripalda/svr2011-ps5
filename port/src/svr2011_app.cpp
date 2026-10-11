@@ -433,7 +433,14 @@ void Svr2011App::OnPostLoadXexImage() {
   }
 #ifndef SVR2011_D3D_TRACE  // the census build has no native renderer
   svr2011::native::Attach(runtime()->memory());
+#if defined(__PROSPERO__)
+  // [ps5 port] The TV is the window: the presenter's 4K swapchain.
+  svr2011::native::SetWindowSizeSource([] { return std::pair<uint32_t, uint32_t>(3840, 2160); });
+  if (false) {
+    rex::ui::Window* w = nullptr;
+#else
   if (rex::ui::Window* w = window()) {
+#endif
     svr2011::native::SetWindowSizeSource([w] {
       return std::pair<uint32_t, uint32_t>(w->GetActualPhysicalWidth(), w->GetActualPhysicalHeight());
     });

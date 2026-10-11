@@ -525,7 +525,16 @@ struct RecordCopy {
 };
 std::mutex g_records_mutex;
 std::map<std::pair<uint32_t, Kind>, RecordCopy> g_records;
-thread_local uint32_t t_pair = 0;  // (a {handle, record} pair for the command)
+// {handle, record} pairs for the commands: a ring, as the commands are played
+// back later (one pair shared by a frame's commands gave each button the
+// last one's record - its size and place).
+constexpr uint32_t kPairs = 4096;
+std::atomic<uint32_t> g_pair_next{0};
+uint32_t NextPair() {
+  static const uint32_t pairs = [] { return g_memory->SystemHeapAlloc(kPairs * 8, 8); }();
+  if (!pairs) return 0;
+  return pairs + (g_pair_next.fetch_add(1, std::memory_order_relaxed) % kPairs) * 8;
+}
 
 uint32_t RecordVersion(uint32_t record, Kind kind) {
   constexpr uint32_t kTextureRecord = 0x8205CF48;  // (vtable)
@@ -537,11 +546,12 @@ uint32_t RecordVersion(uint32_t record, Kind kind) {
   RecordCopy& c = g_records[{record, kind}];
   if (!c.record) c.record = g_memory->SystemHeapAlloc(0x70, 32);
   if (!c.record) return 0;
-  if (c.object != version) {
-    std::memcpy(g_base + c.record, g_base + record, 0x70);
-    Wr32(g_base + c.record + 80, version);
-    c.object = version;
-  }
+  // (refreshed at every use: the game updates its record - the picture's
+  // size and place on screen - and a copy taken once drew the button squeezed
+  // into an old size)
+  std::memcpy(g_base + c.record, g_base + record, 0x70);
+  Wr32(g_base + c.record + 80, version);
+  c.object = version;
   return c.record;
 }
 
@@ -640,11 +650,10 @@ REX_HOOK_RAW(sub_826DE6B0) {
     if (kind == kPlayStation || kind == kKeyboard) {
       const uint32_t record = Readable(ctx.r4.u32) ? Rd32(base + ctx.r4.u32 + 4) : 0;
       if (const uint32_t copy = record ? RecordVersion(record, kind) : 0) {
-        if (!t_pair) t_pair = g_memory->SystemHeapAlloc(8, 8);
-        if (t_pair) {
-          Wr32(base + t_pair, Rd32(base + ctx.r4.u32));
-          Wr32(base + t_pair + 4, copy);
-          ctx.r4.u64 = t_pair;
+        if (const uint32_t pair = NextPair()) {
+          Wr32(base + pair, Rd32(base + ctx.r4.u32));
+          Wr32(base + pair + 4, copy);
+          ctx.r4.u64 = pair;
         }
       }
     }

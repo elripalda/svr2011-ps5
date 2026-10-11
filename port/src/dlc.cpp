@@ -371,14 +371,24 @@ void InstallDlc(rex::system::KernelState* kernel_state, const std::filesystem::p
       REXLOG_WARN("DLC {}: for title {:08X}, not this game - skipped", name, title);
       continue;
     }
-    if (std::filesystem::is_directory(installed / e.path().filename(), ec)) continue;
+    // (a package saved twice by a browser is "<name> (1)": it installs as <name>)
+    std::string installed_name = name;
+    if (const size_t paren = installed_name.rfind(" ("); paren != std::string::npos &&
+        installed_name.back() == ')' &&
+        installed_name.find_first_not_of("0123456789", paren + 2) == installed_name.size() - 1) {
+      installed_name.resize(paren);
+    }
+    if (std::filesystem::is_directory(installed / installed_name, ec) ||
+        std::filesystem::is_directory(installed / e.path().filename(), ec)) {
+      continue;  // (installed at an earlier start)
+    }
     REXLOG_INFO("DLC {}: installing", name);
     const auto result = content->InstallContent(e.path());
     if (result == 0) {
       REXLOG_INFO("DLC {}: installed", name);
     } else {
       REXLOG_ERROR("DLC {}: install failed ({:08X})", name, uint32_t(result));
-      std::filesystem::remove_all(installed / e.path().filename(), ec);  // retry next start
+      std::filesystem::remove_all(installed / installed_name, ec);  // retry next start
     }
   }
 }

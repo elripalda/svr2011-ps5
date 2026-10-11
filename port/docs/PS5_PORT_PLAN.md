@@ -66,6 +66,23 @@ game files, XEX or generated code are ever stored in the repo.
 - Game folder = /app0; guest memory via shm_open(SHM_ANON) + reserved MAP_FIXED views.
 - Music/host sounds: stubs for now (posix_stubs.cpp).
 
+## Status (Oct 11, test 19): playable
+
+Boots in seconds, menus and matches at 60 fps at native 4K (render scale 3x),
+DualSense with PlayStation button pictures, sound, DLC, saves kept between
+starts. Fixes that got it there, in order:
+- 0xE0000000 guest addresses sit 0x1000 higher in host memory with 16 KB pages
+  (as on Windows / arm64 macOS): the runtime knew, the generated code didn't
+  (REX_PHYS_HOST_OFFSET; codegen template + tools/ps5_patch_generated.py).
+- 16 MiB host thread stacks from direct memory (libkernel's come from ~400 MiB
+  of flexible memory: thread 18 failed).
+- Imports only libkernel_sys exports (link, symlink, readlink, pathconf, fork,
+  vfork, setsid) are stubbed: they were calls to address 0 (the save's
+  create_hard_link hung the title screen).
+- No keyboard/mouse driver (the game showed "A / Cross" pairs); the button
+  picture copies get a command pair each and fresh records.
+- DLC "<name> (1)" packages are recognised as installed (no 26 s reinstall).
+
 ## PS5 work list
 
 ### Core (rexglue)
