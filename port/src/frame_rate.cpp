@@ -993,8 +993,9 @@ REX_HOOK_RAW(sub_826DFFA0) {
 namespace {
 // A guest address in the heaps or the image (where a game object can be).
 bool GuestObjectAddress(uint32_t a) {
-  // (0x30000000-0x3FFFFFFF: the system heap - the button pictures' texture
-  // object copies, pad_icons.cpp)
+  // (0x30000000-0x3FFFFFFF: the system heap - the button pictures' record
+  // copies, pad_icons.cpp; skipped, the previous texture stayed bound: a font
+  // page where the character select's controller goes)
   return (a >= 0x30000000u && a < 0x60000000u) || (a >= 0x70000000u && a < 0x90000000u) || a >= 0xA0000000u;
 }
 }  // namespace

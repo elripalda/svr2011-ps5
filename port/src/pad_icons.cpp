@@ -394,7 +394,11 @@ bool Load() {
 uint32_t MakeCopy(uint32_t object, const Sprite& sp, const std::vector<uint8_t>& data) {
   const uint32_t bpb = sp.dxt1 ? 8 : 16;
   const uint32_t blocks_x = std::max(1u, (sp.width + 3) / 4), blocks_y = std::max(1u, (sp.height + 3) / 4);
-  const uint32_t row = blocks_x * bpb, pitch_bytes = (row + 255) & ~255u;
+  // (rows padded as the GPU reads a linear texture: the pitch in whole 32-block
+  // tiles - texture_util's guest layout - so at least 256 bytes. Only 256-byte
+  // rows made a picture under 128 texels wide come out squeezed to half height
+  // and mixed with the next rows: the in-match button prompts.)
+  const uint32_t row = blocks_x * bpb, pitch_bytes = ((blocks_x + 31) & ~31u) * bpb;
   // (a page more: the GPU reads the 0xE0000000 heap one page on - the data
   // goes where it reads, through the physical address)
   const uint32_t at = g_memory->SystemHeapAlloc(pitch_bytes * blocks_y + 4096, 4096, rex::memory::kSystemHeapPhysical);
@@ -415,8 +419,11 @@ uint32_t MakeCopy(uint32_t object, const Sprite& sp, const std::vector<uint8_t>&
   fetch.mip_max_level = 0;
   fetch.packed_mips = 0;
   for (int i = 0; i < 6; ++i) Wr32(g_base + copy + 0x1C + i * 4, words[i]);
-  REXLOG_INFO("[svr2011] pad icons: copy of {:08X} ({}x{}) -> {:08X}, data {:08X} (physical {:08X}), fetch {:08X} {:08X}",
-              object, sp.width, sp.height, copy, at, g_memory->GetPhysicalAddress(at), words[0], words[1]);
+  REXLOG_INFO("[svr2011] pad icons: copy of {:08X} ({}x{} {}) -> {:08X}, data {:08X} (physical {:08X}), fetch {:08X} {:08X} {:08X} "
+              "(original {:08X} {:08X} {:08X}), first bytes {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+              object, sp.width, sp.height, sp.dxt1 ? "DXT1" : "DXT5", copy, at, g_memory->GetPhysicalAddress(at), words[0], words[1], words[2],
+              Rd32(g_base + object + 0x1C), Rd32(g_base + object + 0x20), Rd32(g_base + object + 0x24),
+              dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
   return copy;
 }
 
