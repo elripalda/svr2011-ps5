@@ -149,6 +149,31 @@ else()
     list(APPEND SVR2011_SOURCES src/posix_stubs.cpp src/crash_report_posix.cpp)
 endif()
 
+# [ps5 port] The hub: the screen the app opens on (src/hub); its fonts are
+# built in from assets/fonts (SIL Open Font License).
+if(PS5)
+    list(APPEND SVR2011_SOURCES src/hub/hub_ui.cpp src/hub/ps5_hub.cpp src/hub/hub_pages.cpp src/hub/hub_sfx.cpp src/hub/hub_online.cpp
+                                src/hub/hub_setup.cpp src/hub/hub_install.cpp src/hub/hub_paint.cpp
+                                src/ps5/sound.cpp src/music.cpp)
+    set_source_files_properties(src/hub/ps5_hub.cpp PROPERTIES
+        COMPILE_DEFINITIONS "SVR2011_FONTS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts\""
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/inter-latin-400-normal.ttf")
+endif()
+
+# https where the platform has no TLS of its own (the PS5, Linux): Mbed TLS
+# (thirdparty/mbedtls, Apache-2.0) with the Mozilla CA list built in.
+if(NOT WIN32 AND NOT ANDROID)
+    file(GLOB SVR2011_MBEDTLS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/mbedtls/library/*.c)
+    add_library(svr2011_mbedtls STATIC ${SVR2011_MBEDTLS_SOURCES})
+    target_include_directories(svr2011_mbedtls PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/mbedtls/include)
+    target_compile_definitions(svr2011_mbedtls PUBLIC
+        MBEDTLS_USER_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/src/net/mbedtls_user_config.h")
+    list(APPEND SVR2011_SOURCES src/net/tls.cpp)
+    set_source_files_properties(src/net/tls.cpp PROPERTIES
+        COMPILE_DEFINITIONS "SVR2011_CERTS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/assets/certs\""
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/certs/cacert.pem")
+endif()
+
 if(WIN32)
     add_executable(svr2011 WIN32 ${SVR2011_SOURCES} src/svr2011.rc)
 elseif(ANDROID)
@@ -179,6 +204,12 @@ else()
 endif()
 
 rexglue_setup_target(svr2011 GPU_PLUGINS xenos)
+if(TARGET svr2011_mbedtls)
+    target_link_libraries(svr2011 PRIVATE svr2011_mbedtls)
+    if(PS5)
+        target_link_libraries(svr2011 PRIVATE SceRandom)  # (its randomness)
+    endif()
+endif()
 # The SDK stages the GPU plugin (loaded at run time, never linked) only when
 # the exe relinks: a change to the plugin alone would leave a stale copy
 # beside the exe (and in Game Files / the release). Stage it on every build.

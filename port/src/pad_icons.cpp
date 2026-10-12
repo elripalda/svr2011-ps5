@@ -333,6 +333,7 @@ std::atomic<size_t> g_seen_count{0};
 // Copies of texture objects for the other versions: (object, kind) -> copy.
 struct Copy {
   uint32_t object = 0, fetch1 = 0, data = 0;
+  const Sprite* sprite = nullptr;
 };
 std::mutex g_copies_mutex;
 std::map<std::pair<uint32_t, Kind>, Copy> g_copies;
@@ -401,11 +402,17 @@ uint32_t MakeCopy(uint32_t object, const Sprite& sp, const std::vector<uint8_t>&
   const uint32_t row = blocks_x * bpb, pitch_bytes = ((blocks_x + 31) & ~31u) * bpb;
   // (a page more: the GPU reads the 0xE0000000 heap one page on - the data
   // goes where it reads, through the physical address)
-  const uint32_t at = g_memory->SystemHeapAlloc(pitch_bytes * blocks_y + 4096, 4096, rex::memory::kSystemHeapPhysical);
+  // (one copy of the data per picture: the objects that show it - again
+  // after every match - share it)
+  static std::map<const std::vector<uint8_t>*, uint32_t> datas;
+  uint32_t& at = datas[&data];
+  const bool fresh = !at;
+  if (fresh) at = g_memory->SystemHeapAlloc(pitch_bytes * blocks_y + 4096, 4096, rex::memory::kSystemHeapPhysical);
   const uint32_t copy = g_memory->SystemHeapAlloc(64, 32);
   if (!at || !copy) return 0;
   uint8_t* dst = g_memory->TranslatePhysical<uint8_t*>(g_memory->GetPhysicalAddress(at));
-  for (uint32_t y = 0; y < blocks_y; ++y) std::memcpy(dst + y * pitch_bytes, data.data() + size_t(y) * row, row);
+  if (fresh)
+    for (uint32_t y = 0; y < blocks_y; ++y) std::memcpy(dst + y * pitch_bytes, data.data() + size_t(y) * row, row);
   std::memcpy(g_base + copy, g_base + object, 52);
   rex::graphics::xenos::xe_gpu_texture_fetch_t fetch;
   uint32_t* words = &fetch.dword_0;
@@ -518,10 +525,14 @@ uint32_t VersionOf(uint32_t object, Kind kind) {
     if (auto it = g_seen.find(physical); it != g_seen.end()) sp = it->second;
   }
   if (!sp || sp->data[kind].empty()) return 0;
+  // (the picture last uploaded at that address must be this one's size: after
+  // a match the menu's 512x512 page took the 1024x512 match page's place, and
+  // was drawn from a copy of the old one - before its own upload was seen)
+  if (sp->width != w || sp->height != h) return 0;
   std::lock_guard lock(g_copies_mutex);
   Copy& c = g_copies[{object, kind}];
-  if (c.object && c.fetch1 != fetch1) c = Copy{};  // (the object now holds another picture)
-  if (!c.object) c = Copy{MakeCopy(object, *sp, sp->data[kind]), fetch1, 0};
+  if (c.object && (c.fetch1 != fetch1 || c.sprite != sp)) c = Copy{};  // (the object now holds another picture)
+  if (!c.object) c = Copy{MakeCopy(object, *sp, sp->data[kind]), fetch1, 0, sp};
   return c.object;
 }
 

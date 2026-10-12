@@ -8,7 +8,7 @@
 
 namespace svr2011 {
 
-#if !defined(__ANDROID__)  // (Android: music.cpp)
+#if !defined(__ANDROID__) && !defined(__PROSPERO__)  // (Android, PS5: music.cpp)
 void InstallUserMusic(const std::filesystem::path&) {
   REXLOG_INFO("user music: not available on this platform yet");
 }

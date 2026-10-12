@@ -166,14 +166,8 @@ std::pair<uint32_t, uint16_t> Resolve(std::string item, uint16_t port) {
     item.resize(colon);
   }
   if (item.empty()) return {0, 0};
-  addrinfo hints = {}, *found = nullptr;
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_DGRAM;
   uint32_t ip = 0;
-  if (getaddrinfo(item.c_str(), nullptr, &hints, &found) == 0 && found) {
-    ip = ntohl(reinterpret_cast<sockaddr_in*>(found->ai_addr)->sin_addr.s_addr);
-    freeaddrinfo(found);
-  }
+  if (svr2011::net::ResolveIPv4(item, &ip)) ip = ntohl(ip);  // (online_net.h: works on the PS5 too)
   return {ip, port};
 }
 

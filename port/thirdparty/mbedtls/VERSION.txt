@@ -1,0 +1,1 @@
+Mbed TLS v3.6.2 (Apache-2.0): library/ and include/ from https://github.com/Mbed-TLS/mbedtls

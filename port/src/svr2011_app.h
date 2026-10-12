@@ -24,4 +24,9 @@ class Svr2011App : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
   void OnConfigureFonts(ImFontAtlas* atlas) override;
   void OnPostLoadXexImage() override;
+#if defined(__PROSPERO__)
+  // [ps5 port] The hub (src/hub) first; LAUNCH GAME continues the start.
+  std::optional<rex::PathConfig> OnFinalizePaths(const rex::PathConfig& defaults,
+                                                 std::function<void(rex::PathConfig)> resume) override;
+#endif
 };

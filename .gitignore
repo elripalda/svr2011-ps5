@@ -13,6 +13,8 @@
 /port/generated/
 /port/assets/*
 !/port/assets/README.md
+!/port/assets/fonts/
+!/port/assets/certs/
 /port/out/
 /port/runs/
 /port/*.txt

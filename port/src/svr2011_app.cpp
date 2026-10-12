@@ -3,6 +3,9 @@
 #include "generated/default/svr2011_init.h"
 
 #include "svr2011_app.h"
+#if defined(__PROSPERO__)
+#include "hub/ps5_hub.h"
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -79,6 +82,8 @@
 #include "xaudio2_audio.h"
 #endif
 
+// [ps5 port] The hub's menu music, 0..100 (its Settings page writes it).
+REXCVAR_DEFINE_INT32(hub_music_volume, 80, "Hub", "Menu music volume in the PS5 hub (0-100)");
 REXCVAR_DEFINE_STRING(saves_folder, "", "Storage",
                       "Where the saves live: empty for the game folder's Saves, or a folder (absolute, or "
                       "relative to the game folder) - e.g. to keep two installs' saves apart or shared")
@@ -344,7 +349,31 @@ void Svr2011App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
 
 // The GRAPHICS page's fonts (bold, like the game's menus); ImGui's own
 // stays the default for the overlays.
+#if defined(__PROSPERO__)
+std::optional<rex::PathConfig> Svr2011App::OnFinalizePaths(const rex::PathConfig& defaults,
+                                                           std::function<void(rex::PathConfig)> resume) {
+  if (!Env("SVR2011_NO_HUB").empty() || !imgui_drawer()) return defaults;
+  svr2011::hub::Paths paths{rex::filesystem::GetExecutableFolder(), g_config_path, g_saves};
+  std::string player;
+  try {
+    player = rex::cvar::Query<std::string>("online_name");
+  } catch (...) {
+  }
+  svr2011::hub::Show(imgui_drawer(), immediate_drawer(), paths, player, [this, defaults, resume] {
+    // The hub's changes (svr2011.toml) apply to this start.
+    rex::cvar::LoadConfig(g_config_path);
+    REXLOG_INFO("PS5 hub: LAUNCH GAME");
+    app_context().CallInUIThreadDeferred([defaults, resume] { resume(defaults); });
+  });
+  return std::nullopt;
+}
+#endif
+
 void Svr2011App::OnConfigureFonts(ImFontAtlas* atlas) {
+#if defined(__PROSPERO__)
+  // [ps5 port] The hub's fonts (built in); the in-game pages keep ImGui's.
+  svr2011::hub::ConfigureFonts(atlas);
+#endif
   const char* kBold = "C:\\Windows\\Fonts\\segoeuib.ttf";
   const char* kBoldItalic = "C:\\Windows\\Fonts\\segoeuiz.ttf";
   // (The error_code form: on the PS5, stat on a Windows-style path fails with
@@ -488,6 +517,7 @@ void Svr2011App::OnPostLoadXexImage() {
 
   // Saves as plain files in the Saves folder (saves.h).
   svr2011::UseFlatSaves(runtime()->kernel_state(), g_user_data, g_saves);
+  REXLOG_INFO("start: flat saves set up");
 
   // DLC packages the launcher put in "DLC" (dlc.h).
   {
@@ -495,6 +525,7 @@ void Svr2011App::OnPostLoadXexImage() {
     // (the user data the content goes to: <game>\UserData, or a test's)
     svr2011::InstallDlc(runtime()->kernel_state(), exe_dir / "DLC", g_user_data);
   }
+  REXLOG_INFO("start: DLC checked");
 
   // USER PLAYLIST entrance music from the Music folder (music.h); tests:
   // SVR2011_MUSIC=<folder>.
@@ -503,6 +534,7 @@ void Svr2011App::OnPostLoadXexImage() {
     if (std::string dir = Env("SVR2011_MUSIC"); !dir.empty()) music = dir;
     svr2011::InstallUserMusic(music);
   }
+  REXLOG_INFO("start: music checked");
 
   // USER MOVIES entrance movies from the Custom Movies folder, mounted as
   // umovie: (user_movies.h); tests: SVR2011_MOVIES=<folder>.

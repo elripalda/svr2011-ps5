@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <random>
 #include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -32,6 +34,8 @@
 #if defined(__ANDROID__)
 #include <jni.h>
 #include <SDL3/SDL_system.h>
+#elif !defined(_WIN32)
+#include "net/tls.h"  // (https: Mbed TLS)
 #endif
 
 #include <rex/cvar.h>
@@ -47,6 +51,7 @@ namespace {
 TransferListener g_transfer = nullptr;  // (SetTransferListener)
 LocalAnswer g_local = nullptr;          // (SetLocalAnswer)
 std::atomic<int> g_profile{0};          // (SignedInProfile)
+thread_local std::string t_error;       // (LastError)
 
 // -- sockets ----------------------------------------------------------------------
 
@@ -282,38 +287,199 @@ std::optional<Response> ParseRaw(const std::string& raw) {
   return r;
 }
 
-// Plain http over sockets.
-std::optional<Response> SocketRequest(const std::string& method, const Url& url, const Headers& headers,
-                                      const std::string& body) {
+void Fail(std::string why) {
+  REXLOG_WARN("online: {}", why);
+  t_error = std::move(why);
+}
+
+#if defined(__PROSPERO__)
+extern "C" int sceNetInit(void);
+extern "C" int* sceNetErrnoLoc(void);
+#endif
+
+// The PS5's network library: started once (an app may have to).
+void StartNet() {
+#if defined(__PROSPERO__)
+  static const int rc = [] {
+    const int r = sceNetInit();
+    REXLOG_INFO("online: network library started ({:#x})", uint32_t(r));
+    return r;
+  }();
+  (void)rc;
+#endif
+}
+
+// A name's IPv4 address straight from a public DNS server (1.1.1.1, then
+// 8.8.8.8), over UDP: when the system's resolver can't.
+bool DnsLookup(const std::string& host, in_addr* out) {
+  std::string q;
+  q += std::string("\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00", 12);  // id, recursion, 1 question
+  size_t start = 0;
+  while (start <= host.size()) {
+    const size_t dot = host.find('.', start);
+    const std::string label = host.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+    if (label.empty() || label.size() > 63) return false;
+    q += char(label.size());
+    q += label;
+    if (dot == std::string::npos) break;
+    start = dot + 1;
+  }
+  q += std::string("\x00\x00\x01\x00\x01", 5);  // end, type A, class IN
+  for (const char* server : {"1.1.1.1", "8.8.8.8"}) {
+    Socket u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (u == kBadSocket) continue;
+    SetTimeout(u, 3);
+    sockaddr_in to = {};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(53);
+    inet_pton(AF_INET, server, &to.sin_addr);
+    unsigned char a[512];
+    int n = -1;
+    if (sendto(u, q.data(), q.size(), 0, reinterpret_cast<sockaddr*>(&to), sizeof(to)) == ssize_t(q.size()))
+      n = int(recv(u, reinterpret_cast<char*>(a), sizeof(a), 0));
+    CloseSocket(u);
+    if (n < 12 || a[0] != 0x12 || a[1] != 0x34 || (a[3] & 0x0F)) continue;
+    const int answers = a[6] << 8 | a[7];
+    size_t i = q.size();  // (past the question, as sent)
+    for (int k = 0; k < answers && i + 12 <= size_t(n); ++k) {
+      if ((a[i] & 0xC0) == 0xC0) i += 2;  // (a pointer to the name)
+      else {
+        while (i < size_t(n) && a[i]) i += a[i] + 1;
+        ++i;
+      }
+      if (i + 10 > size_t(n)) break;
+      const int type = a[i] << 8 | a[i + 1], len = a[i + 8] << 8 | a[i + 9];
+      i += 10;
+      if (type == 1 && len == 4 && i + 4 <= size_t(n)) {
+        std::memcpy(&out->s_addr, a + i, 4);
+        REXLOG_INFO("online: {} is {}.{}.{}.{} (from {})", host, a[i], a[i + 1], a[i + 2], a[i + 3], server);
+        return true;
+      }
+      i += size_t(len);
+    }
+  }
+  return false;
+}
+
+#if defined(__PROSPERO__)
+extern "C" {
+int sceNetPoolCreate(const char*, int, int);
+int sceNetPoolDestroy(int);
+int sceNetResolverCreate(const char*, int, int);
+int sceNetResolverDestroy(int);
+int sceNetResolverStartNtoa(int, const char*, in_addr_t*, int, int, int);
+}
+// The console's own DNS (its network settings), through libSceNet - the
+// PS5's getaddrinfo here is a stub that always fails.
+bool SystemLookup(const std::string& host, in_addr_t* out) {
+  const int pool = sceNetPoolCreate("svr2011 dns", 0x4000, 0);
+  if (pool < 0) return false;
+  const int rid = sceNetResolverCreate("svr2011 dns", pool, 0);
+  int rc = -1;
+  if (rid >= 0) {
+    rc = sceNetResolverStartNtoa(rid, host.c_str(), out, 0, 0, 0);
+    sceNetResolverDestroy(rid);
+  }
+  sceNetPoolDestroy(pool);
+  if (rc < 0) REXLOG_WARN("online: the console's DNS couldn't find {} ({:#x})", host, uint32_t(*sceNetErrnoLoc()));
+  return rc >= 0;
+}
+#else
+bool SystemLookup(const std::string& host, in_addr_t* out) {
   addrinfo hints = {};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* found = nullptr;
-  if (getaddrinfo(url.host.c_str(), std::to_string(url.port).c_str(), &hints, &found) != 0 || !found) {
-    return std::nullopt;
-  }
-  Socket s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (s == kBadSocket) {
-    freeaddrinfo(found);
-    return std::nullopt;
-  }
-  SetTimeout(s, 30);
-  const bool connected = connect(s, found->ai_addr, int(found->ai_addrlen)) == 0;
+  if (getaddrinfo(host.c_str(), nullptr, &hints, &found) != 0 || !found) return false;
+  *out = reinterpret_cast<sockaddr_in*>(found->ai_addr)->sin_addr.s_addr;
   freeaddrinfo(found);
+  return true;
+}
+#endif
+
+// The Host header: the port only when it isn't the scheme's own.
+std::string HostHeader(const Url& url) {
+  const bool plain = url.port == (url.https ? 443 : 80);
+  return plain ? url.host : url.host + ":" + std::to_string(url.port);
+}
+
+// A connection: plain, or https (Mbed TLS: where the platform has no TLS of its own).
+struct Link {
+  Socket s = kBadSocket;
+#if !defined(__ANDROID__)
+  std::unique_ptr<Tls> tls;
+#endif
+  bool Send(const std::string& data) {
+#if !defined(__ANDROID__)
+    if (tls) return tls->SendAll(data.data(), data.size());
+#endif
+    return SendAll(s, data);
+  }
+  int Recv(char* buf, size_t size) {
+#if !defined(__ANDROID__)
+    if (tls) return tls->Recv(buf, size);
+#endif
+    return int(recv(s, buf, size, 0));
+  }
+  // Connects (and shakes hands for https); false if it can't (LastError says why).
+  bool Open(const Url& url) {
+    StartNet();
+    sockaddr_in to = {};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(uint16_t(url.port));
+    if (!ResolveIPv4(url.host, &to.sin_addr.s_addr)) {
+      Fail("couldn't find " + url.host + " (no DNS answer: is the console online?)");
+      return false;
+    }
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == kBadSocket) {
+      Fail("no socket (" + std::string(std::strerror(errno)) + ")");
+      return false;
+    }
+    SetTimeout(s, 30);
+    if (connect(s, reinterpret_cast<sockaddr*>(&to), sizeof(to)) != 0) {
+      char ip[32] = {};
+      inet_ntop(AF_INET, &to.sin_addr, ip, sizeof(ip));
+      Fail("couldn't connect to " + url.host + " (" + ip + ":" + std::to_string(url.port) + "): " + std::strerror(errno));
+      return false;
+    }
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+    if (url.https) {
+#if defined(__ANDROID__)
+      return false;  // (Android: its own TLS, BridgeRequest)
+#else
+      tls = Tls::Start(s, url.host);
+      if (!tls) Fail("the secure connection to " + url.host + " failed (see the log)");
+      return tls != nullptr;
+#endif
+    }
+    return true;
+  }
+  ~Link() {
+#if !defined(__ANDROID__)
+    tls.reset();
+#endif
+    if (s != kBadSocket) CloseSocket(s);
+  }
+};
+
+// http (and https) over sockets.
+std::optional<Response> SocketRequest(const std::string& method, const Url& url, const Headers& headers,
+                                      const std::string& body) {
+  Link link;
   std::string raw;
-  if (connected) {
-    std::string request = method + " " + url.path + " HTTP/1.0\r\nHost: " + url.host + ":" +
-                          std::to_string(url.port) + "\r\nConnection: close\r\nContent-Length: " +
-                          std::to_string(body.size()) + "\r\n";
+  if (link.Open(url)) {
+    std::string request = method + " " + url.path + " HTTP/1.0\r\nHost: " + HostHeader(url) +
+                          "\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
     for (const auto& [k, v] : headers) request += k + ": " + v + "\r\n";
     request += "\r\n" + body;
-    if (SendAll(s, request)) {
-      char buf[65536];
+    if (link.Send(request)) {
+      std::vector<char> buf(65536);
       int n;
-      while ((n = int(recv(s, buf, sizeof(buf), 0))) > 0 && raw.size() < (32u << 20)) raw.append(buf, size_t(n));
+      while ((n = link.Recv(buf.data(), buf.size())) > 0 && raw.size() < (32u << 20)) raw.append(buf.data(), size_t(n));
     }
   }
-  CloseSocket(s);
   return ParseRaw(raw);
 }
 
@@ -388,15 +554,11 @@ std::optional<Response> BridgeRequest(const std::string& method, const std::stri
 
 std::optional<Response> RequestImpl(const std::string& method, const Url& url, const Headers& headers,
                                     const std::string& body, const std::string& full_url) {
-  if (url.https) {
 #if defined(__ANDROID__)
-    return BridgeRequest(method, full_url, headers, body);
+  if (url.https) return BridgeRequest(method, full_url, headers, body);
 #else
-    static std::once_flag once;
-    std::call_once(once, [] { REXLOG_WARN("online: https servers aren't supported on this platform yet"); });
-    return std::nullopt;
+  (void)full_url;
 #endif
-  }
   return SocketRequest(method, url, headers, body);
 }
 
@@ -748,37 +910,23 @@ std::unique_ptr<Half> StartHalf(const Url& /*url*/, const std::string& full_url,
 
 #else
 
-// Plain http over a socket (no TLS here: https servers need Windows or Android).
+// http (and https) over a socket.
 struct SocketHalf : Half {
-  Socket s = kBadSocket;
+  Link link;
   std::string early;  // (body bytes read with the headers)
-  ~SocketHalf() override {
-    if (s != kBadSocket) CloseSocket(s);
-  }
   int Start(const Url& url, bool post, const Headers& headers) {
-    if (url.https) return 0;
-    addrinfo hints = {}, *found = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(url.host.c_str(), std::to_string(url.port).c_str(), &hints, &found) != 0 || !found) return 0;
-    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    const bool connected = s != kBadSocket && connect(s, found->ai_addr, int(found->ai_addrlen)) == 0;
-    freeaddrinfo(found);
-    if (!connected) return 0;
-    int one = 1;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
-    SetTimeout(s, 30);
+    if (!link.Open(url)) return 0;
     // (the download: HTTP/1.0, so its body comes plain until the server closes it)
     std::string request = (post ? "POST " : "GET ") + url.path + (post ? " HTTP/1.1" : " HTTP/1.0") +
-                          "\r\nHost: " + url.host + ":" + std::to_string(url.port) + "\r\n";
+                          "\r\nHost: " + HostHeader(url) + "\r\n";
     if (post) request += "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n";
     for (const auto& [k, v] : headers) request += k + ": " + v + "\r\n";
-    if (!SendAll(s, request + "\r\n")) return 0;
+    if (!link.Send(request + "\r\n")) return 0;
     if (post) return 200;
     std::string head;
     char buf[4096];
     while (head.find("\r\n\r\n") == std::string::npos && head.size() < 65536) {
-      const int n = int(recv(s, buf, sizeof(buf), 0));
+      const int n = link.Recv(buf, sizeof(buf));
       if (n <= 0) return 0;
       head.append(buf, size_t(n));
     }
@@ -793,15 +941,15 @@ struct SocketHalf : Half {
       early.erase(0, n);
       return int(n);
     }
-    const int n = int(recv(s, reinterpret_cast<char*>(buf), int(size), 0));
+    const int n = link.Recv(reinterpret_cast<char*>(buf), size);
     return n > 0 ? n : -1;
   }
   bool Write(const uint8_t* data, size_t size) override {
     char head[16];
     std::snprintf(head, sizeof(head), "%zx\r\n", size);
-    return SendAll(s, head + std::string(reinterpret_cast<const char*>(data), size) + "\r\n");
+    return link.Send(head + std::string(reinterpret_cast<const char*>(data), size) + "\r\n");
   }
-  void Finish() override { SendAll(s, "0\r\n\r\n"); }
+  void Finish() override { link.Send("0\r\n\r\n"); }
 };
 
 std::unique_ptr<Half> StartHalf(const Url& url, const std::string& /*full_url*/, bool post, const Headers& headers,
@@ -882,10 +1030,35 @@ namespace {
 
 }  // namespace
 
+std::string LastError() { return t_error; }
+
+bool ResolveIPv4(const std::string& host, uint32_t* ip) {
+#if defined(_WIN32)
+  addrinfo hints = {}, *found = nullptr;
+  hints.ai_family = AF_INET;
+  if (getaddrinfo(host.c_str(), nullptr, &hints, &found) != 0 || !found) return false;
+  *ip = reinterpret_cast<sockaddr_in*>(found->ai_addr)->sin_addr.s_addr;
+  freeaddrinfo(found);
+  return true;
+#else
+  StartNet();
+  in_addr a = {};
+  if (inet_pton(AF_INET, host.c_str(), &a) == 1) return *ip = a.s_addr, true;
+  in_addr_t v = 0;
+  if (SystemLookup(host, &v)) return *ip = v, true;
+  if (DnsLookup(host, &a)) return *ip = a.s_addr, true;
+  return false;
+#endif
+}
+
 std::optional<Response> Request(const std::string& method, const std::string& url, const Headers& headers,
                                 const std::string& body) {
+  t_error.clear();
   Url u;
-  if (!ParseUrl(url, &u)) return std::nullopt;
+  if (!ParseUrl(url, &u)) {
+    t_error = "not a web address: " + url;
+    return std::nullopt;
+  }
   return RequestImpl(method, u, headers, body, url);
 }
 

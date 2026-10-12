@@ -32,6 +32,8 @@
 #include <SDL3/SDL.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaExtractor.h>
+#elif defined(__PROSPERO__)
+#include "ps5/sound.h"
 #endif
 
 #include <rex/cvar.h>
@@ -57,6 +59,9 @@ constexpr const wchar_t* kExtensions[] = {L".mp3", L".wma", L".m4a", L".aac", L"
 constexpr uint32_t kSlots = 6;   // buffers owned by the player
 constexpr uint32_t kQueued = 4;  // at most this many queued on the voice
 constexpr double kBufferSeconds = 0.1;
+#elif defined(__PROSPERO__)
+// (the PS5: the port's own decoders, ps5/sound.h)
+constexpr const wchar_t* kExtensions[] = {L".mp3", L".wav", L".flac", L".ogg"};
 #else
 // (Android's decoders: no WMA)
 constexpr const wchar_t* kExtensions[] = {L".mp3", L".m4a", L".aac", L".wav", L".flac", L".ogg"};
@@ -581,6 +586,47 @@ class Player {
   std::chrono::steady_clock::time_point started_{}, paused_at_{};
   bool stream_paused_ = true;
   float volume_ = -1.0f;
+};
+
+#elif defined(__PROSPERO__)
+
+// The PS5: a voice of the port's own mixer (ps5/sound.h), which decodes and
+// plays on its thread - Run has nothing to do.
+class Player {
+ public:
+  explicit Player(bool once = false) : once_(once) {
+    voice_ = sound::NewVoice();
+    voice_->game_sound = true;
+    sound::StartOutput();
+  }
+  void Play(std::filesystem::path path, bool once) {
+    once_ = once;
+    Play(std::move(path));
+  }
+  bool Active() const { return voice_->Active(); }
+  void Play(std::filesystem::path path) {
+    sound::SetGameMuted(rex::cvar::GetFlagByName("audio_mute") == "true");
+    auto source = sound::Open(path);
+    if (!source) {
+      REXLOG_WARN("user music: cannot play {}", path.string());
+      voice_->Stop();
+      return;
+    }
+    voice_->SetVolume(volume_);
+    voice_->Play(std::move(source), !once_);
+  }
+  void Stop() { voice_->Stop(); }
+  void Pause(bool paused) { voice_->Pause(paused); }
+  void SetVolume(float volume) {
+    volume_ = std::clamp(volume, 0.0f, 1.0f);
+    voice_->SetVolume(volume_);
+  }
+  void Run() {}
+
+ private:
+  sound::Voice* voice_ = nullptr;
+  bool once_;
+  float volume_ = 1.0f;
 };
 
 #endif

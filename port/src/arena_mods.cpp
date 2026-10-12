@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1158,6 +1159,21 @@ uint32_t TestPlistPath(uint32_t guest_path) {
   static std::vector<std::pair<std::string, uint32_t>> made;
   for (const auto& m : made)
     if (m.first == to) return m.second;
+  {
+    // (only to a list that is there: a missing one would leave the game
+    // waiting on its pacs - the game reads its own list instead)
+    std::string hp = (g_game / folder).string();
+    std::replace(hp.begin(), hp.end(), '\\', '/');
+    const std::filesystem::path file = std::filesystem::path(hp) / (slash == std::string::npos ? s : s.substr(slash + 1));
+    if (FILE* fp = std::fopen(file.string().c_str(), "rb")) {
+      std::fclose(fp);
+    } else {
+      static bool warned = false;
+      if (!warned) REXLOG_WARN("[svr2011] pac list: {} can't be read ({}) - the game's own list is used", file.string(), std::strerror(errno));
+      warned = true;
+      return 0;
+    }
+  }
   const uint32_t g = g_memory->SystemHeapAlloc(uint32_t(to.size() + 1));
   if (!g) return 0;
   std::memcpy(g_memory->TranslateVirtual(g), to.c_str(), to.size() + 1);

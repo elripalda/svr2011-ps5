@@ -907,14 +907,22 @@ bool WriteList(const fs::path& game, const fs::path& overlay, const std::string&
 void Register(rex::filesystem::VirtualFileSystem* vfs, const fs::path& overlay) {
   if (!vfs) return;
   std::error_code ec;
+  int seen = 0;
   for (const auto& e : fs::recursive_directory_iterator(overlay, ec)) {  // (entry pacs sit in evt\)
-    if (!e.is_regular_file()) continue;
-    std::string rel = fs::relative(e.path(), overlay, ec).string();
+    std::error_code tec;
+    if (!e.is_regular_file(tec)) continue;
+    std::string rel = fs::relative(e.path(), overlay, tec).string();
+    if (rel.empty()) rel = e.path().lexically_relative(overlay).string();
     std::replace(rel.begin(), rel.end(), '/', '\\');
     const std::string path = "\\Device\\Harddisk0\\Partition1\\Mods\\PacOverlay\\" + rel;
-    if (auto* entry = vfs->ResolvePath(path)) entry->update();
-    else REXLOG_WARN("[svr2011] move packs: the game can't see {}", path);
+    if (auto* entry = vfs->ResolvePath(path)) {
+      entry->update();
+      ++seen;
+    } else {
+      REXLOG_WARN("[svr2011] move packs: the game can't see {}", path);
+    }
   }
+  REXLOG_INFO("[svr2011] move packs: {} overlay files registered{}", seen, ec ? " (listing stopped: " + ec.message() + ")" : "");
 }
 
 std::string FileStamp(const fs::path& p) {

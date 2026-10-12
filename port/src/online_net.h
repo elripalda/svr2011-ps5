@@ -31,10 +31,16 @@ struct Response {
 
 using Headers = std::vector<std::pair<std::string, std::string>>;
 
-// A request to any http(s) URL (https: Windows only for now); nullopt if it
-// didn't get an answer.
+// A request to any http(s) URL; nullopt if it didn't get an answer (then
+// LastError says why, on this thread).
 std::optional<Response> Request(const std::string& method, const std::string& url, const Headers& headers = {},
                                 const std::string& body = {});
+
+std::string LastError();
+
+// A host name's (or dotted address's) IPv4 address, network byte order:
+// the system's DNS, then a public DNS server. false if none answers.
+bool ResolveIPv4(const std::string& host, uint32_t* ip);
 
 // A request to the server: `path` under online_server (e.g. "/api/session"),
 // with the account's token.

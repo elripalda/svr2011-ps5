@@ -30,6 +30,9 @@
 #include <unwind.h>
 
 #include <rex/logging.h>
+#if defined(__PROSPERO__)
+#include <rex/ps5_diag.h>
+#endif
 #include <rex/ppc/context.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
@@ -73,7 +76,7 @@ void Line(FILE* f, const std::string& text) {
   REXLOG_ERROR("crash: {}", text);
 }
 
-void Report(int sig, siginfo_t* info) {
+void Report(int sig, siginfo_t* info, void* ucontext) {
   if (g_reported.exchange(true) || g_dir.empty()) return;
   if (g_hook) g_hook();
   char stamp[32];
@@ -89,6 +92,43 @@ void Report(int sig, siginfo_t* info) {
   std::snprintf(buf, sizeof(buf), "SvR 2011 crash: %s (thread %d), address %p", SignalName(sig), gettid(),
                 info ? info->si_addr : nullptr);
   Line(f, buf);
+#if defined(__PROSPERO__)
+  // The faulting thread's registers (the PS5's mcontext sits at +64 of the
+  // ucontext: rex exception_handler_posix.cpp), the return address on its
+  // stack and its frame chain - _Unwind_Backtrace stops at the signal frame.
+  // "anchor" is rex::ps5diag::NowMs's address: link-time address = value -
+  // anchor + NowMs's address in the ELF.
+  if (ucontext) {
+    const uint64_t* g = reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(ucontext) + 64);
+    const uint64_t rip = g[20], rsp = g[23], rbp = g[9];
+    std::snprintf(buf, sizeof(buf), "rip %llx rsp %llx rbp %llx anchor %llx | rax %llx rbx %llx rcx %llx rdx %llx "
+                  "rsi %llx rdi %llx r12 %llx r13 %llx r14 %llx r15 %llx",
+                  (unsigned long long)rip, (unsigned long long)rsp, (unsigned long long)rbp,
+                  (unsigned long long)rex::ps5diag::Anchor(), (unsigned long long)g[7], (unsigned long long)g[8],
+                  (unsigned long long)g[4], (unsigned long long)g[3], (unsigned long long)g[2], (unsigned long long)g[1],
+                  (unsigned long long)g[12], (unsigned long long)g[13], (unsigned long long)g[14], (unsigned long long)g[15]);
+    Line(f, buf);
+    auto plausible = [](uint64_t a) { return a >= 0x10000 && a < 0x800000000000ull && (a & 7) == 0; };
+    std::string words = "stack:";
+    for (int i = 0; i < 16 && plausible(rsp); ++i) {
+      char w[24];
+      std::snprintf(w, sizeof(w), " %llx", (unsigned long long)reinterpret_cast<const uint64_t*>(rsp)[i]);
+      words += w;
+    }
+    Line(f, words);
+    std::string chain = "frames:";
+    uint64_t fp = rbp;
+    for (int i = 0; i < 24 && plausible(fp); ++i) {
+      const uint64_t* frame = reinterpret_cast<const uint64_t*>(fp);
+      char w[24];
+      std::snprintf(w, sizeof(w), " %llx", (unsigned long long)frame[1]);
+      chain += w;
+      if (frame[0] <= fp) break;
+      fp = frame[0];
+    }
+    Line(f, chain);
+  }
+#endif
   Frames frames;
   _Unwind_Backtrace(Collect, &frames);
   for (int i = 0; i < frames.count; ++i) {
@@ -121,7 +161,7 @@ void Report(int sig, siginfo_t* info) {
 }
 
 void OnSignal(int sig, siginfo_t* info, void* ucontext) {
-  Report(sig, info);
+  Report(sig, info, ucontext);
   // Hand it on: the previous handler, else the default action.
   for (size_t i = 0; i < sizeof(kSignals) / sizeof(kSignals[0]); ++i) {
     if (kSignals[i] != sig) continue;
