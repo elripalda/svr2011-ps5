@@ -322,6 +322,33 @@ class Hub {
   };
   std::vector<Drop> drops_;
   void LoadDrops();
+  // Find Mods (hub_browse.cpp): .svrmod files anywhere - USB drives, extended
+  // storage, the console's folders - browsed with the controller and
+  // installed from where they are (the files are kept).
+  struct Browser {
+    struct Entry {
+      enum Kind { kPlace, kFolder, kMod } kind = kFolder;
+      std::string label, sub;
+      std::filesystem::path path;
+      install::ModInfo info;
+      uint64_t bytes = 0;
+    };
+    bool open = false;
+    std::filesystem::path dir;  // (empty: the places)
+    std::vector<Entry> entries;
+    int sel = 0, mods = 0;      // (mods: the .svrmod files listed)
+    float in = 0, scroll = 0, focus = 0;
+  } br_;
+  void OpenBrowser();
+  void BrowseTo(const std::filesystem::path& dir, const std::filesystem::path& focus = {});
+  void BrowserInput(uint32_t pressed);
+  void DrawBrowser();
+  float BrowserHints(float right);
+  // 0 not installed, 1 installed (this version), 2 installed (another version)
+  int ModStatus(const install::ModInfo& info) const;
+  // Installs .svrmod files where they are, one after another (task kind 5).
+  void StartModInstalls(std::vector<std::filesystem::path> files);
+  std::string ModInstallsStatus();  // ("Installing 2 of 5: ..."; "": not now)
   std::vector<Dlc> dlc_;
   std::vector<Character> roster_;
   std::vector<Pack> packs_;
@@ -338,7 +365,7 @@ class Hub {
   float task_speed_ = 0;
   uint64_t task_last_ = 0;
   float task_in_ = 0;
-  int task_kind_ = 0;  // 1 install, 2 check, 3 a mod, 4 the bundled mods (at the first start)
+  int task_kind_ = 0;  // 1 install, 2 check, 3 a mod, 4 the bundled mods (at the first start), 5 mods found (Find Mods)
   std::filesystem::path task_file_;
   std::string task_title_;
   std::string verify_result_;  // the last check's outcome

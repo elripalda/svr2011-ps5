@@ -44,7 +44,8 @@ It opens on its own **hub**, the PC port's launcher made for a controller.
 
 - **60 fps up to 4K**, with anti-aliasing and the PC port's graphics options.
 - **The hub**: Home, Settings, Mods, Roster, Textures, Music, Movies, Paint, Saves, Online, DLC and About pages, all driven by the DualSense, with menu music (a random song each time, **R3** for the next, and a volume setting).
-- **The PC port's bundled mods**: 23 superstars, 5 arenas and 11 match types, set up the first time the app opens. Turn them on in the Mods page.
+- **The PC port's bundled mods, already installed**: 23 superstars, 5 arenas and 11 match types. Turn them on in the Mods page.
+- **Find Mods**: the Mods page looks for `.svrmod` files on a USB drive, extended storage or any folder on the console, and installs them from there (one, or all of a folder's).
 - **The PC port's extras**: `.svrmod` mods, your own entrance music and movies, up to 10 HD logos per created superstar, Paint Tool import and export, save backups.
 - **PlayStation buttons** in the game's menus and prompts.
 - **An on-screen keyboard** in the hub's style for names and text.
@@ -53,7 +54,7 @@ It opens on its own **hub**, the PC port's launcher made for a controller.
 
 You need a jailbroken PS5 that runs homebrew apps from `/data/homebrew/`, with a homebrew launcher that lists them.
 
-**With the app store:** install SmackDown vs. Raw 2011 and give it your disc image. It puts the app in `/data/homebrew/PPSA92011/` and the game's files beside it. Start the app: the first time, it sets up the bundled mods (a minute or so; the bottom of the hub says so). Then press **START GAME**.
+**With the app store:** install SmackDown vs. Raw 2011 and give it your disc image. It puts the app in `/data/homebrew/PPSA92011/` and the game's files beside it. Start the app and press **START GAME**.
 
 **By hand** (an FTP client and a tool that extracts Xbox 360 disc images, such as extract-xiso):
 
@@ -61,7 +62,7 @@ You need a jailbroken PS5 that runs homebrew apps from `/data/homebrew/`, with a
 2. Over FTP, copy the `PPSA92011` folder into `/data/homebrew/`.
 3. On your PC, extract your disc image (leave out `$SystemUpdate` and `nxeart`).
 4. Over FTP, copy the extracted files **straight into** `/data/homebrew/PPSA92011/`, beside `eboot.bin` (not in a subfolder): `default.xex`, `plist360.arc`, `plist360_4x3.arc`, `pac/`, `sound/`, `movies/`. About 5.3 GB.
-5. Start **SmackDown vs. Raw 2011** from your homebrew launcher. The first time, it sets up the bundled mods; then press **START GAME**.
+5. Start **SmackDown vs. Raw 2011** from your homebrew launcher and press **START GAME**.
 
 **DLC** is optional: put the Xbox 360 content packages in `/data/homebrew/PPSA92011/DLC/` and the game installs them the next time it starts.
 
@@ -80,13 +81,17 @@ The download's `HOW TO INSTALL.txt` has the full instructions, every hub page an
 
 In the hub: **L1 / R1** change pages, **Cross** selects, **Circle** goes back, **Options** starts the game, **R3** changes the song.
 
+## Adding mods
+
+Copy `.svrmod` files onto a USB drive (any folder) and plug it into the PS5. In the hub's **Mods** page, press **Square** (**Find Mods**), open the folder, and press **Cross** to install a mod or **Triangle** to install all of the folder's. The files stay on the drive. You can also copy `.svrmod` files over FTP into `/data/homebrew/PPSA92011/Mods/`: they show up at the top of the Mods page, ready to install. New mods take effect the next time the game starts.
+
 ## Folders
 
 `/data/homebrew/PPSA92011/` holds the app, the game and everything you add: `Mods/` (one folder per type), `DLC/`, `Music/` (entrance songs, each in its own folder), `Custom Movies/`, `Texture Packs/`, `Paint Tool/`, `Saves/`, and `hub/music/` for the hub's menu music (MP3, WAV, FLAC or OGG).
 
 ## Updating
 
-Copy a newer `PPSA92011` folder over the old one. The game files, your saves, mods, music, movies and settings are kept.
+Copy a newer `PPSA92011` folder over the old one, leaving out its `Mods` folder (yours has your mods and which are on). The game files, your saves, music, movies and settings are kept.
 
 ## Reporting a problem
 

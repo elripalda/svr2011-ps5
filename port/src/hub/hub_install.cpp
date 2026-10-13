@@ -107,12 +107,15 @@ class Reader {
   int fd_ = -1;
 };
 
-// A file being written: <name>.part, renamed to <name> when complete.
+// A file being written: <name>.part, renamed to <name> when complete -
+// or (`direct`: inside a folder that is itself moved into place when done,
+// a mod's) straight to <name>, which saves a rename per file.
 class Writer {
  public:
-  explicit Writer(fs::path dst) : dst_(std::move(dst)), part_(dst_.string() + ".part") {
+  explicit Writer(fs::path dst, bool direct = false)
+      : dst_(std::move(dst)), part_(direct ? dst_ : fs::path(dst_.string() + ".part")), direct_(direct) {
     std::error_code ec;
-    fs::create_directories(dst_.parent_path(), ec);
+    if (!direct || !fs::is_directory(dst_.parent_path(), ec)) fs::create_directories(dst_.parent_path(), ec);
     fd_ = ::open(part_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd_ < 0) error_ = "couldn't create " + dst_.filename().string() + " (" + ErrnoText(errno) + ")";
   }
@@ -142,11 +145,13 @@ class Writer {
       error_ = "couldn't write " + dst_.filename().string() + " (" + ErrnoText(errno) + ")";
       return false;
     }
-    std::error_code ec;
-    fs::rename(part_, dst_, ec);
-    if (ec) {
-      error_ = "couldn't rename " + part_.filename().string() + " (" + ec.message() + ")";
-      return false;
+    if (!direct_) {
+      std::error_code ec;
+      fs::rename(part_, dst_, ec);
+      if (ec) {
+        error_ = "couldn't rename " + part_.filename().string() + " (" + ec.message() + ")";
+        return false;
+      }
     }
     done_ = true;
     return true;
@@ -155,6 +160,7 @@ class Writer {
 
  private:
   fs::path dst_, part_;
+  bool direct_ = false;
   int fd_ = -1;
   bool done_ = false;
   std::string error_;
@@ -474,8 +480,9 @@ bool SafeName(const std::string& name) {
   return true;
 }
 
-bool UnzipTo(const Reader& f, const ZipEntry& e, const fs::path& dst, Progress* p, std::string* why) {
-  Writer w(dst);
+bool UnzipTo(const Reader& f, const ZipEntry& e, const fs::path& dst, Progress* p, std::string* why,
+             bool direct = false) {
+  Writer w(dst, direct);
   if (!w.error().empty()) {
     *why = w.error();
     return false;
@@ -1179,7 +1186,7 @@ bool InstallMod(const fs::path& game, const fs::path& svrmod, bool bundled, std:
     if (e.name.empty() || e.name.back() == '/' || e.name.compare(0, prefix.size(), prefix)) continue;
     const std::string rel = e.name.substr(prefix.size());
     if (!SafeName(rel)) continue;
-    if (!UnzipTo(f, e, tmp / rel, nullptr, &why)) {
+    if (!UnzipTo(f, e, tmp / rel, nullptr, &why, true)) {  // (.incoming is moved into place whole)
       fs::remove_all(tmp, ec);
       *message = svrmod.filename().string() + ": " + why;
       return false;

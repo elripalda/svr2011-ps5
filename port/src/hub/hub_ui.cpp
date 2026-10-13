@@ -612,12 +612,15 @@ void Hub::DrawHints() {
     r = Hint(r, kCross, "Choose");
     return;
   }
+  if (br_.open) r = BrowserHints(r);
+  if (!br_.open) {
   if (tab_ != kHome && state_.Installed()) r = Hint(r, kOptions, "Start Game");
   if (tab_ != kHome) r = Hint(r, kCircle, "Home");
   switch (tab_) {
     case kHome: r = Hint(r, kCross, "Start Game"); break;
     case kSettingsTab: r = Hint(r, kLeft | kRight, "Change"); break;
     case kModsTab:
+      r = Hint(r, kSquare, "Find Mods");
       if (item_[tab_] < int(drops_.size())) r = Hint(r, kCross, "Install");
       else if (!mods_.empty()) r = Hint(r, kCross, "Turn On / Off");
       break;
@@ -639,6 +642,7 @@ void Hub::DrawHints() {
       break;
     case kSavesTab: r = Hint(r, kCross, item_[tab_] == 0 ? "Back Up" : "Restore"); break;
     case kOnlineTab: r = Hint(r, kCross, item_[tab_] == 2 ? "Turn On / Off" : item_[tab_] == 3 ? "Change" : "Select"); break;
+  }
   }
   // a message (bottom left, rising in), or the version
   if (toast_time_ > 0) {
@@ -826,8 +830,8 @@ void Hub::DrawMods() {
                                         " on. Changes take effect when the game starts.");
   if (mods_.empty() && drops_.empty()) {
     Empty("No mods yet",
-          "Copy .svrmod files over FTP into /data/homebrew/PPSA92011/Mods/ and install them here - or copy mod "
-          "folders, each type in its own folder as the PC launcher keeps them (Superstars, Arenas, Moves...).");
+          "Press Square to find .svrmod files on a USB drive or in any folder, and install them from there. You "
+          "can also copy .svrmod files over FTP into /data/homebrew/PPSA92011/Mods/: they show up here.");
     return;
   }
   const int nd = int(drops_.size());
@@ -1171,6 +1175,10 @@ void Hub::Navigate(const Pad& pad) {
     }
     return;
   }
+  if (br_.open) {  // Find Mods
+    BrowserInput(p);
+    return;
+  }
   // START GAME: once the game is installed (and nothing is being installed)
   auto start = [&] {
     if (task_) {
@@ -1224,6 +1232,10 @@ void Hub::Navigate(const Pad& pad) {
     }
     if (p & kCross) press_ = 1, Activate(0);
     if (p & kTriangle) press_ = 0.6f, PaintExportAll();
+    return;
+  }
+  if (tab_ == kModsTab && (p & kSquare)) {  // Find Mods: .svrmod files on a USB drive...
+    OpenBrowser();
     return;
   }
   const int n = Items();
@@ -1317,6 +1329,7 @@ bool Hub::Draw(const Pad& pad, float dt) {
   }
   ox_ -= shift * s_;
   Fade(first, Smooth(page_in_));
+  DrawBrowser();
   DrawHints();
   DrawConfirm();
   DrawChoice();

@@ -153,7 +153,7 @@ endif()
 # built in from assets/fonts (SIL Open Font License).
 if(PS5)
     list(APPEND SVR2011_SOURCES src/hub/hub_ui.cpp src/hub/ps5_hub.cpp src/hub/hub_pages.cpp src/hub/hub_sfx.cpp src/hub/hub_online.cpp
-                                src/hub/hub_setup.cpp src/hub/hub_install.cpp src/hub/hub_paint.cpp
+                                src/hub/hub_setup.cpp src/hub/hub_install.cpp src/hub/hub_paint.cpp src/hub/hub_browse.cpp
                                 src/ps5/sound.cpp src/music.cpp)
     set_source_files_properties(src/hub/ps5_hub.cpp PROPERTIES
         COMPILE_DEFINITIONS "SVR2011_FONTS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts\""

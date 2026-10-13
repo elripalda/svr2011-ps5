@@ -107,6 +107,50 @@ void Hub::StartModInstall(const fs::path& svrmod) {
   task_ = std::move(t);
 }
 
+// Mods found with Find Mods: installed from where they are (a USB drive...),
+// one after another; the files are kept.
+void Hub::StartModInstalls(std::vector<fs::path> files) {
+  if (files.empty() || Busy()) return;
+  auto t = std::make_shared<Task>();
+  task_kind_ = 5;
+  task_file_ = files.size() == 1 ? files[0] : fs::path();
+  task_title_ = files.size() == 1 ? files[0].filename().string() : std::to_string(files.size()) + " mods";
+  Task* raw = t.get();
+  const fs::path game = paths_.game;
+  t->p.total = files.size();
+  t->thread = std::thread([raw, game, files = std::move(files)] {
+    int ok = 0, failed = 0;
+    std::string last_ok, last_failed;
+    for (size_t i = 0; i < files.size(); ++i) {
+      if (raw->p.cancel) break;
+      raw->p.done = i;
+      raw->p.SetFile(files[i].filename().string());
+      std::string msg;
+      if (install::InstallMod(game, files[i], false, &msg)) ++ok, last_ok = msg;
+      else ++failed, last_failed = msg;
+    }
+    raw->p.done = files.size();
+    raw->p.SetFile("");
+    raw->ok = ok > 0;
+    if (files.size() == 1) raw->message = ok ? last_ok : last_failed;
+    else if (!failed) raw->message = std::to_string(ok) + " mods installed. Turn them on or off in Mods.";
+    else if (!ok) raw->message = "None of the mods could be installed. " + last_failed;
+    else
+      raw->message = std::to_string(ok) + " mods installed, " + std::to_string(failed) + " couldn't be (" + last_failed + ")";
+    raw->p.finished = true;
+  });
+  task_ = std::move(t);
+}
+
+std::string Hub::ModInstallsStatus() {
+  if (!task_ || task_kind_ != 5) return {};
+  const uint64_t done = task_->p.done, total = task_->p.total;
+  const std::string file = task_->p.File();
+  if (total <= 1) return "Installing " + (file.empty() ? task_title_ : file) + "...";
+  return "Installing " + std::to_string(std::min(done + 1, total)) + " of " + std::to_string(total) +
+         (file.empty() ? std::string("...") : ": " + file);
+}
+
 // The bundled mods, at the first start (the game's files come from the app
 // store, which doesn't unpack them).
 void Hub::StartBundled() {
@@ -151,6 +195,12 @@ void Hub::PollTask() {
   if (kind == 4) {  // the bundled mods
     LoadMods();
     if (t->p.mods_installed) Toast(t->p.result);
+    return;
+  }
+  if (kind == 5) {  // mods found with Find Mods (their files kept)
+    LoadMods();
+    Play(t->ok ? Sound::kOn : Sound::kError);
+    Toast(t->message);
     return;
   }
   if (kind == 3) {  // a mod
