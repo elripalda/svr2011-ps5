@@ -107,7 +107,7 @@ Report bugs on the **[RIPALDA Discord](https://discord.gg/GgDE5Vynyu)**. Send th
 
 The PS5 code lives beside the PC port's: `port/src/hub/` (the hub), `port/src/ps5/`, `port/cmake/ps5-toolchain.cmake` and `port/tools/ps5_*`. The runtime's PS5 layer is on this repository's [`rexglue-ps5`](../../tree/rexglue-ps5) branch.
 
-1. Generate the game's code from your own `default.xex` with `rexglue codegen` (the PC port's steps), then run `port/tools/ps5_patch_generated.py generated/rexglue.cmake`.
+1. Generate the game's code from your own `default.xex` with `rexglue codegen` (the PC port's steps; the ReXGlue v0.10.0 Linux release works), then run `port/tools/ps5_patch_generated.py generated/rexglue.cmake`. plume is renderbag/plume at `d723793` with `port/patches/plume-svr2011.patch` and then `port/patches/plume-ps5.patch`; in the runtime checkout, apply `port/patches/ffmpeg-ps5.patch` inside `thirdparty/FFmpeg`.
 2. Configure and build:
    ```sh
    cmake -S port -B port/out/ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release \

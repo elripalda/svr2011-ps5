@@ -1,0 +1,473 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+old mode 100644
+new mode 100755
+index 3f803fe..2c4ab20
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,10 +14,16 @@ if(APPLE)
+ endif()
+ 
+ string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "Linux" IS_LINUX)
++string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "FreeBSD" IS_FREEBSD)
++string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "Prospero" IS_PROSPERO)
+ 
+ # Project options
+ include(CMakeDependentOption)
+-cmake_dependent_option(PLUME_SDL_VULKAN_ENABLED "Enable SDL Vulkan integration" OFF IS_LINUX OFF)
++if(DEFINED SDL_VULKAN_ENABLED AND NOT DEFINED PLUME_SDL_VULKAN_ENABLED)
++    set(PLUME_SDL_VULKAN_ENABLED "${SDL_VULKAN_ENABLED}" CACHE BOOL "Enable SDL Vulkan integration" FORCE)
++else()
++    option(PLUME_SDL_VULKAN_ENABLED "Enable SDL Vulkan integration" OFF)
++endif()
+ cmake_dependent_option(PLUME_D3D12_AGILITY_SDK_ENABLED "Enable D3D12 Agility SDK" OFF WIN32 OFF)
+ cmake_dependent_option(PLUME_APPLE_RETINA_ENABLED "Enable Apple Retina display support" ON APPLE ON)
+ option(PLUME_BUILD_EXAMPLES "Build example applications" OFF)
+@@ -92,8 +98,10 @@ if(WIN32)
+ endif()
+ 
+ if(PLUME_SDL_VULKAN_ENABLED)
+-    target_compile_definitions(plume PUBLIC PLUME_SDL_VULKAN_ENABLED)
+-    target_include_directories(plume PUBLIC ${SDL2_INCLUDE_DIRS})
++    target_compile_definitions(plume PUBLIC PLUME_SDL_VULKAN_ENABLED SDL_VULKAN_ENABLED)
++    if(SDL2_INCLUDE_DIRS)
++        target_include_directories(plume PUBLIC ${SDL2_INCLUDE_DIRS})
++    endif()
+ endif()
+ 
+ if(PLUME_D3D12_AGILITY_SDK_ENABLED)
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+old mode 100644
+new mode 100755
+index a6811cb..97f7d94
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -209,6 +209,9 @@ namespace plume {
+         virtual ~RenderCommandQueue() { }
+         virtual std::unique_ptr<RenderCommandList> createCommandList() = 0;
+         virtual std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) = 0;
++        std::unique_ptr<RenderSwapChain> createSwapChain(RenderWindow renderWindow, uint32_t textureCount, RenderFormat format, uint32_t maxFrameLatency) {
++            return createSwapChain(RenderSwapChainDesc(renderWindow, format, textureCount, maxFrameLatency > 0, maxFrameLatency));
++        }
+         virtual void executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores = nullptr, uint32_t waitSemaphoreCount = 0, RenderCommandSemaphore **signalSemaphores = nullptr, uint32_t signalSemaphoreCount = 0, RenderCommandFence *signalFence = nullptr) = 0;
+         virtual void waitForCommandFence(RenderCommandFence *fence) = 0;
+         // [svr2011] False if the fence isn't signaled within timeoutMs (it can be waited for again).
+@@ -266,8 +269,14 @@ namespace plume {
+         virtual std::unique_ptr<RenderDevice> createDevice(const std::string &preferredDeviceName = "") = 0;
+         virtual const std::vector<std::string> &getDeviceNames() const = 0;
+         virtual const RenderInterfaceCapabilities &getCapabilities() const = 0;
++        virtual bool isValid() const { return true; }
+     };
+ 
++#if defined(PLUME_SDL_VULKAN_ENABLED)
++    extern std::unique_ptr<RenderInterface> CreateVulkanInterface(RenderWindow sdlWindow);
++#endif
++    extern std::unique_ptr<RenderInterface> CreateVulkanInterface();
++
+     extern void RenderInterfaceTest(RenderInterface *renderInterface);
+     extern void TestInitialize(RenderInterface* renderInterface, RenderWindow window);
+     extern void TestDraw();
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+old mode 100644
+new mode 100755
+index 9d5874e..ae499d7
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -15,11 +15,18 @@
+ #include <cfloat>
+ #include <cstdint>
+ 
++#if defined(SDL_VULKAN_ENABLED) && !defined(PLUME_SDL_VULKAN_ENABLED)
++#define PLUME_SDL_VULKAN_ENABLED 1
++#endif
++#if defined(PLUME_SDL_VULKAN_ENABLED) && !defined(SDL_VULKAN_ENABLED)
++#define SDL_VULKAN_ENABLED 1
++#endif
++
+ #if defined(_WIN32)
+ #include <Windows.h>
+ #elif defined(__ANDROID__)
+ #include "android/native_window.h"
+-#elif defined(__linux__) && !defined(PLUME_SDL_VULKAN_ENABLED)
++#elif defined(__linux__) && !defined(PLUME_SDL_VULKAN_ENABLED) && !defined(__PROSPERO__)
+ #include "X11/Xlib.h"
+ #undef None
+ #undef Status
+@@ -41,6 +48,22 @@ namespace plume {
+     typedef ANativeWindow* RenderWindow;
+ #elif defined(PLUME_SDL_VULKAN_ENABLED)
+     typedef SDL_Window *RenderWindow;
++#elif defined(__PROSPERO__)
++    struct RenderWindow {
++        void* window = nullptr;
++        uint32_t width = 3840;
++        uint32_t height = 2160;
++
++        RenderWindow() = default;
++        RenderWindow(std::nullptr_t) : window(nullptr) {}
++        RenderWindow(void* w, uint32_t width = 3840, uint32_t height = 2160)
++            : window(w), width(width), height(height) {}
++
++        bool operator==(const struct RenderWindow& rhs) const {
++            return window == rhs.window && width == rhs.width && height == rhs.height;
++        }
++        bool operator!=(const struct RenderWindow& rhs) const { return !(*this == rhs); }
++    };
+ #elif defined(__linux__)
+     struct RenderWindow {
+         Display* display;
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+old mode 100644
+new mode 100755
+index 79a2e21..fdce65a
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -5,7 +5,9 @@
+ // Licensed under the MIT license. See LICENSE file for details.
+ //
+ 
++#if !defined(__PROSPERO__)  // [svr2011 ps5] the runtime's VMA (3.3.0) is the one implementation in the program
+ #define VMA_IMPLEMENTATION
++#endif
+ #define VOLK_IMPLEMENTATION 
+ 
+ #include "plume_vulkan.h"
+@@ -29,6 +31,116 @@
+ // - Fix resource pools.
+ 
+ namespace plume {
++#if defined(__PROSPERO__)
++    extern "C" int sceSystemServiceHideSplashScreen();
++    extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName) __attribute__((weak));
++
++    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL ps5PlumeGetInstanceProcAddr(VkInstance instance, const char *pName) {
++        if (vk_icdGetInstanceProcAddr == nullptr || pName == nullptr) {
++            return nullptr;
++        }
++        PFN_vkVoidFunction fn = vk_icdGetInstanceProcAddr(instance, pName);
++        if (fn != nullptr) {
++            return fn;
++        }
++        if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0) {
++            return vk_icdGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties2KHR");
++        }
++        if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0) {
++            return vk_icdGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2KHR");
++        }
++        return nullptr;
++    }
++
++    static VkResult createPs5DisplaySurface(VkInstance instance, VkPhysicalDevice physicalDevice, VkSurfaceKHR *outSurface) {
++        (void)sceSystemServiceHideSplashScreen();
++        if (instance == VK_NULL_HANDLE || physicalDevice == VK_NULL_HANDLE || outSurface == nullptr) {
++            return VK_ERROR_INITIALIZATION_FAILED;
++        }
++        if (!vkGetPhysicalDeviceDisplayPropertiesKHR || !vkGetPhysicalDeviceDisplayPlanePropertiesKHR ||
++            !vkGetDisplayModePropertiesKHR || !vkCreateDisplayPlaneSurfaceKHR) {
++            fprintf(stderr, "[plume-ps5] VK_KHR_display entry points are not available.\n");
++            return VK_ERROR_EXTENSION_NOT_PRESENT;
++        }
++
++        uint32_t displayCount = 0;
++        VkResult res = vkGetPhysicalDeviceDisplayPropertiesKHR(physicalDevice, &displayCount, nullptr);
++        if (res != VK_SUCCESS || displayCount == 0) {
++            fprintf(stderr, "[plume-ps5] No displays reported by physical device (res=%d, count=%u).\n", res, displayCount);
++            return VK_ERROR_INITIALIZATION_FAILED;
++        }
++        std::vector<VkDisplayPropertiesKHR> displays(displayCount);
++        res = vkGetPhysicalDeviceDisplayPropertiesKHR(physicalDevice, &displayCount, displays.data());
++        if (res != VK_SUCCESS) {
++            return res;
++        }
++
++        uint32_t planeCount = 0;
++        res = vkGetPhysicalDeviceDisplayPlanePropertiesKHR(physicalDevice, &planeCount, nullptr);
++        if (res != VK_SUCCESS || planeCount == 0) {
++            fprintf(stderr, "[plume-ps5] No display planes reported by physical device (res=%d, count=%u).\n", res, planeCount);
++            return VK_ERROR_INITIALIZATION_FAILED;
++        }
++        std::vector<VkDisplayPlanePropertiesKHR> planes(planeCount);
++        res = vkGetPhysicalDeviceDisplayPlanePropertiesKHR(physicalDevice, &planeCount, planes.data());
++        if (res != VK_SUCCESS) {
++            return res;
++        }
++
++        VkDisplayKHR chosenDisplay = VK_NULL_HANDLE;
++        VkDisplayModeKHR chosenMode = VK_NULL_HANDLE;
++        VkExtent2D chosenExtent = { 3840, 2160 };
++        for (uint32_t i = 0; i < displayCount && chosenMode == VK_NULL_HANDLE; ++i) {
++            uint32_t modeCount = 0;
++            if (vkGetDisplayModePropertiesKHR(physicalDevice, displays[i].display, &modeCount, nullptr) != VK_SUCCESS || modeCount == 0) {
++                continue;
++            }
++            std::vector<VkDisplayModePropertiesKHR> modes(modeCount);
++            if (vkGetDisplayModePropertiesKHR(physicalDevice, displays[i].display, &modeCount, modes.data()) != VK_SUCCESS) {
++                continue;
++            }
++            chosenDisplay = displays[i].display;
++            chosenMode = modes[0].displayMode;
++            chosenExtent = modes[0].parameters.visibleRegion;
++            for (uint32_t m = 0; m < modeCount; ++m) {
++                if (modes[m].parameters.visibleRegion.width == 3840 && modes[m].parameters.visibleRegion.height == 2160) {
++                    chosenMode = modes[m].displayMode;
++                    chosenExtent = modes[m].parameters.visibleRegion;
++                    break;
++                }
++            }
++        }
++
++        if (chosenMode == VK_NULL_HANDLE) {
++            fprintf(stderr, "[plume-ps5] No usable display mode found.\n");
++            return VK_ERROR_INITIALIZATION_FAILED;
++        }
++
++        uint32_t chosenPlane = UINT32_MAX;
++        for (uint32_t i = 0; i < planeCount; ++i) {
++            if (planes[i].currentDisplay == VK_NULL_HANDLE || planes[i].currentDisplay == chosenDisplay) {
++                chosenPlane = i;
++                break;
++            }
++        }
++        if (chosenPlane == UINT32_MAX) {
++            chosenPlane = 0;
++        }
++
++        VkDisplaySurfaceCreateInfoKHR surfaceCreateInfo = {};
++        surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR;
++        surfaceCreateInfo.displayMode = chosenMode;
++        surfaceCreateInfo.planeIndex = chosenPlane;
++        surfaceCreateInfo.planeStackIndex = planes[chosenPlane].currentStackIndex;
++        surfaceCreateInfo.transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++        surfaceCreateInfo.globalAlpha = 1.0f;
++        surfaceCreateInfo.alphaMode = VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR;
++        surfaceCreateInfo.imageExtent = chosenExtent;
++
++        return vkCreateDisplayPlaneSurfaceKHR(instance, &surfaceCreateInfo, nullptr, outSurface);
++    }
++#endif
++
+     // Backend constants.
+ 
+     // Required buffer alignment for acceleration structures.
+@@ -46,10 +158,9 @@ namespace plume {
+ 
+     static const std::unordered_set<std::string> RequiredInstanceExtensions = {
+         VK_KHR_SURFACE_EXTENSION_NAME,
+-#   ifdef VULKAN_OBJECT_NAMES_ENABLED
+-        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+-#   endif
+-#   if defined(_WIN32)
++#   if defined(__PROSPERO__)
++        VK_KHR_DISPLAY_EXTENSION_NAME,
++#   elif defined(_WIN32)
+         VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
+ #   elif defined(__ANDROID__)
+         VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
+@@ -59,10 +170,16 @@ namespace plume {
+ #   endif
+ #   elif defined(__APPLE__)
+         VK_EXT_METAL_SURFACE_EXTENSION_NAME,
++#   endif
++#   if defined(VULKAN_OBJECT_NAMES_ENABLED) && !defined(__PROSPERO__)
++        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+ #   endif
+     };
+ 
+     static const std::unordered_set<std::string> OptionalInstanceExtensions = {
++#   if defined(VULKAN_OBJECT_NAMES_ENABLED) && defined(__PROSPERO__)
++        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
++#   endif
+ #   if defined(__APPLE__)
+         // Tells the system Vulkan loader to enumerate portability drivers, if supported.
+         VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
+@@ -848,7 +965,7 @@ namespace plume {
+         bufferInfo.usage |= (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT) ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
+         bufferInfo.usage |= (desc.flags & RenderBufferFlag::SHADER_BINDING_TABLE) ? VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR : 0;
+         
+-        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
++        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
+         const bool useDeviceAddress = device->capabilities.bufferDeviceAddress && (desc.flags & deviceAddressMask);
+         bufferInfo.usage |= useDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0;
+         
+@@ -938,7 +1055,11 @@ namespace plume {
+     }
+ 
+     uint64_t VulkanBuffer::getDeviceAddress() const {
+-        assert((desc.flags & RenderBufferFlag::DEVICE_ADDRESSABLE) != 0 && "Buffer must have been created with GPU_ADDRESSABLE flag.");
++        if (!device->capabilities.bufferDeviceAddress) {
++            return 0;
++        }
++        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
++        assert((desc.flags & deviceAddressMask) != 0 && "Buffer must have been created with an addressable flag.");
+         if (deviceAddress != 0) {  // [svr2011] a buffer's address never changes
+             return deviceAddress;
+         }
+@@ -2132,7 +2253,14 @@ namespace plume {
+ 
+         VkResult res;
+ 
+-#   if defined(_WIN32)
++#   if defined(__PROSPERO__)
++        VulkanInterface *renderInterface = commandQueue->device->renderInterface;
++        res = createPs5DisplaySurface(renderInterface->instance, commandQueue->device->physicalDevice, &surface);
++        if (res != VK_SUCCESS) {
++            fprintf(stderr, "createPs5DisplaySurface failed with error code 0x%X.\n", res);
++            return;
++        }
++#   elif defined(_WIN32)
+         assert(desc.renderWindow != 0);
+         VkWin32SurfaceCreateInfoKHR surfaceCreateInfo = {};
+         surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+@@ -2388,7 +2516,10 @@ namespace plume {
+         createInfo.imageExtent.width = width;
+         createInfo.imageExtent.height = height;
+         createInfo.imageArrayLayers = 1;
+-        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++        createInfo.imageUsage = (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) & surfaceCapabilities.supportedUsageFlags;
++        if (createInfo.imageUsage == 0) {
++            createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++        }
+         createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+         createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+         createInfo.compositeAlpha = pickedAlphaFlag;
+@@ -2401,6 +2532,9 @@ namespace plume {
+             fprintf(stderr, "vkCreateSwapchainKHR failed with error code 0x%X.\n", res);
+             return false;
+         }
++#if defined(__PROSPERO__)
++        (void)sceSystemServiceHideSplashScreen();
++#endif
+ 
+         // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
+         createdPresentMode = requiredPresentMode;
+@@ -2508,7 +2642,19 @@ namespace plume {
+     }
+ 
+     void VulkanSwapChain::getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const {
+-#   if defined(_WIN32)
++#   if defined(__PROSPERO__)
++        if (surface != VK_NULL_HANDLE && commandQueue != nullptr && commandQueue->device != nullptr) {
++            VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
++            if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(commandQueue->device->physicalDevice, surface, &surfaceCapabilities) == VK_SUCCESS &&
++                surfaceCapabilities.currentExtent.width != UINT32_MAX && surfaceCapabilities.currentExtent.width > 0) {
++                dstWidth = surfaceCapabilities.currentExtent.width;
++                dstHeight = surfaceCapabilities.currentExtent.height;
++                return;
++            }
++        }
++        dstWidth = 3840;
++        dstHeight = 2160;
++#   elif defined(_WIN32)
+         RECT rect;
+         GetClientRect(desc.renderWindow, &rect);
+         dstWidth = rect.right - rect.left;
+@@ -4165,6 +4311,8 @@ namespace plume {
+             return;
+         }
+ 
++        volkLoadDevice(vk);
++
+         for (uint32_t i = 0; i < queueFamilyCount; i++) {
+             for (uint32_t j = 0; j < queueFamilies[i].queues.size(); j++) {
+                 vkGetDeviceQueue(vk, i, j, &queueFamilies[i].queues[j].vk);
+@@ -4710,16 +4858,26 @@ namespace plume {
+ 
+     // VulkanInterface
+ 
+-#if PLUME_SDL_VULKAN_ENABLED
++    VulkanInterface::VulkanInterface() : VulkanInterface(RenderWindow{}) {
++    }
++
+     VulkanInterface::VulkanInterface(RenderWindow sdlWindow) {
++        (void)sdlWindow;
++        VkResult res = VK_SUCCESS;
++#if defined(__PROSPERO__)
++        (void)sceSystemServiceHideSplashScreen();
++        if (vk_icdGetInstanceProcAddr == nullptr) {
++            fprintf(stderr, "vk_icdGetInstanceProcAddr is not linked into the PS5 executable.\n");
++            return;
++        }
++        volkInitializeCustom(ps5PlumeGetInstanceProcAddr);
+ #else
+-    VulkanInterface::VulkanInterface() {
+-#endif
+-        VkResult res = volkInitialize();
++        res = volkInitialize();
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
+             return;
+         }
++#endif
+ 
+         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+         appInfo.pApplicationName = "plume";
+@@ -4739,7 +4897,7 @@ namespace plume {
+ #   endif
+ 
+         // Check for extensions.
+-        uint32_t extensionCount;
++        uint32_t extensionCount = 0;
+         vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
+ 
+         std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+@@ -4751,7 +4909,7 @@ namespace plume {
+         const std::unordered_set<std::string> dlssExtensions = DLSS::getRequiredInstanceExtensionsVulkan();
+ #   endif
+ 
+-#   if PLUME_SDL_VULKAN_ENABLED
++#   if PLUME_SDL_VULKAN_ENABLED && !defined(__PROSPERO__)
+         // Push the extensions specified by SDL as required.
+         // SDL2 has this awkward requirement for the window to pull the extensions from. 
+         // This can be removed when upgrading to SDL3.
+@@ -4908,17 +5066,15 @@ namespace plume {
+ 
+     // Global creation function.
+ 
+-#if PLUME_SDL_VULKAN_ENABLED
+     std::unique_ptr<RenderInterface> CreateVulkanInterface(RenderWindow sdlWindow) {
+         std::unique_ptr<VulkanInterface> createdInterface = std::make_unique<VulkanInterface>(sdlWindow);
+         return createdInterface->isValid() ? std::move(createdInterface) : nullptr;
+     }
+-#else
++
+     std::unique_ptr<RenderInterface> CreateVulkanInterface() {
+         std::unique_ptr<VulkanInterface> createdInterface = std::make_unique<VulkanInterface>();
+         return createdInterface->isValid() ? std::move(createdInterface) : nullptr;
+     }
+-#endif
+ 
+     std::unique_ptr<RenderInterface> CreateVulkanInterface(const VulkanExistingDevice &existing) {  // [svr2011]
+         std::unique_ptr<VulkanInterface> createdInterface = std::make_unique<VulkanInterface>(existing);
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+old mode 100644
+new mode 100755
+index 6c1cf32..69e05b8
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -18,7 +18,7 @@
+ #define VK_USE_PLATFORM_WIN32_KHR
+ #elif defined(__ANDROID__)
+ #define VK_USE_PLATFORM_ANDROID_KHR
+-#elif defined(__linux__) && !defined(PLUME_SDL_VULKAN_ENABLED)
++#elif defined(__linux__) && !defined(PLUME_SDL_VULKAN_ENABLED) && !defined(__PROSPERO__)
+ #define VK_USE_PLATFORM_XLIB_KHR
+ #elif defined(__APPLE__)
+ #define VK_USE_PLATFORM_METAL_EXT
+@@ -497,17 +497,14 @@ namespace plume {
+ 
+         VulkanInterface(const VulkanExistingDevice &existing);  // [svr2011]
+ 
+-#   if PLUME_SDL_VULKAN_ENABLED
+         VulkanInterface(RenderWindow sdlWindow);
+-#   else
+         VulkanInterface();
+-#   endif
+ 
+         ~VulkanInterface() override;
+         std::unique_ptr<RenderDevice> createDevice(const std::string &preferredDeviceName) override;
+         const RenderInterfaceCapabilities &getCapabilities() const override;
+         const std::vector<std::string> &getDeviceNames() const override;
+-        bool isValid() const;
++        bool isValid() const override;
+     };
+ 
+     // [svr2011]
