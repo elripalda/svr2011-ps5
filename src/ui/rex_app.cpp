@@ -20,6 +20,7 @@
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
@@ -43,6 +44,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <string_view>
 
@@ -175,8 +177,17 @@ bool ReXApp::SetupEnvironment() {
     log_config.app_name = std::string(GetName());
     log_config.log_dir = (exe_dir / "logs").string();
   }
+#if REX_PLATFORM_PS5
+  // [ps5 port] Not a write to the drive after every line, on whichever game
+  // thread logged it: warnings and errors at once, the rest once a second (a
+  // crash flushes the log first).
+  log_config.flush_level = spdlog::level::warn;
+#endif
 
   rex::InitLogging(log_config);
+#if REX_PLATFORM_PS5
+  if (REXCVAR_GET(log_flush_interval) <= 0) spdlog::flush_every(std::chrono::seconds(1));
+#endif
   rex::RegisterLogLevelCallback();
 
   log_sink_ = std::make_shared<rex::LogCaptureSink>();
