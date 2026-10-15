@@ -89,6 +89,7 @@ uint32_t g_language_label = 0;  // "LANGUAGE"
 uint32_t g_controls_label = 0;  // "CONTROLS"
 uint32_t g_backgrounds_label = 0;  // "BACKGROUNDS"
 uint32_t g_extra_label = 0;     // "Mods" (the "?" tile opens the managers: src/managers.cpp)
+rex::memory::Memory* g_guest_memory = nullptr;  // (the match start's log line)
 
 uint32_t Be32(const uint8_t* p) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
@@ -212,6 +213,7 @@ uint32_t ScriptMenuSelects(uint32_t* group, uint32_t* row) {
 namespace svr2011 {
 
 void InstallMenuHooks(rex::memory::Memory* memory) {
+  g_guest_memory = memory;
   // The labels in the game's language (user_language: the Xbox 360 language
   // ids; the game's own text follows it).
   struct Labels {
@@ -482,7 +484,15 @@ REX_HOOK_RAW(sub_826E1C88) {
 REX_EXTERN(__imp__sub_823EEB98);
 REX_HOOK_RAW(sub_823EEB98) {
   svr2011::ArmMatchStart([] {
-    REXLOG_INFO("[svr2011] match starts");
+    // (with the session's match count and the guest's free physical memory:
+    // logs of long sessions show what changes from match to match)
+    static uint32_t matches = 0;
+    uint32_t free_mb = 0;
+    if (g_guest_memory) {
+      if (auto* heap = g_guest_memory->GetPhysicalHeap())
+        free_mb = uint32_t(uint64_t(heap->GetUnreservedPageCount()) * heap->page_size() >> 20);
+    }
+    REXLOG_INFO("[svr2011] match starts (match {} this session; guest memory {} MB free)", ++matches, free_mb);
     svr2011::TouchGameInMatch(true);  // (the touch controller's MATCH layout)
     svr2011::native::SetMatchScene(true);  // (wide screens: full width)
     svr2011::SetDiscordScene(svr2011::DiscordScene::kMatch);

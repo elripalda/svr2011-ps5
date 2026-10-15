@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -299,8 +300,35 @@ void DecodeBC4(const uint8_t* b, uint8_t out[16]) {
   for (int k = 0; k < 6; ++k) bits |= uint64_t(b[2 + k]) << (8 * k);
   for (uint32_t i = 0; i < 16; ++i) out[i] = v[(bits >> (3 * i)) & 7];
 }
-uint32_t g_srv_next = 0, g_srv_end = 0;
+uint32_t g_srv_first = 0, g_srv_next = 0, g_srv_end = 0;
 uint32_t g_sampler_next = 0, g_sampler_end = 0;
+// Texture table slots given back (a texture let go, a pack texture replacing
+// the game's, a resolve copy's views): the frames in flight may still read
+// them, so they're handed out again only kSlotReuseFrames later. Before, a
+// slot was never reused: every texture of every match kept one, and a long
+// session could fill the table (then textures went missing).
+constexpr uint64_t kSlotReuseFrames = 16;
+std::deque<std::pair<uint64_t, uint32_t>> g_srv_retired;  // (frame given back, slot)
+std::vector<uint32_t> g_srv_free;                         // reusable now
+
+uint32_t AllocSrv(uint64_t frame) {
+  while (!g_srv_retired.empty() && g_srv_retired.front().first + kSlotReuseFrames <= frame) {
+    g_srv_free.push_back(g_srv_retired.front().second);
+    g_srv_retired.pop_front();
+  }
+  if (!g_srv_free.empty()) {
+    const uint32_t srv = g_srv_free.back();
+    g_srv_free.pop_back();
+    return srv;
+  }
+  return g_srv_next < g_srv_end ? g_srv_next++ : UINT32_MAX;
+}
+
+void FreeSrv(uint64_t frame, uint32_t srv) {
+  if (srv != UINT32_MAX) g_srv_retired.emplace_back(frame, srv);
+}
+
+bool SrvAvailable() { return !g_srv_free.empty() || !g_srv_retired.empty() || g_srv_next < g_srv_end; }
 std::unordered_map<uint64_t, Entry> g_textures;   // key hash -> texture
 struct SamplerEntry {
   uint32_t index;
@@ -616,8 +644,8 @@ uint32_t ResolvedView(const Context& ctx, const Resolved& res,
                        (uint64_t(res.format) << 46);
   auto it = g_resolved_views.find(key);
   if (it != g_resolved_views.end()) return it->second.index;
-  if (g_srv_next >= g_srv_end) return UINT32_MAX;
-  const uint32_t srv = g_srv_next++;
+  const uint32_t srv = AllocSrv(ctx.frame);
+  if (srv == UINT32_MAX) return UINT32_MAX;
   plume::RenderTextureViewDesc vd = plume::RenderTextureViewDesc::Texture2D(gamma ? res.gamma_format : res.format);
   vd.mipLevels = 1;
   vd.componentMapping = ComponentMapping(fetch.swizzle, res.components, res.swap_rb);
@@ -1040,11 +1068,12 @@ view:
     return true;
   }
   if (e.srv == UINT32_MAX) {
-    if (g_srv_next >= g_srv_end) {
-      REXLOG_WARN("native renderer: texture descriptor heap full");
+    e.srv = AllocSrv(ctx.frame);
+    if (e.srv == UINT32_MAX) {
+      static uint32_t logged = 0;
+      if (logged++ < 8) REXLOG_WARN("native renderer: texture descriptor heap full");
       return false;
     }
-    e.srv = g_srv_next++;
   }
   plume::RenderTextureViewDesc vd;
   vd.format = resource_format;
@@ -1123,7 +1152,7 @@ bool Replace(const Context& ctx, Entry& e, const xenos::xe_gpu_texture_fetch_t& 
     logged = true;
     return false;
   }
-  if (g_srv_next >= g_srv_end) return false;
+  if (!SrvAvailable()) return false;
   // Levels with their data (a DDS may stop short).
   std::vector<Footprint> fps;
   uint64_t total = 0;
@@ -1189,9 +1218,15 @@ bool Replace(const Context& ctx, Entry& e, const xenos::xe_gpu_texture_fetch_t& 
   vd.mipLevels = levels;
   vd.componentMapping = ComponentMapping(0x688, 4);  // (xyzw: the file is the texture as it looks)
   std::shared_ptr<plume::RenderTextureView> view = resource->createTextureView(vd);
-  const uint32_t srv = g_srv_next++;
+  const uint32_t srv = AllocSrv(ctx.frame);
+  if (srv == UINT32_MAX) {  // (only slots still in flight were left)
+    ctx.retire(std::move(view));
+    ctx.retire(std::move(resource));
+    return false;
+  }
   ctx.texture_sets[0]->setTexture(ctx.texture_base[0] + srv, resource.get(), plume::RenderTextureLayout::SHADER_READ,
                                   view.get());
+  FreeSrv(ctx.frame, e.srv);  // (the game's own texture's slot)
   if (e.view) ctx.retire(std::move(e.view));
   if (e.resource && !IsPadPicture(e.resource)) ctx.retire(std::move(e.resource));
   g_resident_bytes = g_resident_bytes - std::min(g_resident_bytes, e.bytes) + total;
@@ -1225,6 +1260,7 @@ void Initialize(rex::memory::Memory* memory, uint32_t srv_first, uint32_t srv_co
                 uint32_t sampler_first, uint32_t sampler_count) {
   g_memory = memory;
   g_physical = memory->TranslatePhysical(0);
+  g_srv_first = srv_first;
   g_srv_next = srv_first;
   g_srv_end = srv_first + srv_count;
   g_sampler_next = sampler_first;
@@ -1315,7 +1351,9 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
         e.resource = nullptr;
         g_resident_bytes -= std::min(g_resident_bytes, e.bytes);
         e.bytes = 0;
+        FreeSrv(ctx.frame, e.srv);  // (a new slot: this one may still be read by the frames in flight)
         e.srv = UINT32_MAX;
+        if (e.replaced && g_replaced) --g_replaced;
         e.replaced = false;
         e.pending = 0;
         e.ready = nullptr;
@@ -1463,6 +1501,7 @@ void ReleaseResolved(const Context& ctx, plume::RenderTexture* texture) {
   for (auto it = g_resolved_views.begin(); it != g_resolved_views.end();) {
     if (it->second.texture == texture) {
       ctx.retire(std::move(it->second.view));
+      FreeSrv(ctx.frame, it->second.index);
       it = g_resolved_views.erase(it);
     } else {
       ++it;
@@ -1470,6 +1509,29 @@ void ReleaseResolved(const Context& ctx, plume::RenderTexture* texture) {
   }
   for (auto it = g_resolved.begin(); it != g_resolved.end();)
     it = it->second.resource == texture ? g_resolved.erase(it) : std::next(it);
+}
+
+uint32_t Trim(const Context& ctx, uint64_t unused_frames) {
+  uint32_t dropped = 0;
+  for (auto it = g_textures.begin(); it != g_textures.end();) {
+    Entry& e = it->second;
+    // (a texture that failed was never drawn: its creation counts)
+    if (ctx.frame < std::max(e.used_frame, e.created_frame) + unused_frames) {
+      ++it;
+      continue;
+    }
+    if (e.view) ctx.retire(std::move(e.view));
+    if (e.resource) {
+      if (!IsPadPicture(e.resource)) ctx.retire(std::move(e.resource));  // (the shared button pictures stay)
+      ++dropped;
+    }
+    g_resident_bytes -= std::min(g_resident_bytes, e.bytes);
+    if (e.skip && e.bytes && g_reduced) --g_reduced;
+    if (e.replaced && g_replaced) --g_replaced;
+    FreeSrv(ctx.frame, e.srv);
+    it = g_textures.erase(it);
+  }
+  return dropped;
 }
 
 plume::RenderComponentMapping ComponentMapping(uint32_t swizzle, uint32_t components, bool swap_rb) {
@@ -1492,6 +1554,8 @@ Stats TakePerf() {
   for (const auto& [key, e] : g_textures) s.textures += e.resource != nullptr;
   s.resident_bytes = g_resident_bytes;
   s.reduced = g_reduced;
+  s.slots_used = (g_srv_next - g_srv_first) - uint32_t(g_srv_free.size() + g_srv_retired.size());
+  s.slots_total = g_srv_end - g_srv_first;
   g_stats.hash_bytes = g_stats.upload_bytes = 0;
   g_stats.hashes = g_stats.uploads_total = 0;
   g_stats.hash_ms = g_stats.upload_ms = g_stats.convert_ms = 0;

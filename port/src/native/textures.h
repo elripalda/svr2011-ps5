@@ -102,6 +102,11 @@ void RegisterResolved(uint32_t base_address, plume::RenderTexture* texture, plum
 // views go with it (after the frame, through ctx.retire).
 void ReleaseResolved(const Context& ctx, plume::RenderTexture* texture);
 
+// Lets go of the textures not drawn with for `unused_frames` frames: their
+// GPU memory goes (after the frame, through ctx.retire) and their table slots
+// are reused; one drawn again is uploaded again. Returns how many went.
+uint32_t Trim(const Context& ctx, uint64_t unused_frames);
+
 // The component mapping for a Xenos fetch swizzle (0-3 xyzw, 4 zero, 5 one);
 // components the format lacks repeat its last one (as Xenia does).
 plume::RenderComponentMapping ComponentMapping(uint32_t swizzle, uint32_t components,
@@ -115,6 +120,7 @@ struct Stats {
   uint64_t hash_bytes = 0, upload_bytes = 0;  // upload: host bytes copied
   uint64_t resident_bytes = 0;  // all the textures' host bytes (TakePerf)
   uint32_t reduced = 0;         // textures with levels left out (texture quality)
+  uint32_t slots_used = 0, slots_total = 0;  // texture table slots (TakePerf)
   uint32_t hashes = 0, uploads_total = 0;
   double hash_ms = 0, upload_ms = 0, convert_ms = 0;  // convert: of upload_ms
 };

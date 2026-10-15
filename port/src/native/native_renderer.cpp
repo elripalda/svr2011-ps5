@@ -83,10 +83,13 @@ REXCVAR_DEFINE_BOOL(native_shadows, true, "GPU",
                     "Native renderer: the characters' and the arena's real-time shadows (false: nothing "
                     "is drawn into the shadow map - no shadows, fewer draws). Applies at once.");
 
-// On by default only on phones, where the driver's command recording is a
-// large part of the render thread; on a PC (D3D12, Batista's entrance at
-// 5,400 draws) handing the commands over cost more than recording them.
-#if defined(__ANDROID__)
+// On by default on phones, where the driver's command recording is a large
+// part of the render thread, and on the PS5 (RADV on its Zen 2 cores: the
+// game's render thread ran out of time in entrances, replays and the
+// post-match scene, 1,800-2,600 draws a frame); on a PC (D3D12, Batista's
+// entrance at 5,400 draws) handing the commands over cost more than recording
+// them. (svr2011.toml: native_record_thread = false turns it off.)
+#if defined(__ANDROID__) || defined(__PROSPERO__)
 constexpr bool kRecordThreadDefault = true;
 #else
 constexpr bool kRecordThreadDefault = false;
@@ -1632,6 +1635,15 @@ bool BeginFrame(Renderer* r) {
   r->frame_stats = {};
   r->texture_context = TextureContext(r);
   g_resolved_this_frame = false;
+  // Out of matches, every 5 s: the textures not drawn for 30 s go (their GPU
+  // memory and table slots come back). Before, the cache kept every texture
+  // of every match - on the PS5 ~300 more and 30 MB a match.
+  static uint64_t trimmed = 0;
+  if (g_main && !g_match_scene.load() && r->frames >= trimmed + 300) {
+    trimmed = r->frames;
+    if (const uint32_t n = textures::Trim(r->texture_context, 1800))
+      REXLOG_INFO("native renderer: {} textures not used for 30 s let go", n);
+  }
   return true;
 }
 
@@ -1689,9 +1701,9 @@ void UpdateTitle(Renderer* r) {
     {
       const textures::Stats ts = textures::TakePerf();
       REXLOG_INFO("native perf: textures: {} uploads ({:.1f} MB, {:.1f} ms, converting {:.1f} ms) in {:.1f} s; "
-                  "{} resident ({:.1f} MB, {} with mip levels left out)",
+                  "{} resident ({:.1f} MB, {} with mip levels left out), table slots {} of {}",
                   ts.uploads_total, ts.upload_bytes / 1048576.0, ts.upload_ms, ts.convert_ms, psecs,
-                  ts.textures, ts.resident_bytes / 1048576.0, ts.reduced);
+                  ts.textures, ts.resident_bytes / 1048576.0, ts.reduced, ts.slots_used, ts.slots_total);
       REXLOG_INFO("native perf: hashed per frame: vertex buffers {:.0f} KB static + {:.0f} KB dynamic, "
                   "constants compared {:.0f} KB ({:.0f}% reused), textures {:.0f} KB; "
                   "buffers back to checks at every use {}; repeat checks {:.0f} unchanged / {:.0f} changed",
