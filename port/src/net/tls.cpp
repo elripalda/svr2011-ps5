@@ -199,7 +199,6 @@ std::unique_ptr<Tls> Tls::Start(int socket, const std::string& host) {
   }
   mbedtls_ssl_set_bio(&s.ssl, &s.socket, SendCb, RecvCb, nullptr);
   REXLOG_INFO("online: https: handshake with {}", host);
-  rex::FlushLogging();
   while ((rc = mbedtls_ssl_handshake(&s.ssl)) != 0) {
     if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
     const uint32_t flags = mbedtls_ssl_get_verify_result(&s.ssl);

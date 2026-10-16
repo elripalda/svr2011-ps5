@@ -386,11 +386,19 @@ GameFiles GameFilesState(std::string* first_bad) {
 std::string GameFilesOnlineMessage() {
   const GameFiles files = GameFilesState();
   if (files == GameFiles::kModified)
+#if defined(__PROSPERO__)
+    return "Your game files are modified - online is off.\nCopy the files from your disc image into the app's folder again.";
+#else
     return "Your game files are modified - online is off.\nUse Verify game files in the launcher to repair them.";
+#endif
   if (g_version.load() == Version::kOlder) {
     std::lock_guard lock(g_latest_mutex);
     return "Unable to play online due to a difference in game versions.\nUpdate to v" + g_latest +
+#if defined(__PROSPERO__)
+           " (the PS5 app's update for it) to play online.";
+#else
            " (the launcher's Check for updates, or GitHub) to play online.";
+#endif
   }
   if (files == GameFiles::kChecking || g_version.load() == Version::kChecking)
     return "Checking your game files.\nOnline will be ready in a moment - please try again.";
@@ -409,7 +417,11 @@ std::string VersionDifference(const std::string& theirs) {
   if (theirs == PortVersion()) return "";
   if (!theirs.empty() && VersionNewer(theirs, PortVersion()))
     return "They're on v" + theirs + ", you're on v" + PortVersion() + ": update to v" + theirs +
+#if defined(__PROSPERO__)
+           " (the PS5 app's update for it) to play them.";
+#else
            " (launcher or GitHub) to play them.";
+#endif
   return "They're on " + (theirs.empty() ? std::string("an older version") : "v" + theirs) + ", you're on v" +
          PortVersion() + ": they need to update.";
 }

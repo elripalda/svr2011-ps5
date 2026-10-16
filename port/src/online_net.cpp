@@ -464,23 +464,152 @@ struct Link {
   }
 };
 
-// http (and https) over sockets.
-std::optional<Response> SocketRequest(const std::string& method, const Url& url, const Headers& headers,
-                                      const std::string& body) {
-  Link link;
-  std::string raw;
-  if (link.Open(url)) {
-    std::string request = method + " " + url.path + " HTTP/1.0\r\nHost: " + HostHeader(url) +
-                          "\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
-    for (const auto& [k, v] : headers) request += k + ": " + v + "\r\n";
-    request += "\r\n" + body;
-    if (link.Send(request)) {
-      std::vector<char> buf(65536);
-      int n;
-      while ((n = link.Recv(buf.data(), buf.size())) > 0 && raw.size() < (32u << 20)) raw.append(buf.data(), size_t(n));
+// Connections kept open for the next request to the same server (HTTP/1.1
+// keep-alive). A new one costs a DNS lookup, a TCP connect and, for https, a
+// TLS handshake - three round trips before the request is even sent, for
+// every one of Community Creations' requests (the PS5's were each a fresh
+// connection; Windows' WinHTTP keeps them).
+struct IdleLink {
+  std::string key;
+  std::unique_ptr<Link> link;
+  std::chrono::steady_clock::time_point since;
+};
+std::mutex g_idle_mutex;
+std::vector<IdleLink> g_idle;
+constexpr auto kIdleFor = std::chrono::seconds(20);  // (servers close idle ones after a while)
+constexpr size_t kIdleMax = 6;
+
+std::string LinkKey(const Url& url) {
+  return (url.https ? "https://" : "http://") + url.host + ":" + std::to_string(url.port);
+}
+
+std::unique_ptr<Link> TakeIdle(const std::string& key) {
+  std::vector<std::unique_ptr<Link>> stale;  // (closed outside the lock)
+  std::unique_ptr<Link> found;
+  {
+    std::lock_guard lock(g_idle_mutex);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = g_idle.begin(); it != g_idle.end();) {
+      if (now - it->since > kIdleFor) {
+        stale.push_back(std::move(it->link));
+      } else if (!found && it->key == key) {
+        found = std::move(it->link);
+      } else {
+        ++it;
+        continue;
+      }
+      it = g_idle.erase(it);
     }
   }
-  return ParseRaw(raw);
+  return found;
+}
+
+void PutIdle(const std::string& key, std::unique_ptr<Link> link) {
+  std::unique_ptr<Link> oldest;
+  std::lock_guard lock(g_idle_mutex);
+  if (g_idle.size() >= kIdleMax) {
+    oldest = std::move(g_idle.front().link);
+    g_idle.erase(g_idle.begin());
+  }
+  g_idle.push_back(IdleLink{key, std::move(link), std::chrono::steady_clock::now()});
+}
+
+// One answer read from `link` into `raw` (status line, headers, body - a
+// chunked body decoded). False when it didn't all come. *reusable: the
+// connection can take another request.
+bool ReadAnswer(Link& link, const std::string& method, std::string* raw, bool* reusable) {
+  *reusable = false;
+  std::vector<char> buf(65536);
+  const auto more = [&] {
+    const int n = link.Recv(buf.data(), buf.size());
+    if (n <= 0) return false;
+    raw->append(buf.data(), size_t(n));
+    return true;
+  };
+  size_t head_end;
+  while ((head_end = raw->find("\r\n\r\n")) == std::string::npos)
+    if (raw->size() > 65536 || !more()) return false;
+  Response h;
+  ParseHeaders(raw->substr(0, head_end), &h);
+  const int status = std::atoi(raw->c_str() + raw->find(' ') + 1);
+  const std::string connection = Lower(h.headers["connection"]);
+  const bool keep = raw->compare(0, 8, "HTTP/1.0") == 0 ? connection == "keep-alive" : connection != "close";
+  const size_t body_at = head_end + 4;
+  constexpr size_t kMax = 32u << 20;
+  if (method == "HEAD" || status == 204 || status == 304 || status / 100 == 1) {
+    raw->resize(body_at);
+    *reusable = keep && status / 100 != 1;
+    return true;
+  }
+  if (Lower(h.headers["transfer-encoding"]).find("chunked") != std::string::npos) {
+    std::string body;
+    size_t at = body_at, line;
+    for (;;) {
+      while ((line = raw->find("\r\n", at)) == std::string::npos)
+        if (!more()) return false;
+      const size_t size = size_t(std::strtoull(raw->c_str() + at, nullptr, 16));
+      at = line + 2;
+      if (size == 0) {
+        for (;;) {  // (trailers, to the empty line)
+          while ((line = raw->find("\r\n", at)) == std::string::npos)
+            if (!more()) return false;
+          const bool last = line == at;
+          at = line + 2;
+          if (last) break;
+        }
+        break;
+      }
+      if (body.size() + size > kMax) return false;
+      while (raw->size() < at + size + 2)
+        if (!more()) return false;
+      body.append(*raw, at, size);
+      at += size + 2;
+    }
+    const bool extra = raw->size() > at;  // (bytes past the answer: not reused)
+    raw->resize(body_at);
+    *raw += body;
+    *reusable = keep && !extra;
+    return true;
+  }
+  if (auto it = h.headers.find("content-length"); it != h.headers.end()) {
+    const size_t length = size_t(std::strtoull(it->second.c_str(), nullptr, 10));
+    if (length > kMax) return false;
+    while (raw->size() < body_at + length)
+      if (!more()) return false;
+    *reusable = keep && raw->size() == body_at + length;
+    raw->resize(body_at + length);
+    return true;
+  }
+  // (no length: the body runs until the server closes)
+  while (raw->size() < kMax && more()) {
+  }
+  return true;
+}
+
+// http (and https) over sockets, on a kept connection when there is one.
+std::optional<Response> SocketRequest(const std::string& method, const Url& url, const Headers& headers,
+                                      const std::string& body) {
+  const std::string key = LinkKey(url);
+  std::string request = method + " " + url.path + " HTTP/1.1\r\nHost: " + HostHeader(url) +
+                        "\r\nConnection: keep-alive\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
+  for (const auto& [k, v] : headers) request += k + ": " + v + "\r\n";
+  request += "\r\n" + body;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::unique_ptr<Link> link = attempt == 0 ? TakeIdle(key) : nullptr;
+    const bool kept = link != nullptr;
+    if (!link) {
+      link = std::make_unique<Link>();
+      if (!link->Open(url)) return std::nullopt;
+    }
+    std::string raw;
+    bool reusable = false;
+    const bool ok = link->Send(request) && ReadAnswer(*link, method, &raw, &reusable);
+    if (ok && reusable) PutIdle(key, std::move(link));
+    // (a kept connection the server had closed meanwhile - nothing came back:
+    // once more on a new one)
+    if (ok || !kept || !raw.empty()) return ParseRaw(raw);
+  }
+  return std::nullopt;
 }
 
 #if defined(__ANDROID__)
@@ -1044,10 +1173,22 @@ bool ResolveIPv4(const std::string& host, uint32_t* ip) {
   StartNet();
   in_addr a = {};
   if (inet_pton(AF_INET, host.c_str(), &a) == 1) return *ip = a.s_addr, true;
+  // (names found are kept for 10 minutes: every request looked its server up again)
+  static std::mutex mutex;
+  static std::map<std::string, std::pair<uint32_t, std::chrono::steady_clock::time_point>> found;
+  const auto now = std::chrono::steady_clock::now();
+  {
+    std::lock_guard lock(mutex);
+    if (auto it = found.find(host); it != found.end() && now - it->second.second < std::chrono::minutes(10))
+      return *ip = it->second.first, true;
+  }
   in_addr_t v = 0;
-  if (SystemLookup(host, &v)) return *ip = v, true;
-  if (DnsLookup(host, &a)) return *ip = a.s_addr, true;
-  return false;
+  bool ok = SystemLookup(host, &v);
+  if (!ok && DnsLookup(host, &a)) v = a.s_addr, ok = true;
+  if (!ok) return false;
+  std::lock_guard lock(mutex);
+  found[host] = {uint32_t(v), now};
+  return *ip = v, true;
 #endif
 }
 
