@@ -1239,7 +1239,7 @@ void LoadBackstage() {
   std::sort(dirs.begin(), dirs.end());
   for (const auto& d : dirs) {
     BackstageRow r;
-    r.file = fs::relative(d / "arena.pac", g_game, ec).generic_string();
+    r.file = svr2011::RelativePath(d / "arena.pac", g_game).generic_string();  // [ps5 port] (host_case.h)
     r.dir = d.string();  // (full path)
     if (FILE* t = std::fopen((d / "manifest.txt").string().c_str(), "rb")) {
       char line[4096];
@@ -1312,7 +1312,7 @@ void LoadBackstage() {
   if (found.size() > 1)
     REXLOG_WARN("[svr2011] arena mods: {} backstage areas installed, only {} plays (one at a time)", found.size(),
                 found.back().filename().string());
-  const fs::path rel = fs::relative(found.back() / "arena.pac", g_game, ec);
+  const fs::path rel = svr2011::RelativePath(found.back() / "arena.pac", g_game);  // [ps5 port] (host_case.h)
   svr2011::SetArenaDefault(78, rel.generic_string());
 }
 

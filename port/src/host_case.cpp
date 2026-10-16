@@ -52,4 +52,12 @@ fs::path HostCase(const fs::path& p) {
 #endif
 }
 
+fs::path RelativePath(const fs::path& p, const fs::path& base) {
+  const fs::path r = p.lexically_normal().lexically_relative(base.lexically_normal());
+  if (!r.empty() && *r.begin() != "..") return r;
+  std::error_code ec;
+  const fs::path q = fs::relative(p, base, ec);
+  return ec || q.empty() ? r : q;
+}
+
 }  // namespace svr2011

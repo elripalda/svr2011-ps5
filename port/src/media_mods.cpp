@@ -45,6 +45,7 @@
 //    yes while it plays (else music players think it ended at once). Volume:
 //    the game's music / SFX / voice settings (*(0x82EC4C18)+36: floats).
 #include "media_mods.h"
+#include "host_case.h"  // [ps5 port]
 
 #include <algorithm>
 #include <cstdint>
@@ -280,7 +281,7 @@ void InstallMediaMods(rex::memory::Memory* memory) {
       } else if (k.rfind("sound.", 0) == 0 || k == "menu_music") {
         if (fs::exists(p.folder / v, ec)) g_sounds[k == "menu_music" ? "Menu_Music" : k.substr(6)] = p.folder / v;
       } else if (KeyId(k, "arena.", id) && id < 100) {
-        const fs::path rel = fs::relative(p.folder / v, Game(), ec);
+        const fs::path rel = svr2011::RelativePath(p.folder / v, Game());  // [ps5 port] (host_case.h)
         if (fs::exists(p.folder / v, ec)) SetArenaDefault(int(id), rel.generic_string());
       }
     }

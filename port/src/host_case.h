@@ -13,4 +13,12 @@ namespace svr2011 {
 // entries without regard to case; else `p` as it was. Windows: `p`.
 std::filesystem::path HostCase(const std::filesystem::path& p);
 
+// `p` relative to `base`, worked out from the names (std::filesystem::relative
+// goes through the real paths first, and on the PS5 it gave nothing for the
+// app folder's files: the DLC pacs and catalogs served from the move packs'
+// overlay pointed at the overlay folder itself - the game waited on its
+// loading screen for ever). The file system's own answer only when the names
+// don't lead there.
+std::filesystem::path RelativePath(const std::filesystem::path& p, const std::filesystem::path& base);
+
 }  // namespace svr2011

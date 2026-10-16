@@ -1,5 +1,6 @@
 // What online needs to trust - see online_files.h.
 #include "online_files.h"
+#include "host_case.h"  // [ps5 port]
 
 #include <algorithm>
 #include <atomic>
@@ -286,7 +287,7 @@ std::string BuildModSet() {
       for (const fs::path& f : files) {
         uint32_t c = 0;
         if (!FileCrc(f, false, &c)) continue;
-        const std::string rel = fs::relative(f, e.path(), ec).generic_string();
+        const std::string rel = svr2011::RelativePath(f, e.path()).generic_string();  // [ps5 port] (host_case.h)
         crc = CrcUpdate(crc, reinterpret_cast<const uint8_t*>(rel.data()), rel.size());
         crc = CrcUpdate(crc, reinterpret_cast<const uint8_t*>(&c), 4);
       }

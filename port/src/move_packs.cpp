@@ -1214,7 +1214,7 @@ void LinkDlcCopies(rex::filesystem::VirtualFileSystem* vfs, const fs::path& over
   std::map<std::string, std::vector<std::pair<std::string, std::string>>> links;
   std::set<fs::path> catalogs;
   auto add = [&](const std::string& pkg, const std::string& rel, const fs::path& copy) {
-    std::string r = fs::relative(copy, overlay, ec).string();
+    std::string r = svr2011::RelativePath(copy, overlay).string();  // [ps5 port] (host_case.h)
     std::replace(r.begin(), r.end(), '/', '\\');
     links[pkg].push_back({rel, "\\Device\\Harddisk0\\Partition1\\Mods\\PacOverlay\\" + r});
   };
@@ -1303,8 +1303,7 @@ void Register(rex::filesystem::VirtualFileSystem* vfs, const fs::path& overlay) 
   for (const auto& e : fs::recursive_directory_iterator(overlay, ec)) {  // (entry pacs sit in evt\)
     std::error_code tec;
     if (!e.is_regular_file(tec)) continue;
-    std::string rel = fs::relative(e.path(), overlay, tec).string();
-    if (rel.empty()) rel = e.path().lexically_relative(overlay).string();
+    std::string rel = svr2011::RelativePath(e.path(), overlay).string();  // [ps5 port] (host_case.h)
     std::replace(rel.begin(), rel.end(), '/', '\\');
     const std::string path = "\\Device\\Harddisk0\\Partition1\\Mods\\PacOverlay\\" + rel;
     if (auto* entry = vfs->ResolvePath(path)) {
