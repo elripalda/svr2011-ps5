@@ -18,6 +18,7 @@ struct Hub::Task {
   install::Progress p;
   bool ok = false;  // (a mod: installed)
   std::string message;
+  std::vector<std::string> failed;  // (DLC: the package files that didn't install)
   void Cancel() { p.cancel = true; }
   ~Task() {
     p.cancel = true;  // (the hub closing: stops at the next piece)
@@ -172,6 +173,100 @@ std::string Hub::BundledStatus() {
                : std::string("Setting up the bundled mods");
 }
 
+// DLC packages, installed here with progress (the hub's DlcInstall) instead
+// of on the game's black screen as it starts.
+void Hub::StartDlcInstalls(std::vector<Dlc> list, bool then_start) {
+  if (list.empty() || Busy()) return;
+  if (!dlc_install_) {
+    Play(Sound::kError);
+    Toast("DLC installs when the game starts");
+    return;
+  }
+  auto t = std::make_shared<Task>();
+  task_kind_ = 6;
+  task_file_.clear();
+  task_title_ = list.size() == 1 ? list[0].title : std::to_string(list.size()) + " DLC packs";
+  task_speed_ = 0, task_last_ = 0, task_in_ = 0;
+  dlc_count_ = list.size();
+  dlc_then_start_ = then_start;
+  Task* raw = t.get();
+  t->thread = std::thread([raw, list = std::move(list), install = dlc_install_] {
+    int ok = 0;
+    std::string last_ok, why;
+    for (size_t i = 0; i < list.size() && !raw->p.cancel; ++i) {
+      raw->p.step = int(i);
+      raw->p.SetFile(list[i].title);
+      std::string error;
+      if (install(list[i].path, list[i].name, raw->p, error)) {
+        ++ok, last_ok = list[i].title;
+      } else if (!raw->p.cancel) {
+        raw->failed.push_back(list[i].file);
+        why += (why.empty() ? "" : " ") + list[i].title + ": " + error;
+      }
+    }
+    raw->ok = raw->failed.empty() && !raw->p.cancel;
+    raw->message = !raw->failed.empty() ? why
+                   : ok == 1             ? last_ok + " is installed"
+                                         : std::to_string(ok) + " DLC packs installed";
+    raw->p.finished = true;
+  });
+  task_ = std::move(t);
+}
+
+std::string Hub::DlcStatus() {
+  if (!task_ || task_kind_ != 6) return {};
+  const uint64_t done = task_->p.done, total = task_->p.total;
+  std::string s = "Installing DLC";
+  if (dlc_count_ > 1)
+    s += " " + std::to_string(std::min(size_t(std::max(0, int(task_->p.step))) + 1, dlc_count_)) + " of " +
+         std::to_string(dlc_count_);
+  return s + ": " + std::to_string(total ? int(std::min(done, total) * 100 / total) : 0) + "%";
+}
+
+void Hub::DlcActivate() {
+  if (dlc_.empty()) return;
+  const Dlc d = dlc_[size_t(std::clamp(item_[tab_], 0, int(dlc_.size()) - 1))];
+  if (d.other) {
+    Play(Sound::kError);
+    Toast("This file isn't SmackDown vs. Raw 2011 DLC");
+    return;
+  }
+  if (!dlc_install_) {
+    Play(Sound::kError);
+    Toast("It installs when the game starts");
+    return;
+  }
+  if (Busy()) return;
+  Play(Sound::kSelect);
+  if (!d.installed) {
+    dlc_failed_.erase(d.file);
+    StartDlcInstalls({d}, false);
+    return;
+  }
+  Choose(d.title, {"Install Again", "Delete"}, [this, d](int i) {
+    if (i == 0) {
+      dlc_failed_.erase(d.file);
+      StartDlcInstalls({d}, false);
+      return;
+    }
+    Confirm("Delete this DLC?",
+            d.title + " is taken out of the game and its package file deleted, freeing " + Size(d.bytes) +
+                " and more. Your saves stay.",
+            "Delete", [this, d] {
+              std::error_code ec;
+              const fs::path title = paths_.game / "UserData" / "0000000000000000" / "5451085D";
+              for (const std::string& n : {d.name, d.file}) {
+                fs::remove_all(title / "00000002" / n, ec);
+                fs::remove(title / "Headers" / "00000002" / (n + ".header"), ec);
+              }
+              fs::remove(d.path, ec);
+              Play(Sound::kOff);
+              Toast(ec ? "Its package file couldn't be deleted" : d.title + " deleted");
+              LoadDlc();
+            });
+  });
+}
+
 void Hub::StopTask() {
   if (task_) task_->Cancel();
 }
@@ -195,6 +290,23 @@ void Hub::PollTask() {
   if (kind == 4) {  // the bundled mods
     LoadMods();
     if (t->p.mods_installed) Toast(t->p.result);
+    return;
+  }
+  if (kind == 6) {  // DLC
+    for (const std::string& f : t->failed) dlc_failed_.insert(f);
+    LoadDlc();
+    const bool start = dlc_then_start_ && t->ok;
+    dlc_then_start_ = false;
+    if (t->p.cancel) {
+      Toast("DLC install stopped");
+    } else if (!t->ok) {
+      Play(Sound::kError);
+      Notice(t->failed.size() == 1 ? "A DLC pack didn't install" : "Some DLC didn't install", t->message);
+    } else {
+      Play(Sound::kOn);
+      Toast(t->message);
+      if (start) press_ = 1, launch_ = true;
+    }
     return;
   }
   if (kind == 5) {  // mods found with Find Mods (their files kept)
@@ -547,6 +659,55 @@ void Hub::DrawInstallProgress() {
     }
     Wrapped(a_.body, 19, px, py + 20, pw, White(0.45f),
             "You can look around the other pages meanwhile. If it stops, install again: it goes on where it stopped.");
+  });
+}
+
+void Hub::DrawDlcProgress() {
+  install::Progress& p = task_->p;
+  const size_t index = size_t(std::max(0, int(p.step)));
+  PageTitle("INSTALLING DLC", dlc_count_ > 1 ? "Package " + std::to_string(std::min(index + 1, dlc_count_)) + " of " +
+                                                   std::to_string(dlc_count_)
+                                             : std::string("Copying the pack's files into the game"));
+  Ease(task_in_, 1, 6);
+  const uint64_t done = p.done, total = p.total;
+  const float frac = total ? float(double(std::min(done, total)) / double(total)) : 0.0f;
+  const float x = kListX, y = 300;
+  Text(a_.body_bold, 16, x, y, White(0.5f), Upper(Fit(a_.body_bold, 16, p.File(), 860)), 0, 3);
+  char pct[16];
+  std::snprintf(pct, sizeof(pct), "%d%%", int(frac * 100));
+  Text(a_.display, 140, x - 6, y + 34, kText, pct);
+  const float bw = 860, by = y + 206;
+  Rect(x, by, bw, 10, White(0.12f), 5);
+  static float shown = 0;
+  shown = shown > frac ? frac : shown + (frac - shown) * (1 - std::exp(-dt_ * 8));
+  const float fw = std::max(10.0f, bw * shown);
+  Rect(x, by, fw, 10, kAccent, 5);
+  const float sheen = std::fmod(time_ * 0.6f, 1.4f) - 0.2f;
+  const float sx = x + fw * sheen;
+  if (sheen > 0 && sheen < 1)
+    dl_->AddRectFilledMultiColor(P(std::max(x, sx - 60), by), P(std::min(x + fw, sx + 60), by + 10), White(0), White(0.35f),
+                                 White(0.35f), White(0));
+  std::string line = install::Bytes(done) + " of " + install::Bytes(total);
+  if (task_speed_ > 1 << 20) {
+    char sp[32];
+    std::snprintf(sp, sizeof(sp), "%.0f MB/s", task_speed_ / 1048576.0f);
+    line += std::string("  \xC2\xB7  ") + sp;
+    const float left = float(total - std::min(done, total)) / task_speed_;
+    if (left > 1) {
+      line += "  \xC2\xB7  ";
+      line += left >= 90 ? "about " + std::to_string(int(left / 60 + 0.5f)) + " min left" : std::to_string(int(left) + 1) + " s left";
+    }
+  }
+  Text(a_.body_bold, 22, x, by + 34, White(0.85f), line);
+  Panel([&](float px, float py, float pw) {
+    Text(a_.body_bold, 15, px, py + 5, White(0.45f), "WHAT HAPPENS", 0, 3);
+    py += 50;
+    py += Wrapped(a_.body, 22, px, py, pw, White(0.7f),
+                  "The DLC's files are copied out of its package into the game's content folder, once. The game finds "
+                  "it there every time it starts.") + 24;
+    Wrapped(a_.body, 19, px, py, pw, White(0.45f),
+            dlc_then_start_ ? "The game starts when it's done. Circle stops it."
+                            : "You can look around the other pages meanwhile. Circle stops it.");
   });
 }
 

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -127,6 +128,19 @@ int main(int argc, char** argv) {
                      return svr2011::hub::Image{reinterpret_cast<ImTextureID>(t), float(w), float(h)};
                    },
                    [](const svr2011::hub::Image&) {}});
+  // HUB_FAKE_DLC=1: DLC "installs" in about two seconds (its folder and .header made), for the DLC page's progress
+  if (std::getenv("HUB_FAKE_DLC"))
+    hub.SetDlcInstall([game](const std::filesystem::path&, const std::string& name, svr2011::hub::install::Progress& p,
+                             std::string& error) {
+      p.total = 2000u << 20;
+      for (int i = 0; i < 40 && !p.cancel; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50)), p.done += 50u << 20;
+      if (p.cancel) return error = "stopped", false;
+      const std::string root = game + "/UserData/0000000000000000/5451085D";
+      std::filesystem::create_directories(root + "/00000002/" + name);
+      std::filesystem::create_directories(root + "/Headers/00000002");
+      std::ofstream(root + "/Headers/00000002/" + name + ".header") << "x";
+      return true;
+    });
   std::vector<uint32_t> script;
   for (int i = 8; i < argc; ++i) {
     std::string s = argv[i];

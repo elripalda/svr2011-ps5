@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,12 @@ struct Audio {
 using Request = std::function<int(const std::string&, const std::string&, const std::string&, const std::string&,
                                   std::string*)>;
 
+// A DLC package installed (ps5/dlc_install.cpp): (package file, the folder
+// name it gets, progress, why not) -> done. None: the game installs it as it
+// starts.
+using DlcInstall = std::function<bool(const std::filesystem::path&, const std::string&, install::Progress&,
+                                      std::string&)>;
+
 // The pages, in the order of the top bar.
 enum Tab {
   kHome, kSettingsTab, kModsTab, kRosterTab, kPacksTab, kMusicTab, kMoviesTab, kPaintTab, kSavesTab, kOnlineTab,
@@ -102,6 +109,7 @@ class Hub {
   void SetAudio(Audio audio) { audio_ = std::move(audio); }
   void SetRequest(Request request) { request_ = std::move(request); }
   void SetTextures(Textures textures) { textures_ = std::move(textures); }
+  void SetDlcInstall(DlcInstall install) { dlc_install_ = std::move(install); }
   ~Hub();
   // Draws the hub over the whole display; true when the game should start.
   bool Draw(const Pad& pad, float dt);
@@ -121,9 +129,12 @@ class Hub {
     bool enabled = true;
   };
   struct Dlc {
+    std::filesystem::path path;
     std::string file, title;
+    std::string name;  // the folder it installs as (a browser's " (1)" left out)
     uint64_t bytes = 0;
     bool installed = false;
+    bool other = false;  // not SmackDown vs. Raw 2011's (or not DLC)
   };
   struct Character {
     uint32_t id = 0;
@@ -217,6 +228,12 @@ class Hub {
   void StartModInstall(const std::filesystem::path& svrmod);
   void StartBundled();
   std::string BundledStatus();  // the bundled mods being set up ("": not now)
+  // DLC packages installed one after another; `then_start`: the game starts after.
+  void StartDlcInstalls(std::vector<Dlc> list, bool then_start);
+  std::string DlcStatus();  // the DLC being installed ("": not now)
+  std::vector<Dlc> DlcToInstall() const;  // this game's packages not installed (and not failed this time)
+  void DlcActivate();
+  void DrawDlcProgress();
   void PollTask();
   void StopTask();
   int InstallItems() const;
@@ -365,7 +382,12 @@ class Hub {
   float task_speed_ = 0;
   uint64_t task_last_ = 0;
   float task_in_ = 0;
-  int task_kind_ = 0;  // 1 install, 2 check, 3 a mod, 4 the bundled mods (at the first start), 5 mods found (Find Mods)
+  int task_kind_ = 0;  // 1 install, 2 check, 3 a mod, 4 the bundled mods (at the first start), 5 mods found (Find Mods),
+                       // 6 DLC
+  DlcInstall dlc_install_;
+  size_t dlc_count_ = 0;          // the DLC packages of the install running
+  bool dlc_then_start_ = false;   // START GAME asked for it: the game starts after
+  std::set<std::string> dlc_failed_;  // (not tried again by START GAME this time)
   std::filesystem::path task_file_;
   std::string task_title_;
   std::string verify_result_;  // the last check's outcome

@@ -206,36 +206,59 @@ void Hub::LoadDrops() {
 void Hub::LoadDlc() {
   dlc_.clear();
   std::error_code ec;
-  const fs::path installed = paths_.game / "UserData" / "0000000000000000" / "5451085D" / "00000002";
+  const fs::path title_dir = paths_.game / "UserData" / "0000000000000000" / "5451085D";
+  const fs::path installed = title_dir / "00000002", headers = title_dir / "Headers" / "00000002";
+  // (an install the app was closed in the middle of)
+  for (const auto& e : install::ListDir(installed))
+    if (const std::string f = e.path().filename().string();
+        e.is_directory(ec) && f.size() > 11 && f.compare(f.size() - 11, 11, ".installing") == 0)
+      fs::remove_all(e.path(), ec);
   for (const auto& e : install::ListDir(paths_.game / "DLC")) {
     if (!e.is_regular_file(ec)) continue;
     Dlc d;
+    d.path = e.path();
     d.file = e.path().filename().string();
     d.bytes = e.file_size(ec);
-    std::string base = d.file;
-    if (const size_t p = base.rfind(" ("); p != std::string::npos && base.back() == ')') base.resize(p);
-    d.installed = fs::is_directory(installed / base, ec);
-    // the package's display name (STFS header: 0x411, UTF-16 big-endian)
+    d.name = d.file;
+    if (const size_t p = d.name.rfind(" ("); p != std::string::npos && d.name.back() == ')' &&
+        d.name.find_first_not_of("0123456789", p + 2) == d.name.size() - 1)
+      d.name.resize(p);
+    // installed: its folder, and the .header the game lists it by (the game's
+    // own install at start names the folder after the file as it is)
+    d.installed = (fs::is_directory(installed / d.name, ec) && fs::exists(headers / (d.name + ".header"), ec)) ||
+                  (fs::is_directory(installed / d.file, ec) && fs::exists(headers / (d.file + ".header"), ec));
+    // the STFS header: magic, content type (0x344: 2 = DLC), title (0x360), display name (0x411, UTF-16BE)
     {
       std::ifstream f(e.path(), std::ios::binary);
-      char magic[4] = {};
-      unsigned char name[0x80] = {};
-      if (f.read(magic, 4) && (!std::memcmp(magic, "LIVE", 4) || !std::memcmp(magic, "PIRS", 4) ||
-                               !std::memcmp(magic, "CON ", 4)) &&
-          f.seekg(0x411) && f.read(reinterpret_cast<char*>(name), sizeof(name))) {
-        for (size_t k = 0; k + 1 < sizeof(name); k += 2) {
-          const unsigned c = unsigned(name[k]) << 8 | name[k + 1];
-          if (!c) break;
-          if (c < 0x80) d.title += char(c);
-          else if (c < 0x800) d.title += char(0xC0 | c >> 6), d.title += char(0x80 | (c & 0x3F));
-          else d.title += char(0xE0 | c >> 12), d.title += char(0x80 | (c >> 6 & 0x3F)), d.title += char(0x80 | (c & 0x3F));
-        }
+      unsigned char head[0x491] = {};
+      const bool read = bool(f.read(reinterpret_cast<char*>(head), sizeof(head)));
+      const bool stfs = read && (!std::memcmp(head, "LIVE", 4) || !std::memcmp(head, "PIRS", 4) ||
+                                 !std::memcmp(head, "CON ", 4));
+      auto be32 = [&](size_t o) {
+        return uint32_t(head[o]) << 24 | uint32_t(head[o + 1]) << 16 | uint32_t(head[o + 2]) << 8 | head[o + 3];
+      };
+      d.other = !stfs || be32(0x344) != 2 || be32(0x360) != 0x5451085D;
+      for (size_t k = 0x411; stfs && k + 1 < sizeof(head); k += 2) {
+        const unsigned c = unsigned(head[k]) << 8 | head[k + 1];
+        if (!c) break;
+        if (c < 0x80) d.title += char(c);
+        else if (c < 0x800) d.title += char(0xC0 | c >> 6), d.title += char(0x80 | (c & 0x3F));
+        else d.title += char(0xE0 | c >> 12), d.title += char(0x80 | (c >> 6 & 0x3F)), d.title += char(0x80 | (c & 0x3F));
       }
-      if (d.title.empty()) d.title = "Content package " + base.substr(0, 8);
+      if (d.title.empty()) d.title = stfs ? "Content package " + d.name.substr(0, 8) : d.file;
     }
     dlc_.push_back(std::move(d));
   }
-  std::sort(dlc_.begin(), dlc_.end(), [](const Dlc& a, const Dlc& b) { return a.file < b.file; });
+  std::sort(dlc_.begin(), dlc_.end(), [](const Dlc& a, const Dlc& b) {
+    return a.other != b.other ? b.other : a.file < b.file;
+  });
+}
+
+std::vector<Hub::Dlc> Hub::DlcToInstall() const {
+  std::vector<Dlc> out;
+  for (const Dlc& d : dlc_)
+    if (!d.installed && !d.other && !dlc_failed_.count(d.file)) out.push_back(d);
+  return out;
 }
 
 std::string Hub::Value(const std::string& key, const std::string& fallback) const {
@@ -642,6 +665,14 @@ void Hub::DrawHints() {
       break;
     case kSavesTab: r = Hint(r, kCross, item_[tab_] == 0 ? "Back Up" : "Restore"); break;
     case kOnlineTab: r = Hint(r, kCross, item_[tab_] == 2 ? "Turn On / Off" : item_[tab_] == 3 ? "Change" : "Select"); break;
+    case kDlcTab:
+      if (task_ && task_kind_ == 6) break;
+      if (DlcToInstall().size() > 1 && dlc_install_) r = Hint(r, kTriangle, "Install All");
+      if (!dlc_.empty() && dlc_install_) {
+        const Dlc& d = dlc_[size_t(std::clamp(item_[tab_], 0, int(dlc_.size()) - 1))];
+        if (!d.other) r = Hint(r, kCross, d.installed ? "Options" : "Install");
+      }
+      break;
   }
   }
   // a message (bottom left, rising in), or the version
@@ -652,7 +683,8 @@ void Hub::DrawHints() {
     Rect(112, y, w, 42, White(0.14f * a), 21);
     dl_->AddCircleFilled(P(132, y + 21), 4.5f * s_, WithAlpha(kAccent, a), 16);
     Text(a_.body_bold, 20, 146, y + 8, White(0.92f * a), toast_);
-  } else if (const std::string status = BundledStatus(); !status.empty()) {
+  } else if (const std::string status = !DlcStatus().empty() && tab_ != kDlcTab ? DlcStatus() : BundledStatus();
+             !status.empty()) {
     // (the first start: a pulsing dot while the bundled mods are set up)
     dl_->AddCircleFilled(P(118, 1023), 4.5f * s_, WithAlpha(kAccent, 0.5f + 0.5f * std::sin(time_ * 6)), 16);
     Text(a_.body_bold, 18, 134, 1012, White(0.7f), status);
@@ -901,15 +933,21 @@ void Hub::DrawMods() {
 }
 
 void Hub::DrawDlc() {
-  int installed = 0;
-  for (const Dlc& d : dlc_) installed += d.installed;
-  PageTitle("DLC", dlc_.empty() ? std::string("Downloadable content you add shows up here.")
-                                : std::to_string(dlc_.size()) + " packages, " + std::to_string(installed) +
-                                      " installed. New ones install when the game starts.");
+  if (task_ && task_kind_ == 6) {
+    DrawDlcProgress();
+    return;
+  }
+  int installed = 0, waiting = 0;
+  for (const Dlc& d : dlc_) installed += d.installed, waiting += !d.installed && !d.other;
+  std::string sub = dlc_.empty() ? std::string("Downloadable content you add shows up here.")
+                                 : std::to_string(dlc_.size()) + (dlc_.size() == 1 ? " package, " : " packages, ") +
+                                       std::to_string(installed) + " installed.";
+  if (waiting) sub += dlc_install_ ? " Press Cross to install." : " New ones install when the game starts.";
+  PageTitle("DLC", sub);
   if (dlc_.empty()) {
     Empty("No DLC yet",
-          "Put your DLC files (the Xbox 360 content packages) in /data/homebrew/PPSA92011/DLC/ over FTP. They're "
-          "extra: the game doesn't need them. The game installs them the next time it starts.");
+          "Put your DLC files (the Xbox 360 content packages) in /data/homebrew/PPSA92011/DLC/ over FTP, then come back "
+          "to this page to install them. They're extra: the game doesn't need them.");
     return;
   }
   const int n = int(dlc_.size());
@@ -921,18 +959,26 @@ void Hub::DrawDlc() {
     const Dlc& d = dlc_[size_t(i)];
     Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(0.94f), kInk, over), Fit(a_.body_bold, 24, d.title, w - 260));
     Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), Size(d.bytes));
-    const char* st = d.installed ? "Installed" : "Installs at start";
+    const char* st = d.other ? "Not for this game" : d.installed ? "Installed" : "Not installed";
+    const bool lit = !d.installed && !d.other;
     const float sx = x + w - 24 - TextWidth(a_.body_bold, 18, st);
-    if (!d.installed)
+    if (lit)
       dl_->AddCircleFilled(P(sx - 14, ry + 35), 4.5f * s_, WithAlpha(kAccent, 0.6f + 0.4f * std::sin(time_ * 3)), 16);
-    Text(a_.body_bold, 18, sx, ry + 24, Mix(White(d.installed ? 0.55f : 0.9f), Black(0.7f), over), st);
+    Text(a_.body_bold, 18, sx, ry + 24, Mix(White(lit ? 0.9f : 0.55f), Black(0.7f), over), st);
   });
   const Dlc& d = dlc_[size_t(sel)];
   Panel([&](float px, float py, float pw) {
     py += Wrapped(a_.display, 44, px, py, pw, kText, d.title, 1.15f) + 22;
-    Facts(px, py, pw,
-          {{"STATUS", d.installed ? "Installed" : "Installs when the game starts"}, {"SIZE", Size(d.bytes)},
-           {"FILE", d.file.size() > 24 ? d.file.substr(0, 20) + "..." : d.file}});
+    py = Facts(px, py, pw,
+               {{"STATUS", d.other ? "Not for this game" : d.installed ? "Installed" : "Not installed"},
+                {"SIZE", Size(d.bytes)},
+                {"FILE", d.file.size() > 24 ? d.file.substr(0, 20) + "..." : d.file}});
+    Wrapped(a_.body, 19, px, py + 10, pw, White(0.5f),
+            d.other ? "This file isn't SmackDown vs. Raw 2011 DLC, so it's left alone."
+            : d.installed
+                ? "Cross to install it again, or to delete it."
+                : "Cross installs it now, with progress. A pack that isn't installed here installs when the game "
+                  "starts instead, on a black screen.");
   });
 }
 
@@ -1189,6 +1235,13 @@ void Hub::Navigate(const Pad& pad) {
       Notice("The game isn't installed",
              "Install SmackDown vs. Raw 2011 with the app store, or copy the files of your disc image into "
              "/data/homebrew/PPSA92011/ (default.xex, pac, sound, movies... beside eboot.bin).");
+    } else if (std::vector<Dlc> dlc = DlcToInstall(); !dlc.empty() && dlc_install_) {
+      // (the DLC not installed yet: here, with progress, rather than on the
+      // game's black screen - then the game starts)
+      Play(Sound::kSelect);
+      GoTo(kDlcTab, 1);
+      Toast(dlc.size() == 1 ? "Installing your DLC first" : "Installing your " + std::to_string(dlc.size()) + " DLC packs first");
+      StartDlcInstalls(std::move(dlc), true);
     } else {
       press_ = 1, launch_ = true;
     }
@@ -1200,6 +1253,13 @@ void Hub::Navigate(const Pad& pad) {
   if (p & (kL1 | kR1)) {
     GoTo((tab_ + ((p & kR1) ? 1 : kTabCount - 1)) % kTabCount, (p & kR1) ? 1.0f : -1.0f);
     Play(Sound::kPage);
+    return;
+  }
+  if ((p & kCircle) && tab_ == kDlcTab && task_ && task_kind_ == 6) {
+    StopTask();
+    dlc_then_start_ = false;
+    Play(Sound::kBack);
+    Toast("Stopping the DLC install");
     return;
   }
   if ((p & kCircle) && tab_ != kHome) {
@@ -1258,6 +1318,14 @@ void Hub::Navigate(const Pad& pad) {
     case kOnlineTab:
       if (p & kCross) press_ = 1, Activate(0);
       break;
+    case kDlcTab:
+      if (task_ && task_kind_ == 6) break;
+      if (p & kCross) press_ = 1, DlcActivate();
+      if ((p & kTriangle) && DlcToInstall().size() > 1) {
+        press_ = 0.6f;
+        if (!Busy()) Play(Sound::kSelect), StartDlcInstalls(DlcToInstall(), false);
+      }
+      break;
     case kPacksTab:
       if (p & kCross) press_ = 1, Activate(0);
       if (p & kTriangle) press_ = 0.6f, Activate(-1);
@@ -1282,6 +1350,7 @@ void Hub::GoTo(int tab, float dir) {
   // (what these pages show can change while the hub is open: looked at again)
   if (tab == kPaintTab) LoadPaint();
   if (tab == kModsTab) LoadDrops();
+  if (tab == kDlcTab && !(task_ && task_kind_ == 6)) LoadDlc();
 }
 
 bool Hub::Draw(const Pad& pad, float dt) {

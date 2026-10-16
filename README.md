@@ -64,7 +64,7 @@ You need a jailbroken PS5 that runs homebrew apps from `/data/homebrew/`, with a
 4. Over FTP, copy the extracted files **straight into** `/data/homebrew/PPSA92011/`, beside `eboot.bin` (not in a subfolder): `default.xex`, `plist360.arc`, `plist360_4x3.arc`, `pac/`, `sound/`, `movies/`. About 5.3 GB.
 5. Start **SmackDown vs. Raw 2011** from your homebrew launcher and press **START GAME**.
 
-**DLC** is optional: put the Xbox 360 content packages in `/data/homebrew/PPSA92011/DLC/` and the game installs them the next time it starts.
+**DLC** is optional: put the Xbox 360 content packages in `/data/homebrew/PPSA92011/DLC/`, then install them from the hub's **DLC** page. Pressing **START GAME** installs any that are still waiting first.
 
 The download's `HOW TO INSTALL.txt` has the full instructions, every hub page and the folder layout.
 

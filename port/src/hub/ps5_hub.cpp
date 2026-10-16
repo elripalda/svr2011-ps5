@@ -26,7 +26,9 @@
 
 #include "hub_sfx.h"
 #include "hub_ui.h"
+#include "../online_files.h"
 #include "../online_net.h"
+#include "../ps5/dlc_install.h"
 #include "../ps5/sound.h"
 #include "imgui.h"
 #define STB_IMAGE_STATIC
@@ -335,7 +337,8 @@ class HubDialog final : public rex::ui::ImGuiDialog {
                         g_dropped->push_back({g_frame, std::move(it->second)});
                         g_made->erase(it);
                       }});
-    hub_.Init(paths, a, std::move(player), "v2.0.6");
+    // (the PC port's version this build is: online plays only the same one)
+    hub_.Init(paths, a, std::move(player), "v" + svr2011::PortVersion());
     audio_ = std::make_unique<HubAudio>(paths.game / "hub", hub_.MusicVolume());
     StyleGameDialogs(a);
     Audio hooks;
@@ -347,6 +350,11 @@ class HubDialog final : public rex::ui::ImGuiDialog {
     hooks.music_volume = [this](int v) { audio_->SetVolume(v); };
     hub_.SetAudio(std::move(hooks));
     // the server (online_net.h: https through Mbed TLS on the PS5)
+    // DLC installed from its page, with progress (not on the game's black screen)
+    hub_.SetDlcInstall([user_data = paths.game / "UserData"](const std::filesystem::path& package, const std::string& name,
+                                                             install::Progress& p, std::string& error) {
+      return svr2011::ps5::InstallDlcPackage(package, user_data, name, p, error);
+    });
     hub_.SetRequest([](const std::string& method, const std::string& url, const std::string& body,
                        const std::string& token, std::string* answer) {
       svr2011::net::Headers headers = {{"Content-Type", "application/json"}};
