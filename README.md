@@ -117,7 +117,7 @@ The PS5 code lives beside the PC port's: `port/src/hub/` (the hub), `port/src/ps
    ```
 3. Link and package it as an app folder with `port/tools/ps5_package.sh port/out/ps5 <ps5-plume-triangle checkout>`.
 
-[`port/docs/PS5_PORT_PLAN.md`](port/docs/PS5_PORT_PLAN.md) has the details. The PC port's own README is [`README-PC.md`](README-PC.md).
+[`port/docs/PS5_PORT_PLAN.md`](port/docs/PS5_PORT_PLAN.md) has the details. To move to a new PC port release, see [`port/docs/PS5_UPDATING.md`](port/docs/PS5_UPDATING.md). The PC port's own README is [`README-PC.md`](README-PC.md).
 
 ## Credits
 
