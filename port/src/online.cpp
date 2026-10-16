@@ -390,6 +390,31 @@ REX_HOOK_RAW(sub_82629160) {
   if (!downloaded) ctx.r3.u64 = 1;
 }
 
+// A port's online socket, made or shared: sub_829F5608(obj, ?, port) keeps the
+// game's ports in a list (head 0x82EE2608: {u16 port, u32 sockets, u32 next}),
+// puts a new port in before making its socket and leaves it there when the
+// socket can't be made (setup refused, bind failed) - and its next call for
+// that port takes the first socket of the empty list: a null read (on the PS5
+// the crash on joining a match, while its sockets failed). Ports with no
+// socket are taken out first, so a failure stays one the game reports.
+REX_EXTERN(__imp__sub_829F5608);
+REX_HOOK_RAW(sub_829F5608) {
+  constexpr uint32_t kPorts = 0x82EE2608;
+  uint32_t link = kPorts;
+  for (int guard = 0; guard < 256; ++guard) {
+    const uint32_t entry = svr2011::Rd32(base, link);
+    if (!entry || entry >= 0xE0000000u) break;
+    if (svr2011::Rd32(base, entry + 4) == 0) {
+      REXLOG_WARN("online: port {} had no socket (a setup that failed) - taken out",
+                  uint32_t(base[entry]) << 8 | base[entry + 1]);
+      svr2011::Wr32(base, link, svr2011::Rd32(base, entry + 8));
+      continue;
+    }
+    link = entry + 8;
+  }
+  __imp__sub_829F5608(ctx, base);
+}
+
 // The menus' button help bar: sub_82746358(table, bar id, out) fills out with
 // three slots of two string ids (u16 at +0 and +2 of each 4 bytes: the
 // button's and the label's; 0xFFFF: none), which sub_8274A458 shows. The PC's removed
