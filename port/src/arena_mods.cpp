@@ -21,6 +21,7 @@
 // 4 left, 8 right). The 20 banners are DXT5 256 x 128 textures from
 // menu/MatchHD.pac (MENU/MASI), kept in guest physical memory (4 KB view)
 // untiled, with 16-bit words byte-swapped.
+#include "host_case.h"  // [ps5 port] game files in any letter case
 #include "backgrounds_page.h"
 #include "arena_mods.h"
 #include "crowd_off.h"
@@ -116,6 +117,23 @@ bool Place(const fs::path& requested, const std::string& name) {
     return false;
   }
   fs::create_hard_link(source, dst, ec);
+#if defined(__PROSPERO__)
+  // [ps5 port] The app folder takes no hard links: a symbolic link, not a
+  // copy - copying every arena file (a 20 s freeze on the arena screen's
+  // mod page, every session) for each one.
+  if (ec) {
+    const std::string why = ec.message();
+    std::error_code e2;
+    fs::create_symlink(source, dst, e2);
+    if (!e2) ec.clear();
+    static bool said = false;
+    if (!said) {
+      said = true;
+      REXLOG_INFO("[svr2011] arena mods: no hard links here ({}): overlay entries as {}", why,
+                  e2 ? "copies (" + e2.message() + ")" : std::string("symbolic links"));
+    }
+  }
+#endif
   if (ec) {
     ec.clear();
     fs::copy_file(source, dst, fs::copy_options::none, ec);  // (never over an entry: it could be a link)
@@ -1367,7 +1385,7 @@ void RedirectArena(int arena, const std::string& file) {
   if (!PrepareOverlay()) return;
   char name[16];
   std::snprintf(name, sizeof name, "BG%02d.PAC", arena);
-  const fs::path source = relative_file.empty() ? g_game / "pac" / "bg" / name : g_game / fs::u8path(relative_file);
+  const fs::path source = svr2011::HostCase(relative_file.empty() ? g_game / "pac" / "bg" / name : g_game / fs::u8path(relative_file));
   std::error_code ec;
   if (!fs::exists(source, ec)) {
     REXLOG_WARN("[svr2011] arena mods: {} not found", source.string());
@@ -1426,7 +1444,7 @@ void RedirectArena(int arena, const std::string& file) {
   // its own file and a match picked there plays as arena 29 (the match screen's
   // arena, set as the match record copies it: sub_82773F00 below).
   if (stage_at >= 0 && !std::memcmp(head + stage_at, "0029", 4)) {
-    const fs::path stock = g_game / "pac" / "bg" / "BG29.PAC";
+    const fs::path stock = svr2011::HostCase(g_game / "pac" / "bg" / "BG29.PAC");
     std::error_code e1, e2;
     bool same = fs::file_size(source, e1) == fs::file_size(stock, e2) && !e1 && !e2;
     if (same) {
@@ -1439,7 +1457,7 @@ void RedirectArena(int arena, const std::string& file) {
       }
     }
     if (same) {
-      if (!Place(g_game / "pac" / "bg" / name, name)) return;
+      if (!Place(svr2011::HostCase(g_game / "pac" / "bg" / name), name)) return;
       g_redirect[arena] = relative_file;
       g_number_for[arena] = 29;
       REXLOG_INFO("[svr2011] arena mods: BG{:02} -> {} (the stock practice ring: a match there plays as arena 29)", arena,

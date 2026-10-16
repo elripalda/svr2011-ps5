@@ -15,6 +15,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -23,6 +24,7 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/pad_dialog_style.h>
+#include <rex/ui/window.h>
 
 #include "hub_sfx.h"
 #include "hub_ui.h"
@@ -72,6 +74,69 @@ struct PadData {
 };
 
 Assets g_assets;
+Assets g_startup_assets;  // (the hub's, with its pictures: the loading screen's)
+
+// The loading screen from LAUNCH GAME until the game's first picture: the
+// app sets up mods on the UI thread meanwhile (move packs, arenas,
+// superstars: up to a minute the first time), which before showed a black
+// screen that looked frozen. Painted from that work (PaintStartupScreen).
+struct StartupState {
+  std::mutex m;
+  std::string step = "Starting the game", detail;
+  float fraction = -1;
+  bool open = false, closing = false;
+  std::thread::id ui;
+  std::chrono::steady_clock::time_point painted{};
+};
+StartupState* g_startup = new StartupState;
+rex::ui::Window* g_window = nullptr;
+
+class StartupDialog final : public rex::ui::ImGuiDialog {
+ public:
+  explicit StartupDialog(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {
+    hub_.InitStartup(g_startup_assets, "v" + svr2011::PortVersion());
+  }
+
+ protected:
+  void OnDraw(ImGuiIO&) override {
+    std::string step, detail;
+    float fraction;
+    bool closing;
+    {
+      std::lock_guard lock(g_startup->m);
+      step = g_startup->step, detail = g_startup->detail, fraction = g_startup->fraction, closing = g_startup->closing;
+    }
+    // (its own clock: painted from the startup work, ImGui's step is off)
+    const auto now = std::chrono::steady_clock::now();
+    const float dt = last_.time_since_epoch().count() ? std::chrono::duration<float>(now - last_).count() : 0.0f;
+    last_ = now;
+    if (closing) {
+      alpha_ -= std::min(dt, 0.05f) / 0.35f;
+      if (alpha_ <= 0) {
+        std::lock_guard lock(g_startup->m);
+        g_startup->open = false;
+        Close();
+        return;
+      }
+    }
+    hub_.DrawStartup(step, detail, fraction, dt, alpha_);
+  }
+
+ private:
+  Hub hub_;
+  float alpha_ = 1;
+  std::chrono::steady_clock::time_point last_{};
+};
+
+void OpenStartupScreen(rex::ui::ImGuiDrawer* drawer) {
+  {
+    std::lock_guard lock(g_startup->m);
+    if (g_startup->open) return;
+    g_startup->open = true, g_startup->closing = false;
+    g_startup->ui = std::this_thread::get_id();
+  }
+  new StartupDialog(drawer);  // (the dialog owns itself)
+}
 // The hub's pictures: kept for the app's life. (The dialog is deleted right
 // after the frame LAUNCH GAME was pressed on, and that frame's draw list,
 // rendered afterwards, still uses them: freed with the dialog, the renderer
@@ -322,6 +387,7 @@ class HubDialog final : public rex::ui::ImGuiDialog {
                                                       {kOptions, "Options"},   {kLeft | kRight, "D-Pad"}};
     for (const auto& [b, n] : names)
       if (Image img = Load(immediate, paths.game / "hub" / "buttons" / (std::string(n) + ".png"))) a.buttons[b] = img;
+    g_startup_assets = a;  // (the loading screen after LAUNCH GAME: the same pictures)
     hub_.SetTextures({[immediate](const uint8_t* rgba, int w, int h) -> Image {
                         if (!immediate) return {};
                         auto tex = immediate->CreateTexture(uint32_t(w), uint32_t(h),
@@ -384,6 +450,7 @@ class HubDialog final : public rex::ui::ImGuiDialog {
     if (go) {
       done_ = true;
       Close();
+      OpenStartupScreen(imgui_drawer());  // (until the game's first picture: the mods being set up)
       launch_();
     }
   }
@@ -428,6 +495,34 @@ void ConfigureFonts(ImFontAtlas* atlas) {
 }
 
 ImFont* MenuFont() { return g_assets.nav; }
+
+void SetWindow(rex::ui::Window* window) { g_window = window; }
+
+void StartupStep(const std::string& step, const std::string& detail, float fraction) {
+  {
+    std::lock_guard lock(g_startup->m);
+    if (!g_startup->open) return;
+    g_startup->step = step, g_startup->detail = detail, g_startup->fraction = fraction;
+    g_startup->painted = {};  // (shown at once)
+  }
+  PaintStartupScreen();
+}
+
+void PaintStartupScreen() {
+  {
+    std::lock_guard lock(g_startup->m);
+    if (!g_startup->open || g_startup->closing || !g_window || std::this_thread::get_id() != g_startup->ui) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_startup->painted < std::chrono::milliseconds(80)) return;  // (~12 a second: each waits for the TV)
+    g_startup->painted = now;
+  }
+  g_window->PaintNowFromUIThread();
+}
+
+void CloseStartupScreen() {
+  std::lock_guard lock(g_startup->m);
+  if (g_startup->open) g_startup->closing = true;
+}
 ImFont* TitleFont() { return g_assets.display; }
 
 void Show(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, const Paths& paths, std::string player,

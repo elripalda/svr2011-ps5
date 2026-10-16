@@ -439,6 +439,7 @@ std::optional<rex::PathConfig> Svr2011App::OnFinalizePaths(const rex::PathConfig
     player = rex::cvar::Query<std::string>("online_name");
   } catch (...) {
   }
+  svr2011::hub::SetWindow(window());  // (the loading screen after it paints through it)
   svr2011::hub::Show(imgui_drawer(), immediate_drawer(), paths, player, [this, defaults, resume] {
     // The hub's changes (svr2011.toml) apply to this start.
     rex::cvar::LoadConfig(g_config_path);
@@ -627,6 +628,7 @@ void Svr2011App::OnPostLoadXexImage() {
   REXLOG_INFO("start: flat saves set up");
 
   // DLC packages the launcher put in "DLC" (dlc.h).
+  svr2011::StartupStep("Checking your DLC");
   {
     const std::filesystem::path exe_dir = rex::filesystem::GetExecutableFolder();
     // (the user data the content goes to: <game>\UserData, or a test's)
@@ -634,6 +636,7 @@ void Svr2011App::OnPostLoadXexImage() {
   }
   REXLOG_INFO("start: DLC checked");
 
+  svr2011::StartupStep("Loading your music");
   // USER PLAYLIST entrance music from the Music folder (music.h); tests:
   // SVR2011_MUSIC=<folder>.
   {
@@ -643,6 +646,7 @@ void Svr2011App::OnPostLoadXexImage() {
   }
   REXLOG_INFO("start: music checked");
 
+  svr2011::StartupStep("Preparing entrance movies");
   // USER MOVIES entrance movies from the Custom Movies folder, mounted as
   // umovie: (user_movies.h); tests: SVR2011_MOVIES=<folder>.
   {
@@ -689,6 +693,7 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::InstallMatchTypes(runtime()->memory());
   // Arena mods: custom arenas in place of a host arena (arena_mods.h).
   svr2011::KeepWindowAlive();
+  svr2011::StartupStep("Setting up your mods", "Move packs - merged again only when your mods change");
   {
     // (the installed DLC packages - dlc.cpp - whose own m / mpsp pacs get copies with the packs in the overlay)
     char title[16];
@@ -697,6 +702,7 @@ void Svr2011App::OnPostLoadXexImage() {
                               g_user_data / "0000000000000000" / title / "00000002");
   }
   svr2011::KeepWindowAlive();
+  svr2011::StartupStep("Setting up your mods", "Arenas");
   svr2011::InstallArenaMods(runtime()->memory(), runtime()->file_system());
   svr2011::KeepWindowAlive();
   // Ring Kit: rope heights and rules from a custom arena's manifest (ring_rules.h).
@@ -708,6 +714,7 @@ void Svr2011App::OnPostLoadXexImage() {
 #ifndef SVR2011_D3D_TRACE
   svr2011::InstallModelMem(runtime()->memory());  // (model_mem.cpp)
 #endif
+  svr2011::StartupStep("Setting up your mods", "Superstars");
   svr2011::InstallSuperstarMods(runtime()->memory(), runtime()->file_system());
   svr2011::InstallUniverseWelcome(g_saves, g_user_data);  // (the Universe welcome kept as seen once accepted)
   svr2011::InstallUniverseMods(runtime()->memory(), g_saves);  // (the mods' WWE Universe side table: after the mods)
@@ -756,6 +763,7 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::InstallLeaderboards(runtime()->memory(), runtime()->kernel_state());
   svr2011::InstallOnlineMods(runtime()->memory());  // (superstar / arena mods in online lobbies)
   svr2011::InstallOnlineChat();  // (lobby chat longer than the game's)
+  svr2011::StartupDone();         // (the loading screen fades out over the game's first pictures)
 
   // Developer aid: SVR2011_DUMP_IMAGE=<file> writes the loaded (decrypted,
   // decompressed) executable image for analysis tools (port/tools/).

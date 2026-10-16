@@ -16,3 +16,8 @@
  * that wasn't there. */
 #define MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG
 #define MBEDTLS_PLATFORM_ZEROIZE_ALT  /* (no explicit_bzero on the PS5) */
+/* Connections on several threads at once (the relay serves the game's
+ * requests in parallel): PSA's key slots and the RNG need the locks - two
+ * handshakes at the same moment failed without them. */
+#define MBEDTLS_THREADING_C
+#define MBEDTLS_THREADING_PTHREAD

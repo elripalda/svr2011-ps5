@@ -97,6 +97,7 @@ set(SVR2011_SOURCES
     src/small_rig.cpp
     src/pose_dump.cpp
     src/game_files.cpp
+    src/host_case.cpp
 )
 
 # Developer build: count calls into every function of the game's D3D library

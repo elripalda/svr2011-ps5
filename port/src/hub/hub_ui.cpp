@@ -23,6 +23,43 @@ static const char* const kTabNames[kTabCount] = {"HOME",  "SETTINGS", "MODS",   
 
 namespace {
 
+// GET MODS on the Mods page: the QR code of the SmackDown vs. Raw Recomp
+// Discord (its mods channel has .svrmod files), https://discord.gg/5JRGZVfcRE
+// - version 3, error correction M, 29 x 29 (1: dark).
+constexpr const char* kModsUrl = "discord.gg/5JRGZVfcRE";
+constexpr const char* kModsQr[] = {
+    "11111110111010011111001111111",
+    "10000010010011101110001000001",
+    "10111010111000111100101011101",
+    "10111010010010100010101011101",
+    "10111010011011110001001011101",
+    "10000010101000010100001000001",
+    "11111110101010101010101111111",
+    "00000000010010111001000000000",
+    "10100011001001100100100100101",
+    "01000100101111100010101100011",
+    "11101011011000010001000001101",
+    "11111000001111000000111001000",
+    "01011011001101011001001100001",
+    "11110100110010001001011100011",
+    "11111011100111101001011000001",
+    "01001101101010111001101000000",
+    "00110010000111100000101000001",
+    "00010101110111100001001100111",
+    "11001111101100010011001011001",
+    "00101001000001000011100010000",
+    "11100010111101011101111111010",
+    "00000000110000001010100011101",
+    "11111110101111101010101010001",
+    "10000010000000111001100010010",
+    "10111010000101101101111111000",
+    "10111010011000100001100011110",
+    "10111010101110011100110010011",
+    "10000010011010100010111001000",
+    "11111110110110111110110011001",
+};
+constexpr int kQrSize = int(sizeof(kModsQr) / sizeof(kModsQr[0]));
+
 // A mod folder type as a heading: "MatchTypes" -> "MATCH TYPES".
 std::string TypeHeading(const std::string& type) {
   std::string out;
@@ -635,6 +672,10 @@ void Hub::DrawHints() {
     r = Hint(r, kCross, "Choose");
     return;
   }
+  if (qr_open_) {
+    r = Hint(r, kCircle, "Close");
+    return;
+  }
   if (br_.open) r = BrowserHints(r);
   if (!br_.open) {
   if (tab_ != kHome && state_.Installed()) r = Hint(r, kOptions, "Start Game");
@@ -643,6 +684,7 @@ void Hub::DrawHints() {
     case kHome: r = Hint(r, kCross, "Start Game"); break;
     case kSettingsTab: r = Hint(r, kLeft | kRight, "Change"); break;
     case kModsTab:
+      r = Hint(r, kTriangle, "Get Mods");
       r = Hint(r, kSquare, "Find Mods");
       if (item_[tab_] < int(drops_.size())) r = Hint(r, kCross, "Install");
       else if (!mods_.empty()) r = Hint(r, kCross, "Turn On / Off");
@@ -762,6 +804,54 @@ void Hub::DrawHome() {
 
 }
 
+void Hub::DrawStartup(const std::string& step, const std::string& detail, float fraction, float dt, float alpha) {
+  dt_ = std::clamp(dt, 0.0f, 0.1f);
+  time_ += dt_;
+  const ImVec2 size = ImGui::GetIO().DisplaySize;
+  s_ = std::min(size.x / kW, size.y / kH);
+  ox_ = (size.x - kW * s_) * 0.5f;
+  oy_ = (size.y - kH * s_) * 0.5f;
+  dl_ = ImGui::GetForegroundDrawList();
+  const int v0 = dl_->VtxBuffer.Size;
+  tab_ = kHome;
+  DrawBackdrop();
+  // the logo, where the home page has it
+  const float lx = 104, lw = a_.logo && a_.logo.width > a_.logo.height * 2.4f ? 700.0f : 640.0f;
+  if (a_.logo) {
+    const float lh = lw * a_.logo.height / a_.logo.width, ly = 862 - 36 - lh;
+    for (int i = 0; i < 8; ++i) {
+      const float a = float(i) * 0.785f, d = 10;
+      const float dx = std::cos(a) * d, dy = std::sin(a) * d + 8;
+      dl_->AddImage(a_.logo.id, P(lx + dx, ly + dy), P(lx + lw + dx, ly + lh + dy), ImVec2(0, 0), ImVec2(1, 1), Black(0.1f));
+    }
+    dl_->AddImage(a_.logo.id, P(lx, ly), P(lx + lw, ly + lh));
+  } else {
+    Text(a_.display, 96, lx, 640, kText, "SMACKDOWN VS RAW");
+  }
+  // where START GAME was: what's being done, a spinner and a bar
+  const float bx = 112, by = 870;
+  const float a0 = time_ * 5;
+  dl_->PathArcTo(P(bx + 20, by + 24), 17 * s_, a0, a0 + 4.2f, 32);
+  dl_->PathStroke(kAccent, 0, 4 * s_);
+  Text(a_.display, 40, bx + 56, by, kText, Upper(step), 0, 2);
+  const float bary = by + 70, barw = 760;
+  Rect(bx, bary, barw, 6, White(0.14f), 3);
+  static float shown = 0;
+  if (fraction >= 0) {
+    const float f = std::clamp(fraction, 0.0f, 1.0f);
+    shown = shown > f ? f : shown + (f - shown) * (1 - std::exp(-dt_ * 8));
+    Rect(bx, bary, std::max(6.0f, barw * shown), 6, kAccent, 3);
+  } else {
+    shown = 0;
+    const float seg = 200, t = std::fmod(time_ * 0.6f, 1.0f), x0 = bx - seg + (barw + seg) * t;
+    const float a = std::max(bx, x0), b = std::min(bx + barw, x0 + seg);
+    if (b > a) Rect(a, bary, b - a, 6, kAccent, 3);
+  }
+  if (!detail.empty()) Text(a_.body, 21, bx, bary + 22, White(0.62f), Fit(a_.body, 21, detail, barw + 200));
+  Text(a_.body, 18, 112, 1012, White(0.32f), "SmackDown vs. Raw Recomp " + version_ + "  \xC2\xB7  PlayStation 5");
+  Fade(v0, alpha);
+}
+
 int Hub::MusicVolume() const {
   return std::clamp(std::atoi(Value("hub_music_volume", "80").c_str()), 0, 100);
 }
@@ -854,12 +944,61 @@ void Hub::DrawSettings() {
   });
 }
 
+// A QR code drawn as squares: crisp at any size. On white, with the quiet
+// zone (2 modules) scanners need.
+void Hub::DrawQr(float x, float y, float size) {
+  Rect(x, y, size, size, Rgba(255, 255, 255), size * 0.04f);
+  const float m = size / float(kQrSize + 4), o = 2 * m;
+  for (int r = 0; r < kQrSize; ++r)
+    for (int c = 0; c < kQrSize; ++c)
+      if (kModsQr[r][c] == '1')
+        dl_->AddRectFilled(P(x + o + c * m, y + o + r * m), P(x + o + (c + 1) * m + 0.35f, y + o + (r + 1) * m + 0.35f),
+                           Rgba(8, 9, 11));
+}
+
+// GET MODS: in the Mods page's corner; Triangle shows it big.
+void Hub::DrawGetMods() {
+  const float x = kPanelX, y = 838, w = kPanelW, h = 132;
+  Rect(x, y, w, h, White(0.06f), 14);
+  DrawQr(x + 14, y + 14, h - 28);
+  const float tx = x + h + 8, tw = w - h - 26;
+  Text(a_.body_bold, 15, tx, y + 18, White(0.5f), "GET MODS", 0, 3);
+  Wrapped(a_.body, 19, tx, y + 46, tw, White(0.78f), "Scan for the SmackDown vs. Raw Recomp Discord: its mods channel is full of .svrmod files.");
+  Glyph(kTriangle, tx + 11, y + h - 25, White(0.6f));
+  Text(a_.body_bold, 17, tx + 30, y + h - 37, White(0.6f), "Enlarge");
+}
+
+void Hub::DrawQrBig() {
+  Ease(qr_in_, qr_open_ ? 1.0f : 0.0f, 14);
+  if (qr_in_ < 0.01f) return;
+  const float a = Smooth(qr_in_);
+  const ImVec2 size = ImGui::GetIO().DisplaySize;
+  const int v0 = dl_->VtxBuffer.Size;
+  dl_->AddRectFilled(ImVec2(0, 0), size, Black(0.82f));
+  const float q = 560, w = 1240, h = q + 120, x = (kW - w) * 0.5f, y = (kH - h) * 0.5f + (1 - a) * 30;
+  Rect(x, y, w, h, Rgba(24, 25, 29), 18);
+  dl_->AddRectFilled(P(x, y), P(x + 6, y + h), kAccent, 18 * s_, ImDrawFlags_RoundCornersLeft);
+  DrawQr(x + 60, y + 60, q);
+  const float tx = x + q + 120, tw = w - q - 180;
+  Text(a_.body_bold, 16, tx, y + 76, White(0.5f), "GET MODS", 0, 3);
+  float ty = y + 112;
+  ty += Wrapped(a_.display, 48, tx, ty, tw, kText, "Scan with your phone", 1.1f) + 24;
+  ty += Wrapped(a_.body, 22, tx, ty, tw, White(0.75f),
+                "It opens the SmackDown vs. Raw Recomp Discord. Its mods channel has superstars, arenas, moves and more "
+                "as .svrmod files.") + 18;
+  ty += Wrapped(a_.body, 22, tx, ty, tw, White(0.75f),
+                "Copy them to a USB drive, plug it in, and press Square on this page to find and install them.") + 30;
+  Text(a_.body_bold, 22, tx, ty, kAccent, kModsUrl);
+  Fade(v0, a);
+}
+
 void Hub::DrawMods() {
   int on = 0;
   for (const Mod& m : mods_) on += m.enabled;
   PageTitle("MODS", mods_.empty() ? std::string("Mods you add show up here.")
                                   : std::to_string(mods_.size()) + " installed, " + std::to_string(on) +
                                         " on. Changes take effect when the game starts.");
+  DrawGetMods();
   if (mods_.empty() && drops_.empty()) {
     Empty("No mods yet",
           "Press Square to find .svrmod files on a USB drive or in any folder, and install them from there. You "
@@ -1225,6 +1364,10 @@ void Hub::Navigate(const Pad& pad) {
     BrowserInput(p);
     return;
   }
+  if (qr_open_) {  // GET MODS, big: any of these closes it
+    if (p & (kCircle | kCross | kTriangle)) qr_open_ = false, Play(Sound::kBack);
+    return;
+  }
   // START GAME: once the game is installed (and nothing is being installed)
   auto start = [&] {
     if (task_) {
@@ -1296,6 +1439,11 @@ void Hub::Navigate(const Pad& pad) {
   }
   if (tab_ == kModsTab && (p & kSquare)) {  // Find Mods: .svrmod files on a USB drive...
     OpenBrowser();
+    return;
+  }
+  if (tab_ == kModsTab && (p & kTriangle)) {  // GET MODS, big
+    qr_open_ = true, qr_in_ = 0;
+    Play(Sound::kSelect);
     return;
   }
   const int n = Items();
@@ -1400,6 +1548,7 @@ bool Hub::Draw(const Pad& pad, float dt) {
   Fade(first, Smooth(page_in_));
   DrawBrowser();
   DrawHints();
+  DrawQrBig();
   DrawConfirm();
   DrawChoice();
   DrawKeyboard();

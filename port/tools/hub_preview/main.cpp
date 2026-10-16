@@ -173,13 +173,24 @@ int main(int argc, char** argv) {
   };
   // HUB_WAIT=<ms>: a pause after each frame (a job on a thread gets that long)
   const int wait_ms = std::getenv("HUB_WAIT") ? std::atoi(std::getenv("HUB_WAIT")) : 0;
+  // HUB_STARTUP="<step>|<detail>[|<fraction>]": the loading screen after START GAME instead of the hub
+  const char* startup = std::getenv("HUB_STARTUP");
+  svr2011::hub::Hub loading;
+  if (startup) loading.InitStartup(a, "V2.1.3");
   for (size_t f = 0; f < script.size(); ++f) {
     if (wait_ms) std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
     io.DeltaTime = step;
     ImGui::NewFrame();
     svr2011::hub::Pad pad;
     pad.pressed = pad.held = script[f];
-    hub.Draw(pad, step);
+    if (startup) {
+      std::string v = startup, st = v.substr(0, v.find('|')), de, fr;
+      if (v.find('|') != std::string::npos) de = v.substr(v.find('|') + 1);
+      if (de.find('|') != std::string::npos) fr = de.substr(de.find('|') + 1), de.resize(de.find('|'));
+      loading.DrawStartup(st, de, fr.empty() ? -1.0f : float(std::atof(fr.c_str())), step, 1);
+    } else {
+      hub.Draw(pad, step);
+    }
     ImGui::Render();
     if (frames) {
       char name[32];

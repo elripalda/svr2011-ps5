@@ -703,6 +703,7 @@ std::string ServerBase() {
 // -- the relay: the game's http ------------------------------------------------------
 
 void HandleHttp(Socket s) {
+  const auto accepted = std::chrono::steady_clock::now();
   SetTimeout(s, 60);
   std::string data;
   char buf[65536];
@@ -741,6 +742,7 @@ void HandleHttp(Socket s) {
     if (it != request_headers.headers.end()) forward.emplace_back(name, it->second);
   }
   const auto t0 = std::chrono::steady_clock::now();
+  const auto read_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t0 - accepted).count();
   auto r = ServerRequest(method, "/game" + target, body, forward);
   const auto ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -749,7 +751,8 @@ void HandleHttp(Socket s) {
     REXLOG_WARN("online: {} {} - the server didn't answer", method, target);
     reply = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
   } else {
-    REXLOG_INFO("online: {} {} -> {} ({} bytes, {} ms)", method, target, r->status, r->body.size(), ms);
+    REXLOG_INFO("online: {} {} -> {} ({} bytes, {} ms; the game's request read in {} ms)", method, target, r->status,
+                r->body.size(), ms, read_ms);
     reply = "HTTP/1.1 " + std::to_string(r->status) + (r->status == 200 ? " OK" : " Error") + "\r\n";
     for (const char* name : {"Content-Type", "Sake-File-Result", "Sake-File-Id"}) {
       auto it = r->headers.find(Lower(name));

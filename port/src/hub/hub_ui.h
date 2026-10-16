@@ -110,6 +110,15 @@ class Hub {
   void SetRequest(Request request) { request_ = std::move(request); }
   void SetTextures(Textures textures) { textures_ = std::move(textures); }
   void SetDlcInstall(DlcInstall install) { dlc_install_ = std::move(install); }
+  // The loading screen from START GAME to the game's first picture (the mods
+  // being set up): the home page's picture and logo, with what's being done
+  // where START GAME was. Needs only the assets (no pages are read).
+  void InitStartup(const Assets& assets, std::string version) {
+    a_ = assets;
+    version_ = std::move(version);
+  }
+  // `fraction` < 0: no known end (a sweep); `alpha` fades it out over the game.
+  void DrawStartup(const std::string& step, const std::string& detail, float fraction, float dt, float alpha);
   ~Hub();
   // Draws the hub over the whole display; true when the game should start.
   bool Draw(const Pad& pad, float dt);
@@ -207,6 +216,9 @@ class Hub {
   void DrawMovies();
   void DrawSaves();
   void DrawDlc();
+  void DrawGetMods();  // the Mods page's GET MODS corner (a QR code to the mods Discord)
+  void DrawQrBig();    // ... and big (Triangle)
+  void DrawQr(float x, float y, float size);
   void DrawOnline();
   void DrawAbout();
   void DrawInstall();
@@ -302,6 +314,8 @@ class Hub {
   std::function<void()> confirm_;
   std::string confirm_title_, confirm_text_, confirm_yes_;
   float confirm_in_ = 0;
+  bool qr_open_ = false;  // GET MODS shown big
+  float qr_in_ = 0;
   // animation (eased toward their targets)
   float tab_x_ = -1, tab_w_ = 0, focus_y_ = -1, shade_ = 0.3f, page_in_ = 1;
   float page_dir_ = 1;          // the page slides in from this side (+1: the right)

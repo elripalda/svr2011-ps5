@@ -1,5 +1,6 @@
 // WWE SmackDown vs. Raw 2011 - DLC installation (see dlc.h).
 
+#include "host_case.h"  // [ps5 port] game files in any letter case
 #include "dlc.h"
 
 #include <cstdint>
@@ -348,7 +349,7 @@ void InstallDlc(rex::system::KernelState* kernel_state, const std::filesystem::p
     ~PatchStrings() {  // whatever happens below: the installed DLC's text
       std::error_code e;
       for (const auto& pkg : std::filesystem::directory_iterator(dir, e))
-        PatchOnlineStrings(pkg.path() / "pac" / "string.pac");
+        PatchOnlineStrings(svr2011::HostCase(pkg.path() / "pac" / "string.pac"));
     }
   } patch_strings{installed};
   struct FanAxxess {  // (whatever happens below: once the player's packages are in)
