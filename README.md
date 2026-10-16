@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/badge/release-v1.0-ff3b4a"></a>
+  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/badge/release-v1.1-ff3b4a"></a>
   <img alt="Platform: PS5 homebrew" src="https://img.shields.io/badge/platform-PS5%20homebrew-1f5fd6">
   <a href="https://github.com/KaikoClanworth1/wwe-svr2011-pc"><img alt="Built on KaikoClanworth1/wwe-svr2011-pc" src="https://img.shields.io/badge/built%20on-KaikoClanworth1%2Fwwe--svr2011--pc-8fb3ff"></a>
   <a href="https://discord.gg/GgDE5Vynyu"><img alt="Discord" src="https://img.shields.io/badge/Discord-RIPALDA-5865F2"></a>
@@ -44,8 +44,10 @@ It opens on its own **hub**, the PC port's launcher made for a controller.
 
 - **60 fps up to 4K**, with anti-aliasing and the PC port's graphics options.
 - **The hub**: Home, Settings, Mods, Roster, Textures, Music, Movies, Paint, Saves, Online, DLC and About pages, all driven by the DualSense, with menu music (a random song each time, **R3** for the next, and a volume setting).
-- **The PC port's bundled mods, already installed**: 23 superstars, 5 arenas and 11 match types. Turn them on in the Mods page.
-- **Find Mods**: the Mods page looks for `.svrmod` files on a USB drive, extended storage or any folder on the console, and installs them from there (one, or all of a folder's).
+- **Online**: matchmaking, lobbies and Community Creations, with PC players on the same version. This release is the PC port's v2.1.3.
+- **The PC port's bundled mods, already installed**: 23 superstars, 5 arenas and 18 match types. Turn them on in the Mods page.
+- **Find Mods**: the Mods page looks for `.svrmod` files on a USB drive, extended storage or any folder on the console, and installs them from there (one, or all of a folder's). **Get Mods** (Triangle) shows a QR code to the Discord where people share them.
+- **DLC** installs from the hub's DLC page, with a progress bar.
 - **The PC port's extras**: `.svrmod` mods, your own entrance music and movies, up to 10 HD logos per created superstar, Paint Tool import and export, save backups.
 - **PlayStation buttons** in the game's menus and prompts.
 - **An on-screen keyboard** in the hub's style for names and text.
