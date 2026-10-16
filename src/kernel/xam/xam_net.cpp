@@ -969,6 +969,13 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
+#if REX_PLATFORM_WIN32
+    REXKRNL_WARN("[svr2011] net: bind port {} failed: {}", uint16_t(native_name.sin_port), HostSocketError());
+#else
+    const int host_errno = errno;
+    REXKRNL_WARN("[svr2011] net: bind port {} failed: {} (errno {})", uint16_t(native_name.sin_port),
+                 HostSocketError(), host_errno);
+#endif
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
     return -1;
   }
@@ -1008,7 +1015,16 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
   }
   X_STATUS status = socket->Connect(&native_name, namelen);
   if (XFAILED(status)) {
-    XThread::SetLastError(HostSocketError());
+    const uint32_t error = HostSocketError();
+    XThread::SetLastError(error);
+    static uint32_t logged = 0;
+    if (error != 10035 && logged++ < 16) {  // (WSAEWOULDBLOCK: a non-blocking connect under way)
+#if REX_PLATFORM_WIN32
+      REXKRNL_WARN("[svr2011] net: connect failed: {}", error);
+#else
+      REXKRNL_WARN("[svr2011] net: connect failed: {} (errno {})", error, errno);
+#endif
+    }
     return -1;
   }
 

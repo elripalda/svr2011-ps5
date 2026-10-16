@@ -233,8 +233,29 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
   return X_STATUS_SUCCESS;
 }
 
+// [ps5 port] An IPv4 address as the host's sockaddr_in. N_XSOCKADDR_IN's
+// 16-bit family is the Windows / Linux layout; a BSD one (the PS5) starts
+// with a length byte, so cast as it was its family read 0 - connect refused
+// it (the GameSpy relay: "communications unavailable") and so could bind.
+static sockaddr_in NativeInet(const N_XSOCKADDR_IN& in) {
+  sockaddr_in sin = {};
+#if defined(__FreeBSD__) || defined(__PROSPERO__) || defined(__APPLE__)
+  sin.sin_len = sizeof(sin);
+#endif
+  sin.sin_family = AF_INET;
+  sin.sin_port = htons(uint16_t(in.sin_port));
+  sin.sin_addr.s_addr = htonl(uint32_t(in.sin_addr));
+  return sin;
+}
+
 X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
-  int ret = connect(native_handle_, (sockaddr*)name, name_len);
+  int ret;
+  if (name->address_family == X_AF_INET) {
+    const sockaddr_in sin = NativeInet(*reinterpret_cast<const N_XSOCKADDR_IN*>(name));
+    ret = connect(native_handle_, (const sockaddr*)&sin, sizeof(sin));
+  } else {
+    ret = connect(native_handle_, (sockaddr*)name, name_len);
+  }
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
@@ -243,7 +264,13 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
-  int ret = bind(native_handle_, (sockaddr*)name, name_len);
+  int ret;
+  if (name->sin_family == X_AF_INET) {
+    const sockaddr_in sin = NativeInet(*name);
+    ret = bind(native_handle_, (const sockaddr*)&sin, sizeof(sin));
+  } else {
+    ret = bind(native_handle_, (sockaddr*)name, name_len);
+  }
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
@@ -264,17 +291,24 @@ X_STATUS XSocket::Listen(int backlog) {
 }
 
 object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
-  sockaddr n_sockaddr;
-  socklen_t n_name_len = sizeof(sockaddr);
-  uintptr_t ret = accept(native_handle_, &n_sockaddr, &n_name_len);
+  sockaddr_in n_sockaddr = {};
+  socklen_t n_name_len = sizeof(n_sockaddr);
+  uintptr_t ret = accept(native_handle_, (sockaddr*)&n_sockaddr, &n_name_len);
   if (ret == -1) {
     std::memset(name, 0, *name_len);
     *name_len = 0;
     return nullptr;
   }
 
-  std::memcpy(name, &n_sockaddr, n_name_len);
-  *name_len = n_name_len;
+  // [ps5 port] Back in the guest's layout (a BSD sockaddr starts with a length byte).
+  N_XSOCKADDR_IN in;
+  in.sin_family = n_sockaddr.sin_family;
+  in.sin_port = ntohs(n_sockaddr.sin_port);
+  in.sin_addr = ntohl(n_sockaddr.sin_addr.s_addr);
+  std::memset(in.x_sin_zero, 0, sizeof(in.x_sin_zero));
+  const int out_len = std::min<int>(int(sizeof(in)), *name_len > 0 ? *name_len : int(sizeof(in)));
+  std::memcpy(name, &in, out_len);
+  *name_len = out_len;
 
   // Create a kernel object to represent the new socket, and copy parameters
   // over.
