@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -102,6 +103,15 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
   if (native_handle_ == -1) {
     return X_STATUS_UNSUCCESSFUL;
   }
+#if REX_PLATFORM_PS5
+  // [ps5] Nagle off: the game sends a request's head and its body as two
+  // sends, and the body waited for the head's ACK - which the other side
+  // delays ~100 ms - on every Community Creations request.
+  if (type == Type::X_SOCK_STREAM) {
+    int one = 1;
+    setsockopt(native_handle_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  }
+#endif
 
   return X_STATUS_SUCCESS;
 }

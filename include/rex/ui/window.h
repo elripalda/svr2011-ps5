@@ -367,6 +367,9 @@ class Window {
       presenter_->RequestUIPaintFromUIThread();
     }
   }
+  // [ps5] Paints now, from the UI thread while it is busy outside the event
+  // loop (the app's loading screen while it sets up mods at start).
+  void PaintNowFromUIThread() { OnPaint(true); }
 
  protected:
   // The receiver, which must never be instantiated in the Window object itself
