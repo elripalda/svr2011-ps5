@@ -99,6 +99,27 @@ void Refresh(const std::string& name) {
 
 std::map<std::string, fs::path> g_placed;  // overlay name -> the file asked for
 
+#if defined(__PROSPERO__)
+// [ps5 port] The app folder takes no hard or symbolic links (Operation not
+// supported), so the overlay - a mirror of pac/bg - was made of copies of
+// every arena file: a 20 s freeze on the arena screen's mod page, every
+// session. Here an arena's own file gets a file-level link in the game's file
+// system instead (the PS5 runtime matches a file found through its folder
+// against those): \PAC\BG\BGnn.PAC -> the file asked for. No link: the original.
+void LinkArena(const std::string& name, const fs::path& file) {
+  const std::string from = std::string(kGameDevice) + "\\PAC\\BG\\" + name;
+  g_fs->UnregisterSymbolicLink(from);
+  std::error_code e1;
+  const fs::path stock = svr2011::HostCase(g_game / "pac" / "bg" / name);
+  if (fs::equivalent(file, stock, e1) || (e1 && file.lexically_normal() == stock.lexically_normal())) return;
+  std::string rel = svr2011::RelativePath(file, g_game).string();
+  std::replace(rel.begin(), rel.end(), '/', '\\');
+  const std::string to = std::string(kGameDevice) + "\\" + rel;
+  if (auto* e = g_fs->ResolvePath(to)) e->update();  // (a copy made now: its size as it is)
+  g_fs->RegisterSymbolicLink(from, to);
+}
+#endif
+
 // overlay/<name> := link to (or copy of) `source` - with the crowd off
 // (crowd_off.h) its crowd-less copy once made.
 bool Place(const fs::path& requested, const std::string& name) {
@@ -107,6 +128,10 @@ bool Place(const fs::path& requested, const std::string& name) {
     std::lock_guard lock(g_mutex);
     if (g_placed[name] == requested) Place(requested, name);  // (now the copy)
   });
+#if defined(__PROSPERO__)
+  LinkArena(name, source);  // [ps5 port] (no overlay entry)
+  return true;
+#endif
   std::error_code ec;
   const fs::path dst = g_overlay / name;
   // An overlay entry may be a hard link to an original: never write through
@@ -117,23 +142,6 @@ bool Place(const fs::path& requested, const std::string& name) {
     return false;
   }
   fs::create_hard_link(source, dst, ec);
-#if defined(__PROSPERO__)
-  // [ps5 port] The app folder takes no hard links: a symbolic link, not a
-  // copy - copying every arena file (a 20 s freeze on the arena screen's
-  // mod page, every session) for each one.
-  if (ec) {
-    const std::string why = ec.message();
-    std::error_code e2;
-    fs::create_symlink(source, dst, e2);
-    if (!e2) ec.clear();
-    static bool said = false;
-    if (!said) {
-      said = true;
-      REXLOG_INFO("[svr2011] arena mods: no hard links here ({}): overlay entries as {}", why,
-                  e2 ? "copies (" + e2.message() + ")" : std::string("symbolic links"));
-    }
-  }
-#endif
   if (ec) {
     ec.clear();
     fs::copy_file(source, dst, fs::copy_options::none, ec);  // (never over an entry: it could be a link)
@@ -150,6 +158,19 @@ bool Place(const fs::path& requested, const std::string& name) {
 bool PrepareOverlay() {
   if (g_overlay_ready) return true;
   std::error_code ec;
+#if defined(__PROSPERO__)
+  // [ps5 port] No mirror (LinkArena): the overlay only holds copies with a
+  // renamed stage entry. The copies earlier builds mirrored pac/bg with go
+  // (over a GB).
+  if (fs::exists(g_overlay / "BG00.PAC", ec)) {
+    fs::remove_all(g_overlay, ec);
+    REXLOG_INFO("[svr2011] arena mods: the old overlay's copies of pac/bg removed");
+  }
+  fs::create_directories(g_overlay, ec);
+  g_overlay_ready = true;
+  REXLOG_INFO("[svr2011] arena mods: arena files linked one at a time (no overlay copies)");
+  return true;
+#endif
   const fs::path bg = g_game / "pac" / "bg";
   fs::create_directories(g_overlay, ec);
   if (ec || !fs::is_directory(bg, ec)) return false;
@@ -1486,7 +1507,11 @@ void RedirectArena(int arena, const std::string& file) {
     std::fseek(f, stage_at, SEEK_SET);
     std::fwrite(want, 1, 4, f);
     std::fclose(f);
+#if defined(__PROSPERO__)
+    LinkArena(name, dst);  // [ps5 port] (the copy, by a file-level link)
+#else
     Refresh(name);
+#endif
     REXLOG_INFO("[svr2011] arena mods: {} stage STG/{} renamed STG/{} for BG{:02}", relative_file,
                 std::string(head + stage_at, 4), want, arena);
   } else if (!Place(source, name)) {
