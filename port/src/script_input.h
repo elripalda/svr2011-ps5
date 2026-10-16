@@ -12,6 +12,8 @@
 //   type <text>                 type on the PC keyboard (keyboard_typing.h)
 //   key <BACK|ENTER|ESC|LEFT|RIGHT|UP|DOWN>   press a PC keyboard key
 //   set <cvar> <value>          sets a setting at once (not queued; tests of live changes)
+//   connect                     an idle "Test Pad" connects now (not queued; late-controller tests;
+//                               SVR2011_TEST_SCRIPT_AS_KEYBOARD=1 lists the script as the keyboard)
 //   touch <x> <y> <ms>          a finger on the on-screen controller at x, y
 //                               (fractions of the window) for ms
 //   drag <x0> <y0> <x1> <y1> <ms>   a finger down at x0, y0, moved to x1, y1
@@ -60,10 +62,17 @@ bool ScriptMenuState(uint32_t* group, uint32_t* row);
 int ScriptMenuRow(uint32_t group, const std::string& label, int* rows);
 std::string ScriptMenuTexts(uint32_t group);
 uint32_t ScriptMenuSelects(uint32_t* group, uint32_t* row);
+// The menu table the game reads when the port changed it (match_types.cpp:
+// its rows added) - the steps' row places come from it, not menu.pac's.
+void ScriptMenuTable(const uint8_t* table, size_t size);
 
 using rex::X_RESULT;
 using rex::X_STATUS;
 using namespace rex::input;  // X_INPUT_* types and button bits
+
+// The "until" steps' log sink - once, at setup, before any game thread
+// (svr2011_app.cpp; adding a sink later races the threads' logging).
+void InstallScriptLogSink();
 
 class ScriptInputDriver final : public rex::input::InputDriver {
  public:

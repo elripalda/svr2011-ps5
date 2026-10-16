@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "app.h"
+#include "mod_check.h"
 
 namespace mm {
 namespace signs_page {
@@ -74,21 +75,19 @@ void InstallPack() {
   std::vector<ZipEntry> files;
   if (!BuildPack(files)) return;
   const fs::path dir = fs::path(g_game) / L"Mods" / L"Signs" / fs::u8path(PackId());
-  std::error_code ec;
-  fs::remove_all(dir, ec);
-  fs::create_directories(dir, ec);
-  for (const auto& f : files)
-    if (!WriteFile(PathStr(dir / fs::u8path(f.name)), f.data)) {
-      Status("Could not write into " + PathStr(dir) + " (is the game running?)");
-      return;
-    }
-  Status("Installed: the crowd holds these signs in every match from the next game start (" + PathStr(dir) + ").");
+  std::string why;
+  if (!InstallModFiles(dir, files, &why)) {
+    Status("Not installed: " + why);
+    return;
+  }
+  Status("Installed: the crowd holds these signs in every match from the next game start (" + PathStr(dir) + ")." + InstallReport("Signs", dir));
 }
 
 void Problems(std::vector<Problem>& p) {
-  if (g_pack.signs.empty()) p.push_back(Error("No signs yet.", "Add pictures: any picture is fitted onto a white 128 x 64 board."));
-  if (!g_pack.name[0]) p.push_back(Warning("No pack name: \"My Signs\" is used."));
-  if (g_pack.signs.size() > 64) p.push_back(Warning("A lot of signs: each match shows at most 16, drawn from the game's and every pack's."));
+  if (g_pack.signs.empty()) p.push_back(Error("No signs yet: add pictures - each is fitted onto a white board."));
+  if (!g_pack.name[0]) p.push_back(Warning("The signs have no name yet: they'd be called \"My Signs\".")
+                                       .With("Call them \"My Signs\"", [] { std::snprintf(g_pack.name, sizeof g_pack.name, "My Signs"); Touch(); }));
+  if (g_pack.signs.size() > 64) p.push_back(Warning("A lot of signs: a match shows at most 16 at a time, picked from the game's and every sign pack's."));
 }
 
 void Draw() {
@@ -208,6 +207,34 @@ Image SignPicture(const Image& src) {
       o[3] = 255;
     }
   return out;
+}
+
+std::vector<ZipEntry> PackFiles(const std::string& id, const std::string& name, const std::string& author,
+                                const std::vector<std::pair<std::string, Image>>& signs) {
+  std::vector<ZipEntry> files;
+  const std::string man = "type=signs\nid=" + id + "\nname=" + name + "\nauthor=" + author + "\nversion=1.0\n" + MadeWith();
+  files.push_back({"manifest.txt", Bytes(man.begin(), man.end())});
+  for (size_t i = 0; i < signs.size(); ++i) {
+    char n[16];
+    std::snprintf(n, sizeof n, "%02zu_", i + 1);
+    std::string stem;
+    for (char c : signs[i].first) stem += std::isalnum(uint8_t(c)) ? c : '_';
+    const Image& img = signs[i].second;
+    files.push_back({n + stem.substr(0, 40) + ".dds", DdsEncode(img.w == 128 && img.h == 64 ? img : SignPicture(img), DxtFormat::kDxt1, true)});
+  }
+  return files;
+}
+
+bool InstallPack(const std::string& id, const std::vector<ZipEntry>& files) {
+  const fs::path dir = fs::path(g_game) / L"Mods" / L"Signs" / fs::u8path(id);
+  std::string why;
+  if (!InstallModFiles(dir, files, &why)) {
+    Log("signs: not installed: " + why);
+    return false;
+  }
+  const std::string doctor = InstallReport("Signs", dir);
+  if (!doctor.empty()) Log("signs: " + doctor);
+  return true;
 }
 
 void TestStart(const std::vector<std::wstring>& files, const std::wstring& save) {

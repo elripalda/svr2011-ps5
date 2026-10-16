@@ -10,6 +10,7 @@
 
 #include "frame_rate.h"
 #include "graphics_page.h"
+#include "port_map.h"
 #include "backgrounds_page.h"
 #include "mystery_opponent.h"
 
@@ -67,14 +68,17 @@ constexpr int kNumResolutions = int(std::size(kResolutions));
 constexpr int kDefaultResolution = 3;  // (1920 x 1080)
 // GRAPHICS -> RENDER RESOLUTION: native_max_scale (AUTO: follow the window,
 // up to 4x; the phone's screen is the window), and below the Xbox 360's 720p
-// native_render_scale (360P / 480P: the scene smaller, scaled up).
+// native_render_scale (360P / 480P: the scene smaller, scaled up); between
+// the 720p steps native_scene_height (900P / 1080P: 2x, scaled down to it).
 struct Scale {
   int value;
   double res;  // (native_render_scale)
+  int height;  // (native_scene_height; 0: off)
   const char* label;
 };
-constexpr Scale kScales[] = {{4, 1.0, "AUTO"},  {1, 0.5, "360P"},  {1, 2.0 / 3.0, "480P"},
-                             {1, 1.0, "720P (XBOX 360)"}, {2, 1.0, "1440P"}, {3, 1.0, "2160P"}};
+constexpr Scale kScales[] = {{4, 1.0, 0, "AUTO"},       {1, 0.5, 0, "360P"},     {1, 2.0 / 3.0, 0, "480P"},
+                             {1, 1.0, 0, "720P (XBOX 360)"}, {2, 1.0, 900, "900P"}, {2, 1.0, 1080, "1080P"},
+                             {2, 1.0, 0, "1440P"},       {3, 1.0, 0, "2160P"}};
 constexpr int kNumScales = int(std::size(kScales));
 // GRAPHICS -> TEXTURES: native_texture_quality (MEDIUM / LOW: big textures
 // from the game's own half / quarter size mipmaps - native/textures.h).
@@ -103,6 +107,8 @@ enum Row {
   kTextureQuality,                                               // GRAPHICS
   kCrowd, kShadows,                                              // ADV. GRAPHICS
   kFastStart,                                                    // DISPLAY (last)
+  kPing,                                                         // DISPLAY
+  kRouterPort,                                                   // DISPLAY
 };
 // FRAME RATE (frame_rate.h): the choices.
 constexpr int kFrameRates[] = {30, 60};
@@ -115,9 +121,9 @@ const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kF
 #elif defined(__ANDROID__)
 // (the phone: the window is the screen - no window size or mode)
 // (no RENDERER row: the phone draws natively on Vulkan, its only graphics API)
-const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kFpsCounter, kTouch, kReplays, kFastStart},
+const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kFpsCounter, kPing, kRouterPort, kTouch, kReplays, kFastStart},
 #else
-const std::vector<Row> kTabRowsAll[kTabs] = {{kResolution, kDisplay, kFrameRate, kFullSpeed, kVsync, kFpsCounter, kRenderer, kTouch,
+const std::vector<Row> kTabRowsAll[kTabs] = {{kResolution, kDisplay, kFrameRate, kFullSpeed, kVsync, kFpsCounter, kPing, kRouterPort, kRenderer, kTouch,
                                               kReplays, kCpuPriority, kFastStart},
 #endif
                                              {kRenderScale, kAntiAliasing, kTextureQuality, kWide, kCutsceneFps},
@@ -174,7 +180,10 @@ constexpr Binding kBindings[] = {
     {"keybind_back", "BACK", "BACK", "Z,Tab"},
 };
 constexpr int kNumBindings = int(std::size(kBindings));
-constexpr int kControlRows = kNumBindings + 1;  // (+ RESET TO DEFAULTS)
+// Rows: VIBRATION (ON / OFF, the vibration setting: pad_types.cpp), the
+// inputs (row - 1), RESET TO DEFAULTS.
+constexpr int kVibrationRow = 0, kFirstBinding = 1, kResetRow = kNumBindings + 1;
+constexpr int kControlRows = kNumBindings + 2;
 constexpr int kControlsShown = 9;              // (rows on screen; the list scrolls)
 
 // The keys a binding can take: ImGui's key -> the driver's name for it.
@@ -390,6 +399,8 @@ class GraphicsPage final : public rex::ui::ImGuiDialog {
   int language_ = 0;    // kLanguages index (saved; applies at the next start)
   int language_at_start_ = 0;
   int aa_ = 1;  // anti-aliasing level: 1 off, 2-4 supersampling per side
+  bool ping_ = true;
+  bool router_port_ = true;
   bool fps_ = true, vsync_ = true, native_ = true, full_speed_ = true;
   bool high_priority_ = false;  // (process_priority 1: above normal, perf_hooks.cpp)
   int display_ = kWindowed;  // (DisplayMode)
@@ -427,13 +438,19 @@ void GraphicsPage::Load() {
   {
     const int32_t v = rex::cvar::Query<int32_t>("native_max_scale");
     const double res = rex::cvar::Query<double>("native_render_scale");
+    const int32_t height = rex::cvar::Query<int32_t>("native_scene_height");
     scale_ = 0;
-    if (res > 0.0 && res < 0.99) {  // (below 720p: the nearer of 360P / 480P)
+    if (height > 0) {  // (the nearest of 900P / 1080P)
+      for (int i = 0; i < kNumScales; ++i)
+        if (kScales[i].height > 0 &&
+            (kScales[scale_].height == 0 || std::abs(kScales[i].height - height) < std::abs(kScales[scale_].height - height)))
+          scale_ = i;
+    } else if (res > 0.0 && res < 0.99) {  // (below 720p: the nearer of 360P / 480P)
       for (int i = 0; i < kNumScales; ++i)
         if (kScales[i].res < 0.99 && std::abs(kScales[i].res - res) < std::abs(kScales[scale_].res - res)) scale_ = i;
     } else {
       for (int i = 0; i < kNumScales; ++i)
-        if (kScales[i].value == v && kScales[i].res >= 0.99) scale_ = i;
+        if (kScales[i].value == v && kScales[i].res >= 0.99 && kScales[i].height == 0) scale_ = i;
     }
   }
   {
@@ -452,6 +469,8 @@ void GraphicsPage::Load() {
   api_ = api_at_start_;
   native_ = true;  // (the game draws only natively)
   fps_ = FpsCounterVisible();
+  ping_ = rex::cvar::Query<bool>("show_ping");
+  router_port_ = rex::cvar::Query<bool>("p2p_port_mapping");
   touch_ = rex::cvar::Query<bool>("touch_controls");
   wide_ = rex::cvar::Query<bool>("native_widescreen");
   dof_ = rex::cvar::Query<bool>("depth_of_field");
@@ -494,6 +513,8 @@ void GraphicsPage::Change(int row, int dir) {
       rex::cvar::SetFlagByName("native_render_scale", res);
       SaveSetting("native_max_scale", std::to_string(kScales[scale_].value));
       SaveSetting("native_render_scale", res);
+      rex::cvar::SetFlagByName("native_scene_height", std::to_string(kScales[scale_].height));
+      SaveSetting("native_scene_height", std::to_string(kScales[scale_].height));
       break;
     }
     case kCrowd:  // (the arenas' crowd-less copies are chosen when the game starts: crowd_off.h)
@@ -584,6 +605,17 @@ void GraphicsPage::Change(int row, int dir) {
       rex::cvar::SetFlagByName("touch_controls", touch_ ? "true" : "false");
       SaveSetting("touch_controls", touch_ ? "true" : "false");
       break;
+    case kPing:
+      ping_ = !ping_;
+      rex::cvar::SetFlagByName("show_ping", ping_ ? "true" : "false");
+      SaveSetting("show_ping", ping_ ? "true" : "false");
+      break;
+    case kRouterPort:
+      router_port_ = !router_port_;
+      rex::cvar::SetFlagByName("p2p_port_mapping", router_port_ ? "true" : "false");
+      SaveSetting("p2p_port_mapping", router_port_ ? "true" : "false");
+      if (!router_port_) svr2011::StopPortMapping();  // (off: given back now; on: from the next start)
+      break;
     case kFpsCounter:
       fps_ = !fps_;
       SetFpsCounterVisible(fps_);
@@ -652,23 +684,35 @@ void GraphicsPage::ControlsInput(uint16_t pressed, uint16_t act, bool& back) {
   const bool add = (pressed & X_INPUT_GAMEPAD_Y) || key(ImGuiKey_Insert, false);
   const bool clear = (pressed & X_INPUT_GAMEPAD_X) || key(ImGuiKey_Delete, false);
   const bool reset = (pressed & X_INPUT_GAMEPAD_BACK) || key(ImGuiKey_R, false);
-  if (control_row_ == kNumBindings) {  // RESET TO DEFAULTS
+  if (control_row_ == kVibrationRow) {  // VIBRATION: A, left / right toggle it
+    const bool flip = change || (act & (X_INPUT_GAMEPAD_DPAD_LEFT | X_INPUT_GAMEPAD_DPAD_RIGHT)) ||
+                      key(ImGuiKey_LeftArrow, false) || key(ImGuiKey_RightArrow, false);
+    if (flip) {
+      const bool on = !rex::cvar::Query<bool>("vibration");
+      rex::cvar::SetFlagByName("vibration", on ? "true" : "false");
+      SaveSetting("vibration", on ? "true" : "false");
+      REXLOG_INFO("[svr2011] controls: vibration {}", on ? "on" : "off");
+    }
+    return;
+  }
+  if (control_row_ == kResetRow) {  // RESET TO DEFAULTS
     if (change) {
       for (int i = 0; i < kNumBindings; ++i) SetBinding(i, kBindings[i].keys);
     }
     return;
   }
+  const int binding = control_row_ - kFirstBinding;
   if (change || add) {
     // (from the next frame on: the key that started it is not the new key)
-    capture_ = control_row_;
+    capture_ = binding;
     capture_mod_ = -1;
     capture_add_ = add && !change;
     capture_until_ = Clock::now() + std::chrono::seconds(8);
     back = false;
   } else if (clear) {
-    SetBinding(control_row_, "");
+    SetBinding(binding, "");
   } else if (reset) {  // (this input's default keys; BACK doesn't close the page here)
-    SetBinding(control_row_, kBindings[control_row_].keys);
+    SetBinding(binding, kBindings[binding].keys);
     back = false;
   }
 }
@@ -945,17 +989,26 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
         dl->AddRectFilled(a, b, IM_COL32(34, 34, 40, 235), 3 * s);
       }
       const float ty = P(0, y + row_h * 0.5f).y - TextSize(g_menu_font, fs, "A").y * 0.5f;
-      if (i == kNumBindings) {
+      if (i == kResetRow) {
         const char* reset = "RESET TO DEFAULTS";
         const ImVec2 z = TextSize(g_menu_font, fs, reset);
         Text(dl, g_menu_font, fs, ImVec2(P(639, 0).x - z.x * 0.5f, ty), IM_COL32(255, 255, 255, 255), reset);
         continue;
       }
-      const Binding& bd = kBindings[i];
+      if (i == kVibrationRow) {
+        Text(dl, g_menu_font, fs, ImVec2(P(186, 0).x, ty), IM_COL32(255, 255, 255, 255), "VIBRATION");
+        Text(dl, g_menu_font, fs * 0.85f, ImVec2(P(470, 0).x, ty + fs * 0.08f), IM_COL32(180, 180, 188, 255),
+             "CONTROLLER RUMBLE");
+        const char* v = rex::cvar::Query<bool>("vibration") ? "ON" : "OFF";
+        const ImVec2 vs = TextSize(g_menu_font, fs, v);
+        Text(dl, g_menu_font, fs, ImVec2(P(1092, 0).x - vs.x, ty), IM_COL32(255, 255, 255, 255), v);
+        continue;
+      }
+      const Binding& bd = kBindings[i - kFirstBinding];
       Text(dl, g_menu_font, fs, ImVec2(P(186, 0).x, ty), IM_COL32(255, 255, 255, 255), bd.input);
       Text(dl, g_menu_font, fs * 0.85f, ImVec2(P(470, 0).x, ty + fs * 0.08f), IM_COL32(180, 180, 188, 255),
            bd.action);
-      const bool waiting = capture_ == i;
+      const bool waiting = capture_ == i - kFirstBinding;
       const std::string v = waiting ? (capture_add_ ? "PRESS A KEY TO ADD" : "PRESS A KEY")
                                     : ShowKeys(rex::cvar::Query<std::string>(bd.cvar));
       const ImVec2 vs = TextSize(g_menu_font, fs, v.c_str());
@@ -972,8 +1025,10 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
     }
     const char* help =
         capture_ >= 0 ? "Press the key (Shift / Ctrl / Alt + a key: a combination; tapped alone: that key). ESC: cancel."
-        : control_row_ == kNumBindings
+        : control_row_ == kResetRow
             ? "A: the default keys for every input."
+        : control_row_ == kVibrationRow
+            ? "A / LEFT / RIGHT: controller vibration on or off."
             : "A: change   Y: add a key   X: clear   BACK: reset   (keyboard: Enter, Insert, Delete, R)";
     const float hs = 18 * s;
     const ImVec2 sz = TextSize(g_menu_font, hs, help);
@@ -997,6 +1052,8 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
         return fps;
       }
       case kFpsCounter: return fps_ ? "ON" : "OFF";
+      case kPing: return ping_ ? "ON" : "OFF";
+      case kRouterPort: return router_port_ ? "ON" : "OFF";
       case kFullSpeed: return full_speed_ ? "ON" : "OFF (AS THE XBOX 360)";
       case kTouch: return touch_ ? "ON" : "OFF";
       case kWide: return wide_ ? "FULL WIDTH" : "16:9";
@@ -1029,6 +1086,8 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
       case kVsync: return "VSYNC";
       case kFrameRate: return "FRAME RATE";
       case kFpsCounter: return "FPS COUNTER";
+      case kPing: return "ONLINE PING";
+      case kRouterPort: return "ROUTER PORT (UPNP)";
       case kFullSpeed: return "FULL SPEED";
       case kTouch: return "TOUCH CONTROLS";
       case kWide: return "WIDE SCREENS";
@@ -1061,6 +1120,8 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
       case kVsync: return "Waits for the monitor's refresh: no tearing.";
       case kFrameRate: return "Frames a second in matches, at most (menus: 60). The game always runs at its normal speed.";
       case kFpsCounter: return "Shows the frame rate at the top of the screen (F2).";
+      case kRouterPort: return "Online: your router opens the game's port while you play (UPnP), so far-off players connect directly. OFF: never touched.";
+      case kPing: return "Online matches: the delay to the other players at the top right (bars: green under 150 ms, yellow under 250, red above).";
       case kFullSpeed:
         return full_speed_ ? "The game keeps its normal speed when the frame rate drops (and at 30 FPS)."
                            : "One game step a frame, as the Xbox 360: the game slows down below 60 FPS (30 FPS off).";
@@ -1082,7 +1143,7 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
       case kRenderer: return "The graphics API the game draws with. AUTO: Direct3D 12, else Vulkan, else Direct3D 11 (older GPUs).";
       case kRenderScale:
         return "The most the game renders at. AUTO fills the screen; lower is faster (360P / 480P: softer, for weak "
-               "devices).";
+               "devices; 1080P: sharp on a 1080p screen, lighter than AUTO's 1440P).";
       case kCrowd:
         return crowd_ == crowd_at_start_ ? "The people in the seats. OFF: empty seats - faster on weak PCs and phones."
                                          : "Takes effect the next time the game starts.";

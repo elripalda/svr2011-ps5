@@ -14,10 +14,24 @@ void mods_build(HWND wnd, mods_add_fn add, int tab, int id_base, HFONT title_fon
 void mods_show(const WCHAR *game_dir);
 /* WM_COMMAND / WM_NOTIFY: 1 when handled. */
 int mods_command(int id, int code);
+/* 1: handled; 2 / 3: the window answers TRUE / FALSE (renaming a background). */
 int mods_notify(const NMHDR *nm);
+/* A background's name (manifest.txt name=). 1 on success. */
+int mods_rename(const WCHAR *folder, const WCHAR *name);
+int mods_remove(const WCHAR *game, const WCHAR *folder);
+int mods_print_superstars(const WCHAR *game);
+/* Two switched-on attire mods on one superstar's attire: the newer moves to a free attire (its manifest
+   rewritten), or the player is told to switch one off. fresh: a mod just installed (the newer), or NULL.
+   -> lines said (report: the text). */
+int mods_attire_guard(const WCHAR *game, const WCHAR *fresh, WCHAR *report, size_t report_n);
+int mods_print_attires(const WCHAR *game);
 /* Installs a .svrmod into <game_dir>/Mods (the + button without its dialog;
    tests: --mods-add <file>). 1 on success; the tab's status says why not. */
 int mods_install(const WCHAR *game_dir, const WCHAR *zip);
+
+/* A main menu background made from a picture (backgrounds.h; tests:
+   --bg-add <game folder> <picture> [logo]). 1 on success; prints the folder. */
+int mods_add_background(const WCHAR *game_dir, const WCHAR *image, int logo);
 /* Installs the mods shipped with the port (<bundle_dir>\*.svrmod) that the
    game hasn't had yet, or whose shipped file changed. */
 void mods_install_bundled(const WCHAR *game_dir, const WCHAR *bundle_dir);

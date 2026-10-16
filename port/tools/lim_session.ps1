@@ -11,7 +11,8 @@
 #   .\session.ps1 status | stop
 # Input goes through the scripted controller (src/script_input.h).
 param([Parameter(Position = 0)][string]$Action, [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest,
-      [string]$Name = "session", [string]$Exe = "svr2011.exe", [string]$LogLevel = "info", [string]$GameDir = "")
+      [string]$Name = "session", [string]$Exe = "svr2011.exe", [string]$LogLevel = "info", [string]$GameDir = "",
+      [string]$Slot = "")
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -40,8 +41,8 @@ $Rest = @($Rest | Where-Object { $_ })
 $port  = Split-Path $PSScriptRoot -Parent
 $game  = if ($GameDir) { $GameDir } else { Join-Path $port "runs\lim_game" }
 $runs  = Join-Path $port "runs"; New-Item -ItemType Directory -Force $runs | Out-Null
-$state = Join-Path $runs "lim_session.json"
-$input = Join-Path $runs "lim_input.txt"
+$state = Join-Path $runs "lim_session$Slot.json"   # (-Slot 2: a second game beside the first)
+$input = Join-Path $runs "lim_input$Slot.txt"
 
 function Stop-Own {
     if (-not (Test-Path $state)) { return }
@@ -73,7 +74,7 @@ switch ($Action) {
         $env:SVR2011_NATIVE_WINDOW_POS = "-2600,0"   # native renderer window, off-screen too
         # dev: converted shaders (not for -GameDir: test the install as players get it)
         $env:SVR2011_NATIVE_SHADERS = Join-Path $runs "shaders_native\dxil"
-        $a = @("--log_file=`"$log`"", "--log_level=$LogLevel", "--audio_mute=true", "--fullscreen=false", "--monitor=2") + $Rest
+        $a = @("--log_file=`"$log`"", "--log_level=$LogLevel", "--audio_mute=true", "--fullscreen=false", "--monitor=2", "--mnk_mode=false", "--p2p_port_mapping=false") + $Rest
         $p = Start-Process (Join-Path $game $Exe) -WorkingDirectory $game -ArgumentList $a -PassThru -WindowStyle Minimized
         for ($t = 0; $t -lt 100 -and -not $p.HasExited; $t++) { $p.Refresh(); if ($p.MainWindowHandle -ne 0) { break }; Start-Sleep -Milliseconds 100 }
         if ($p.MainWindowHandle -ne 0) {

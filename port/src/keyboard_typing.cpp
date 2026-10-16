@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include <rex/ui/windowed_app_context.h>
 
 #include "generated/default/svr2011_init.h"
+#include "online_chat.h"
 #include "story_designer.h"
 
 namespace {
@@ -51,6 +53,7 @@ rex::ui::Window* g_window = nullptr;
 std::atomic<uint32_t> g_keyboard{0};  // the open keyboard object (sub_8274B0A8's r3)
 uint8_t* g_base = nullptr;
 bool g_text_input = false;  // UI thread: we turned the window's text input on
+std::atomic<bool> g_overlay_text{false};  // an overlay's text field wants typing (SetOverlayTyping)
 
 int64_t Now() { return Clock::now().time_since_epoch().count(); }
 
@@ -176,6 +179,15 @@ void Copy() {
 class TypingListener final : public rex::ui::WindowInputListener {
  public:
   void OnKeyDown(rex::ui::KeyEvent& e) override {
+    if (!KeyboardOpen() && g_overlay_text) {
+      // (an overlay's field: its characters come as text; the keys that type
+      // them don't also drive the keyboard's controller emulation)
+      SetTextInput(true);
+      const auto vk = uint16_t(e.virtual_key());
+      if (!e.is_ctrl_pressed() && !e.is_alt_pressed() && CharacterKey(e.virtual_key()) && vk != 0x0D && vk != 0x1B)
+        e.set_handled(true);
+      return;
+    }
     if (!KeyboardOpen()) {
       SetTextInput(false);
       // Ctrl+C / Ctrl+V on a Story Designer list (story_designer.h)
@@ -228,7 +240,14 @@ void ToggleSystemKeyboard() {
 }
 
 void UpdateSystemKeyboard() {
-  if (g_text_input && !KeyboardOpen()) SetTextInput(false);
+  if (g_text_input && !KeyboardOpen() && !g_overlay_text) SetTextInput(false);
+}
+
+void SetOverlayTyping(bool on) {
+  if (g_overlay_text.exchange(on) == on || !g_window) return;
+  g_window->app_context().CallInUIThread([on] {
+    if (!KeyboardOpen()) SetTextInput(on);  // (a phone shows its keyboard)
+  });
 }
 
 void InstallKeyboardTyping(rex::ui::Window* window) {
@@ -275,6 +294,28 @@ REX_HOOK_RAW(sub_8274B0A8) {  // a keyboard's key handling, each frame
   g_base = base;
   __imp__sub_8274B0A8(ctx, base);
   t_handling = prev;
+}
+
+// Test aid (SVR2011_TEST_LOBBY_LOG): a text field's limits as a character
+// goes in (sub_82730110(field, utf8, ...): its settings at +44 - +40 bytes,
+// +44 per line, +52 more lines allowed).
+REX_EXTERN(__imp__sub_82730110);
+REX_HOOK_RAW(sub_82730110) {
+  if (svr2011::OnlineChatBeforeInsert(ctx, base, ctx.r3.u32)) return;  // (online_chat.h: the lobby chat's field)
+  static const bool log = std::getenv("SVR2011_TEST_LOBBY_LOG") != nullptr;
+  static uint32_t logged = 0;
+  if (log && ctx.r3.u32 && ctx.r3.u32 != logged) {
+    logged = ctx.r3.u32;
+    auto rd = [base](uint32_t a) {
+      const uint8_t* p = base + a;
+      return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+    };
+    const uint32_t cfg = rd(ctx.r3.u32 + 44);
+    if (cfg >= 0x40000000 && cfg < 0xC0000000)
+      REXLOG_INFO("[svr2011] text field {:08X}: bytes {}, per line {}, lines {}", ctx.r3.u32, rd(cfg + 40), rd(cfg + 44),
+                  rd(cfg + 52));
+  }
+  __imp__sub_82730110(ctx, base);
 }
 
 REX_HOOK_RAW(sub_82905130) {

@@ -24,7 +24,9 @@
 // extra ones repeat the controller reading and leave the characters' job to
 // the frame's last update (below). Online lockstep: one update a frame.
 #include "frame_rate.h"
+#include "thread_cpu.h"
 #include "fast_start.h"
+#include "pad_icons.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -59,6 +61,7 @@
 #include "match_types.h"
 #include "native/native_renderer.h"
 #include "online_overlay.h"
+#include "online_rules.h"
 #include "players.h"
 #include "superstar_mods.h"
 
@@ -453,6 +456,7 @@ REX_HOOK_RAW(sub_8269D768) {
   __imp__sub_8269D768(ctx, base);
   TestMatchTime(base);
   svr2011::MatchTypesUpdate(ctx, base);  // (match_types.h: the lumberjacks, Slobber Knocker)
+  svr2011::HctpRoomUpdate(ctx, base);    // (match_types.h: an HCTP backstage room's gimmicks)
   svr2011::JukeboxUpdate(ctx, base);     // (jukebox.h: a song stopped, skipped or previewed)
   // An armed match start (ArmMatchStart): once the match's frame count has
   // gone up 30 updates running.
@@ -470,6 +474,7 @@ REX_HOOK_RAW(sub_8269D768) {
 REX_EXTERN(__imp__sub_8269C728);
 REX_HOOK_RAW(sub_8269C728) {
   g_logic_thread = std::this_thread::get_id();
+  svr2011::NoteThreadRole("logic");  // (thread_cpu.h)
   const auto saved = ctx;
   const uint32_t m = ctx.r3.u32;
   constexpr uint32_t kOwner = 0x82EC5F94;
@@ -665,6 +670,15 @@ REX_HOOK_RAW(sub_8216ED38) {
     return;
   }
   if (!old_way) g_job_owed = JobOwed::kNone;
+  svr2011::ThreeStagesCinematic();  // (the world held: a finisher's / signature's cinematic - match_types.h)
+  // Research aid: SVR2011_TEST_PAUSE_LOG=1 - when the world starts being
+  // held (a move's cinematic, a match's end), with the match frame.
+  if (static const bool pause_log = std::getenv("SVR2011_TEST_PAUSE_LOG") != nullptr; pause_log) {
+    static uint32_t last_frame = 0;
+    const uint32_t f = g_job_frame.load();
+    if (f > last_frame + 2) REXLOG_INFO("frame rate: test - the world is held from match frame {}", Rd32(base + kMatchFrames));
+    last_frame = f;
+  }
   __imp__sub_8216ED38(ctx, base);
 }
 
@@ -702,15 +716,93 @@ REX_HOOK_RAW(sub_82905058) {
     return;
   }
   __imp__sub_82905058(ctx, base);
-  if (user == 0 && out && ctx.r3.u32 == 0) svr2011::FastStartInput(base, out);  // (the start skips: fast_start.h)
+  if (user == 0 && out && ctx.r3.u32 == 0) {
+    svr2011::FastStartInput(base, out);  // (the start skips: fast_start.h)
+    // (the online overlay's BACK + RB never reaches the game: online_overlay.h)
+    const uint16_t b = svr2011::OnlineOverlayPad(uint16_t(base[out + 4] << 8 | base[out + 5]));
+    base[out + 4] = uint8_t(b >> 8), base[out + 5] = uint8_t(b);
+    svr2011::OnlineRulesPad(b);  // (LB / RB: the PORT RULES row - online_rules.h)
+  }
+  if (out && ctx.r3.u32 == 0) svr2011::PadIconsInput(user, base + out);  // (who pressed last: pad_icons.h)
   if (r && out) {
     r->valid = true;
     r->result = ctx.r3.u32;
     std::memcpy(r->state, base + out, sizeof(r->state));
-    if (user == 0 && ctx.r3.u32 == 0) svr2011::OnlineOverlayPad(uint16_t(base[out + 4] << 8 | base[out + 5]));  // (online_overlay.h)
-    svr2011::ArenaSelectPad(user, ctx.r3.u32 == 0 ? uint16_t(base[out + 4] << 8 | base[out + 5]) : 0);  // (arena_mods.h)
+    svr2011::ArenaSelectPad(user, ctx.r3.u32 == 0 ? uint16_t((base[out + 4] << 8 | base[out + 5]) & ~0xC00 |
+                                                             (base[out + 6] > 0x40 ? 0x400 : 0) |
+                                                             (base[out + 7] > 0x40 ? 0x800 : 0))
+                                                : 0);  // (arena_mods.h: LB/RB, LT/RT as 0x400/0x800)
     if (user == 0) svr2011::CheckModProfiles(base);  // (superstar_mods.h)
   }
+}
+
+// A CPU's controller word (the AI's virtual pad): sub_82811B98(Y) hands the
+// word at *(*(Y + 20) + 12) (high half the stick, low half the buttons) to
+// its controller (Y + 16, through sub_827F4238 -> sub_8221D480: +72 the
+// pressed edges = new & ~previous) and clears it, each update. With two
+// updates a frame the characters' job sees only the last one's state, so a
+// press the AI made in an extra update was an edge there and a held button
+// (or nothing) in the last: the CPU often didn't start a run - it walked, or
+// stood, where at 60 it ran (a player's report, 2.0.6, at 30 fps). Now, as
+// with the players' pads (the XamInputGetState repeat above): an extra update
+// gets the word the last update delivered again, and its own buttons wait
+// for the frame's last update, delivered with that one's.
+// (Test aids: SVR2011_TEST_CPU_PAD_OLD=1 the old way; SVR2011_TEST_CPU_PAD_LOG=1
+// counts the words with buttons in extra / last updates, every 10 s.)
+namespace {
+struct CpuPad {
+  uint32_t vpad = 0;       // (guest address of the word: one per CPU)
+  uint32_t frame = 0;      // (g_job_frame when last seen)
+  uint32_t last = 0;       // the word delivered in the last update of a frame
+  uint16_t buttons = 0;    // the extra updates' buttons, for the last update
+  uint16_t stick = 0;      // the extra updates' latest stick
+  bool has_stick = false;
+};
+CpuPad g_cpu_pads[12];
+}  // namespace
+REX_EXTERN(__imp__sub_82811B98);
+REX_HOOK_RAW(sub_82811B98) {
+  static const bool old_way = std::getenv("SVR2011_TEST_CPU_PAD_OLD") != nullptr;
+  static const bool log = std::getenv("SVR2011_TEST_CPU_PAD_LOG") != nullptr;
+  const uint32_t y = ctx.r3.u32, links = y ? Rd32(base + y + 20) : 0, vpad = links ? Rd32(base + links + 12) : 0;
+  if (old_way || !vpad || std::this_thread::get_id() != g_logic_thread.load()) {
+    __imp__sub_82811B98(ctx, base);
+    return;
+  }
+  const uint32_t frame = g_job_frame.load(), w = Rd32(base + vpad);
+  CpuPad* e = nullptr;
+  for (CpuPad& c : g_cpu_pads)
+    if (c.vpad == vpad) e = &c;
+  if (!e) {  // (a new one: the oldest's place)
+    e = &g_cpu_pads[0];
+    for (CpuPad& c : g_cpu_pads)
+      if (c.frame < e->frame) e = &c;
+    *e = CpuPad{vpad};
+  }
+  if (frame - e->frame > 2) e->last = 0, e->buttons = 0, e->has_stick = false;  // (not seen for a while: a new match)
+  e->frame = frame;
+  if (log && (w & 0xFFFF)) {
+    static uint32_t counts[2];
+    static int64_t at = 0;
+    ++counts[g_extra_update];
+    if (const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+        now - at > 10000) {
+      at = now;
+      REXLOG_INFO("frame rate: CPU pad words with buttons - {} in extra updates, {} in last updates", counts[1], counts[0]);
+    }
+  }
+  if (g_extra_update) {
+    e->buttons |= uint16_t(w);
+    if (w >> 16) e->stick = uint16_t(w >> 16), e->has_stick = true;
+    Wr32(base + vpad, e->last);  // (the controller sees last frame's word again: no new edge)
+  } else {
+    const uint32_t stick = (w >> 16) ? (w >> 16) : e->has_stick ? e->stick : 0;
+    const uint32_t word = stick << 16 | uint16_t(w | e->buttons);
+    Wr32(base + vpad, word);
+    e->last = word;
+    e->buttons = 0, e->has_stick = false;
+  }
+  __imp__sub_82811B98(ctx, base);
 }
 
 // -- Developer aids ----------------------------------------------------------

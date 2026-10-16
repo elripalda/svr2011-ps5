@@ -40,6 +40,8 @@
 #include "caw_logos.h"
 #include "paint_pages.h"
 #include "match_types.h"
+#include "online_rules.h"
+#include "port_map.h"
 #include "mystery_opponent.h"
 #include "arena_mods.h"
 #include "story_designer.h"
@@ -47,6 +49,7 @@
 #include "ring_rules.h"
 #include "superstar_mods.h"
 #include "crowd_signs.h"
+#include "hd_movies.h"
 #include "media_mods.h"
 #include "frame_rate.h"
 #include "perf_hooks.h"
@@ -59,6 +62,8 @@
 #include "music.h"
 #include "saves.h"
 #include "user_movies.h"
+#include "cae_mod_motions.h"
+#include "cam_mod_moves.h"
 #include "native/native_renderer.h"
 #include "frame_stats.h"
 #include "keyboard_typing.h"
@@ -75,15 +80,27 @@
 #include "entrance_media.h"
 #include "online_cas.h"
 #include "match_hud.h"
+#include "online_files.h"
 #include "online_overlay.h"
+#include "startup_pump.h"
 #include "leaderboards.h"
+#include "online_mods.h"
+#include "online_chat.h"
 #include "p2p.h"
+#include "universe_mods.h"
+#include "universe_welcome.h"
 #if defined(_WIN32)
 #include "xaudio2_audio.h"
 #endif
 
 // [ps5 port] The hub's menu music, 0..100 (its Settings page writes it).
 REXCVAR_DEFINE_INT32(hub_music_volume, 80, "Hub", "Menu music volume in the PS5 hub (0-100)");
+#ifndef SVR2011_D3D_TRACE
+namespace svr2011 {
+void InstallModelMem(rex::memory::Memory* memory);  // (model_mem.cpp: failed buffer allocations logged)
+}
+#endif
+
 REXCVAR_DEFINE_STRING(saves_folder, "", "Storage",
                       "Where the saves live: empty for the game folder's Saves, or a folder (absolute, or "
                       "relative to the game folder) - e.g. to keep two installs' saves apart or shared")
@@ -143,6 +160,51 @@ std::string Env(const char* name) {
   return result;
 }
 
+// A settings file's "basic strings" broken over lines joined again: a
+// `key = "...` line with no closing quote takes the next non-blank lines
+// (the blank ones between them dropped) until its quote closes.
+std::string JoinBrokenTomlStrings(const std::string& text) {
+  const auto open_string = [](const std::string& line) {
+    size_t p = line.find_first_not_of(" \t");
+    if (p == std::string::npos || line[p] == '#' || line[p] == '[') return false;
+    const size_t eq = line.find('=', p);
+    if (eq == std::string::npos) return false;
+    p = line.find_first_not_of(" \t", eq + 1);
+    if (p == std::string::npos || line[p] != '"' || line.compare(p, 3, "\"\"\"") == 0) return false;
+    for (++p; p < line.size(); ++p) {
+      if (line[p] == '\\') ++p;
+      else if (line[p] == '"') return false;
+    }
+    return true;
+  };
+  std::string out, pending;
+  bool joining = false;
+  for (size_t pos = 0; pos <= text.size();) {
+    size_t nl = text.find('\n', pos);
+    if (nl == std::string::npos) nl = text.size();
+    std::string line = text.substr(pos, nl - pos);
+    const bool cr = !line.empty() && line.back() == '\r';
+    if (cr) line.pop_back();
+    const bool last = nl == text.size();
+    pos = nl + 1;
+    if (joining) {
+      if (line.empty()) {
+        if (last) break;
+        continue;
+      }
+      pending += line;
+    } else {
+      pending = line;
+    }
+    joining = open_string(pending) && !last;
+    if (joining) continue;
+    out += pending;
+    if (!last) out += cr ? "\r\n" : "\n";
+  }
+  if (joining) out += pending;
+  return out;
+}
+
 // The runtime's user data (paths.user_data_root) and the saves folder.
 std::filesystem::path g_user_data;
 std::filesystem::path g_saves;
@@ -181,6 +243,8 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
   g_saves = (Env("SVR2011_USER_DATA").empty() ? exe_dir : g_user_data) / "Saves";
   paths.cache_root = exe_dir / "UserData" / "cache";
   svr2011::InstallCrashReporter(exe_dir / "UserData" / "crashes");
+  // Online: where the game files checked against the launcher's list are (online_files.h; the check starts with online).
+  svr2011::SetGameFilesPaths(paths.game_data_root, g_user_data);
 
   // Tests: SVR2011_CONFIG=<file> keeps settings changes away from the player's.
   if (std::string config = Env("SVR2011_CONFIG"); !config.empty()) {
@@ -216,6 +280,15 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
     std::ifstream in(paths.config_path);
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     in.close();
+    // A string broken over lines: launchers up to 2.1.2 wrote a value longer
+    // than 1023 bytes (MY MUSIC's song list) back in pieces, a blank line more
+    // at every save. The file no longer parsed - every setting ignored, no
+    // gpu_plugin: a black screen at start (a 2.1.2 report).
+    if (std::string fixed = JoinBrokenTomlStrings(text); fixed != text) {
+      REXLOG_WARN("settings: {} had a value broken over lines - joined again", paths.config_path.string());
+      text = std::move(fixed);
+      std::ofstream(paths.config_path, std::ios::binary | std::ios::trunc) << text;
+    }
     auto key_of = [](const std::string& line) {
       const size_t a = line.find_first_not_of(" \t");
       const size_t eq = line.find('=');
@@ -262,6 +335,12 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
 }
 
 void Svr2011App::OnPreSetup(rex::RuntimeConfig& config) {
+  // A settings file that couldn't be read (every setting ignored) still draws.
+  if (config.gpu_plugin.empty()) {
+    rex::cvar::SetFlagByName("gpu_plugin", "xenos");
+    config.gpu_plugin = "xenos";
+    REXLOG_WARN("settings: no gpu_plugin (could {} be read?) - using xenos", g_config_path.string());
+  }
 #if defined(__ANDROID__)
   // The phone draws natively on Vulkan only: a settings file with another
   // value ("any", seen in a player's report: "no backend for the emulator's
@@ -292,6 +371,7 @@ void Svr2011App::OnPreSetup(rex::RuntimeConfig& config) {
 #endif
   // Automated tests: the only controller is one driven by a command file.
   if (std::string file = Env("SVR2011_INPUT_FILE"); !file.empty()) {
+    svr2011::InstallScriptLogSink();  // (now: logging is up, no game thread yet)
     config.input_factory = [file](bool) -> std::unique_ptr<rex::system::IInputSystem> {
       auto input = std::make_unique<rex::input::InputSystem>(nullptr);
       input->AddDriver(std::make_unique<svr2011::ScriptInputDriver>(file));
@@ -410,15 +490,27 @@ void Svr2011App::OnPostLoadXexImage() {
 #endif
     REXLOG_INFO("==== SvR 2011 PC port {} (build {}) ====", SVR2011_PORT_VERSION, SVR2011_BUILD_COMMIT);
     REXLOG_INFO("game folder: {}", rex::filesystem::GetExecutableFolder().string());
+#if defined(_WIN32)
+    // (src/utf8.manifest: Windows before 10 version 1903 ignores the UTF-8
+    // code page, and a game folder with other letters than A-Z can't be
+    // opened everywhere - unread settings, a black screen at the start)
+    if (GetACP() != CP_UTF8) {
+      const std::u16string folder = rex::filesystem::GetExecutableFolder().u16string();
+      if (std::any_of(folder.begin(), folder.end(), [](char16_t c) { return c > 0x7F; }))
+        REXLOG_WARN("game folder: its name has letters other than A-Z, which this Windows (before 10 version "
+                    "1903) can't open everywhere - if the game starts to a black screen, move it to a folder "
+                    "with a plain name (such as C:\\Games\\SvR2011)");
+    }
+#endif
     static const char* const kGroups[][2] = {
         {"display", "fullscreen fullscreen_exclusive window_width window_height vsync show_fps"},
-        {"renderer", "native_renderer gpu_backend native_max_scale native_aa native_2x_msaa native_scale_effects "
+        {"renderer", "native_renderer gpu_backend native_max_scale native_render_scale native_scene_height native_aa native_2x_msaa native_scale_effects "
                      "native_texture_quality native_texture_packs native_dump_textures native_widescreen native_prepare_pipelines "
                      "frame_rate full_speed unlock_30fps "
                      "process_priority"},
         {"effects", "depth_of_field motion_blur soft_filter"},
         {"gameplay", "replays managers_tile mixed_gender_matches unlock_everything user_language"},
-        {"input", "input_backend mnk_mode touch_controls touch_auto_layout"},
+        {"input", "input_backend mnk_mode touch_controls touch_auto_layout vibration device_vibration"},
         {"audio", "audio_backend audio_mute"},
         {"online", "online_enabled online_server"},
         {"storage", "saves_folder"},
@@ -451,6 +543,21 @@ void Svr2011App::OnPostLoadXexImage() {
       *static_cast<volatile int*>(nullptr) = 1;
     }).detach();
   }
+#if defined(_WIN32)
+  // Test aid: SVR2011_TEST_LOAD_DLL=<dll> - loads it as an overlay (Discord, RTSS...) gets loaded into the game,
+  // and says whether its start-up (DllMain) worked: with 2.1.0's 14.29 VC++ DLLs next to the game, one built
+  // for the newer runtime failed there (0xc0000142 when it comes in at the process start).
+  if (auto dll = Env("SVR2011_TEST_LOAD_DLL"); !dll.empty()) {
+    HMODULE m = LoadLibraryA(dll.c_str());
+    DWORD e = m ? 0 : GetLastError();
+    char where[MAX_PATH] = "";
+    if (HMODULE rt = GetModuleHandleA("msvcp140.dll")) GetModuleFileNameA(rt, where, MAX_PATH);
+    if (m)
+      REXLOG_INFO("SVR2011_TEST_LOAD_DLL: {} loaded (msvcp140 from {})", dll, where);
+    else
+      REXLOG_WARN("SVR2011_TEST_LOAD_DLL: {} failed, error {} (msvcp140 from {})", dll, e, where);
+  }
+#endif
   // Entrances, finishers and other post-processed scenes sample the frame's
   // resolved colour texture through fetch constants whose type field is 0
   // ("invalid"); the Xbox 360 samples them as textures, the emulator's default
@@ -541,9 +648,16 @@ void Svr2011App::OnPostLoadXexImage() {
   {
     std::filesystem::path movies = rex::filesystem::GetExecutableFolder() / "Custom Movies";
     if (std::string dir = Env("SVR2011_MOVIES"); !dir.empty()) movies = dir;
+    svr2011::InstallCaeModMotions(runtime()->memory());  // (CREATE AN ENTRANCE's MODS rows)
+    svr2011::InstallCamModMoves(runtime()->memory());    // (CREATE A MOVE-SET's MOD rows)
     std::error_code ec;
     std::filesystem::create_directories(movies, ec);
-    svr2011::CopySuperstarMovies(movies);  // (arenas branch: superstar_mods.h)
+    // (HD movies' stubs, hd_movies.h: the folder made before the mount - the
+    // device knows the folders it found then)
+    std::filesystem::create_directories(movies / ".hd", ec);
+    svr2011::CopySuperstarMovies(movies);  // (and the HD movies' stubs)
+    if (std::string t = Env("SVR2011_TEST_MOVIE"); t.size() > 4 && t.substr(t.size() - 4) == ".mp4")
+      svr2011::PrepareHdMovie(movies, "hdtest.bik", t);  // (tests: user_movies.cpp)  // (arenas branch: superstar_mods.h)
     svr2011::CopyMediaMovies(movies);      // (arenas branch: media_mods.h)
     auto device = std::make_unique<rex::filesystem::HostPathDevice>("\\USERMOVIES", movies, true);
     auto* fs = runtime()->file_system();
@@ -556,6 +670,10 @@ void Svr2011App::OnPostLoadXexImage() {
   }
 
   REXLOG_INFO("platform: {}", svr2011::PlatformDescription());
+
+  // The mods below can take a while on a cold hard drive: the window keeps
+  // answering Windows meanwhile (startup_pump.h).
+  svr2011::StartupThread() = std::this_thread::get_id();
 
   // MY WWE -> OPTIONS -> GRAPHICS (menu_hooks.cpp, graphics_page.h).
   svr2011::InstallMenuHooks(runtime()->memory());
@@ -570,15 +688,32 @@ void Svr2011App::OnPostLoadXexImage() {
   // More exhibition match types (match_types.h).
   svr2011::InstallMatchTypes(runtime()->memory());
   // Arena mods: custom arenas in place of a host arena (arena_mods.h).
-  svr2011::InstallMovePacks(runtime()->file_system());  // (arenas branch: before the game mounts its pacs)
+  svr2011::KeepWindowAlive();
+  {
+    // (the installed DLC packages - dlc.cpp - whose own m / mpsp pacs get copies with the packs in the overlay)
+    char title[16];
+    std::snprintf(title, sizeof(title), "%08X", runtime()->kernel_state()->title_id());
+    svr2011::InstallMovePacks(runtime()->file_system(),  // (arenas branch: before the game mounts its pacs)
+                              g_user_data / "0000000000000000" / title / "00000002");
+  }
+  svr2011::KeepWindowAlive();
   svr2011::InstallArenaMods(runtime()->memory(), runtime()->file_system());
+  svr2011::KeepWindowAlive();
   // Ring Kit: rope heights and rules from a custom arena's manifest (ring_rules.h).
   svr2011::InstallRingRules(runtime()->memory());
   svr2011::InstallJukebox(runtime()->memory());  // MY WWE -> JUKEBOX (jukebox.h)
   // Superstar mods: new characters in the free DLC slots (superstar_mods.h).
   svr2011::InstallMediaMods(runtime()->memory());  // (arenas branch: before the superstar mods mount its pac)
+  svr2011::KeepWindowAlive();
+#ifndef SVR2011_D3D_TRACE
+  svr2011::InstallModelMem(runtime()->memory());  // (model_mem.cpp)
+#endif
   svr2011::InstallSuperstarMods(runtime()->memory(), runtime()->file_system());
+  svr2011::InstallUniverseWelcome(g_saves, g_user_data);  // (the Universe welcome kept as seen once accepted)
+  svr2011::InstallUniverseMods(runtime()->memory(), g_saves);  // (the mods' WWE Universe side table: after the mods)
+  svr2011::KeepWindowAlive();
   svr2011::InstallCrowdSigns(runtime()->memory());  // (after the superstar mods: their signs)
+  svr2011::KeepWindowAlive();
   // The frame rate: 30 / 60 / 120 / 144 / 240 at the game's speed (frame_rate.h).
   svr2011::InstallFrameRate(runtime()->memory());
   svr2011::InstallPerfSettings();  // (perf_hooks.h)
@@ -596,6 +731,8 @@ void Svr2011App::OnPostLoadXexImage() {
     svr2011::InstallTouchControls(imgui_drawer(), window(), g_user_data);
     svr2011::InstallPaintPagesOverlay(imgui_drawer());
     svr2011::InstallSlobberKnockerOverlay(imgui_drawer());  // (match_types.h)
+    svr2011::InstallGauntletEliminatorOverlay(imgui_drawer());
+    svr2011::InstallOnlineRulesOverlay(imgui_drawer());  // (online_rules.h)
     svr2011::InstallThreeStagesOverlay(imgui_drawer());
     svr2011::InstallMysteryOpponentOverlay(imgui_drawer());  // (the hidden opponent's "?")
     // The ONLINE overlay: friends, invites (online_overlay.h).
@@ -617,6 +754,8 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::InstallOnlineCas(g_saves);
   // ... and the online leaderboards (leaderboards.h)
   svr2011::InstallLeaderboards(runtime()->memory(), runtime()->kernel_state());
+  svr2011::InstallOnlineMods(runtime()->memory());  // (superstar / arena mods in online lobbies)
+  svr2011::InstallOnlineChat();  // (lobby chat longer than the game's)
 
   // Developer aid: SVR2011_DUMP_IMAGE=<file> writes the loaded (decrypted,
   // decompressed) executable image for analysis tools (port/tools/).
@@ -625,4 +764,11 @@ void Svr2011App::OnPostLoadXexImage() {
     std::ofstream(dump, std::ios::binary)
         .write(reinterpret_cast<const char*>(image), REX_IMAGE_SIZE);
   }
+}
+
+// The window closing (the app hard-exits after: no atexit) - the router's
+// port mapping removed first.
+bool Svr2011App::OnWindowCloseRequested() {
+  svr2011::StopPortMapping();
+  return true;
 }

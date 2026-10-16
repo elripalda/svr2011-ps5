@@ -30,6 +30,14 @@ MATCH_TYPES = [
      "ONE ON ONE -> EXTREME RULES: a normal fall, then Falls Count Anywhere, then Last Man Standing."),
     ("elimination", "Elimination", "TRIPLE THREAT and FATAL-4-WAY: a pin or give up eliminates; the last one left wins."),
     ("mystery_opponent", "Mystery Opponent", "ONE ON ONE -> NORMAL MATCH: the CPU picks your opponent in secret."),
+    ("hiac_tables_ladders", "Hell in a Cell: Tables & Ladders", "HELL IN A CELL: tables, ladders and chairs lying inside the cell."),
+    ("hiac_roof_start", "Hell in a Cell: Start on the Roof", "HELL IN A CELL: the match starts on top of the cell."),
+    ("three_stages_tables_ladders", "Three Stages of Hell: Tables & Ladders",
+     "THREE STAGES OF HELL (one on one, two on two, triple threat, fatal-4-way): TABLE / LADDER / TABLE and TABLE / TLC / LADDER, in the TLC match."),
+    ("gauntlet_eliminator", "Gauntlet Eliminator", "HANDICAP: six superstars, two start, one more each minute; a pin or submission eliminates."),
+    ("cage_weapons", "Steel Cage: Weapons Inside", "STEEL CAGE: chairs and other weapons lying in the ring."),
+    ("inferno_weapons", "Inferno: Weapons Inside", "INFERNO MATCH: chairs and other weapons lying in the ring."),
+    ("online_first_blood", "Online First Blood", "ONLINE Player Match: FIRST BLOOD under EXTREME RULES MATCHES (one on one, 3-man)."),
 ]
 
 

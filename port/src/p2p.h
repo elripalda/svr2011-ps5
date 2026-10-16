@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace rex::memory {
 class Memory;
@@ -49,5 +50,45 @@ bool P2PReachHost(const uint8_t* info);
 // An invite accepted: for 15 minutes the game's session searches list that
 // session first, with its private slots open to this game.
 void P2PExpectInvite(const uint8_t* info);
+// Why the last session search (or invite) left hosts out - another version or
+// other gameplay mods (online_files.h) - and how many sessions ("" when none,
+// or over 2 minutes ago): for the game's own "no sessions" / join messages.
+std::string P2PHiddenReason(int* sessions = nullptr);
+// A port session property (an int32: XUSER_PROPERTY type 1, e.g. 0x1000F001
+// the port's match mode): the host sets it before the game creates its
+// session (it goes into every session it hosts from then on, as
+// XUserSetProperty's); the match session this game hosts or joined has it
+// (nullopt: none).
+void P2PSetHostProperty(uint32_t id, uint32_t value);
+std::optional<uint32_t> P2PSessionProperty(uint32_t id);
+// The port's match rules for online Player Matches (match_types.cpp: mode
+// << 16 | set): the host sets them before CREATE SESSION (0: none); the
+// current match session's (hosted or joined) - nullopt: none. Ranked
+// sessions never carry them.
+void SetPortRules(uint32_t value);
+std::optional<uint32_t> PortRules();
+// The match kind the game set for its online sessions (XUserSetContext
+// X_CONTEXT_GAME_TYPE, set as the player enters RANKED MATCH / PLAYER MATCH,
+// before CREATE SESSION): true Ranked, false Player Match; nullopt: not set yet.
+std::optional<bool> P2PRanked();
+
+// The match session this game is in (hosted, or else joined): its id and
+// members (online ids, this game's too); in = false when there's none.
+struct P2PLobby {
+  bool in = false, host = false;
+  uint64_t session = 0;
+  std::vector<uint64_t> members;
+};
+P2PLobby P2PMatchLobby();
+// The lobby's superstar mods (online_mods.cpp): a message to every peer this
+// game knows, and the handler of those that come (on the network thread).
+using P2PModHandler = void (*)(const uint8_t* data, size_t size);
+void SetP2PModHandler(P2PModHandler handler);
+void P2PSendMods(const std::vector<uint8_t>& payload);
+// Lobby chat longer than the game's 64 bytes (online_chat.cpp): the same, a
+// message kind of its own.
+using P2PChatHandler = void (*)(const uint8_t* data, size_t size);
+void SetP2PChatHandler(P2PChatHandler handler);
+void P2PSendChat(const std::vector<uint8_t>& payload);
 
 }  // namespace svr2011

@@ -7,15 +7,111 @@ import android.os.Bundle;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.util.Log;
+import android.view.InputDevice;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 
 import org.libsdl.app.SDLActivity;
+import org.libsdl.app.SDLControllerManager;
 
 public class GameActivity extends SDLActivity {
     // While the game runs (the launcher's Saves / Paint Tool tabs wait: it keeps its saves open).
     static volatile boolean running;
 
+    // A controller's sticks, whichever view has the focus. SDL reads them only
+    // in its game view's motion listener, and only for events whose source is
+    // exactly SOURCE_JOYSTICK. When the phone keyboard's hidden text field has
+    // the focus (the game's keyboard, the online overlay, a phone keyboard
+    // tap), or a source carries more bits, the motion goes unhandled, and
+    // Android turns an unhandled stick into D-pad key presses (ViewRootImpl's
+    // synthetic joystick keys) that SDL takes as the controller's D-pad: the
+    // left stick "becomes the D-pad" until the focus comes back
+    // (bug 2.1.1: Galaxy S26 Ultra, Xbox Series X / PS5 controllers).
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        if ((event.getSource() & InputDevice.SOURCE_CLASS_JOYSTICK) != 0 &&
+            event.getActionMasked() == MotionEvent.ACTION_MOVE) {
+            try {
+                SDLControllerManager.handleJoystickMotionEvent(event);
+                return true;  // (handled: no synthetic D-pad keys from it)
+            } catch (RuntimeException e) {  // (SDL not set up: its libraries didn't load)
+                Log.w("SvR2011", "joystick motion: " + e);
+            }
+        }
+        return super.dispatchGenericMotionEvent(event);
+    }
+
+    // Belt and braces: D-pad keys Android made up from a stick (FLAG_FALLBACK,
+    // from a joystick-class device) never reach the game - neither as the
+    // controller's D-pad nor, while the controller is between a removal and
+    // its re-add, as the arrow keys of the keyboard binds.
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if ((event.getFlags() & KeyEvent.FLAG_FALLBACK) != 0 && IsDpad(event.getKeyCode()) &&
+            FromJoystick(event)) {
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    private static boolean IsDpad(int key) {
+        return key == KeyEvent.KEYCODE_DPAD_UP || key == KeyEvent.KEYCODE_DPAD_DOWN ||
+               key == KeyEvent.KEYCODE_DPAD_LEFT || key == KeyEvent.KEYCODE_DPAD_RIGHT ||
+               key == KeyEvent.KEYCODE_DPAD_UP_LEFT || key == KeyEvent.KEYCODE_DPAD_UP_RIGHT ||
+               key == KeyEvent.KEYCODE_DPAD_DOWN_LEFT || key == KeyEvent.KEYCODE_DPAD_DOWN_RIGHT;
+    }
+
+    private static boolean FromJoystick(KeyEvent event) {
+        if ((event.getSource() & InputDevice.SOURCE_CLASS_JOYSTICK) != 0) return true;
+        InputDevice device = InputDevice.getDevice(event.getDeviceId());
+        return device != null && (device.getSources() & InputDevice.SOURCE_CLASS_JOYSTICK) != 0;
+    }
+
+    // The device's own vibrator for player 1's rumble when the controller can't rumble (pad_types.cpp:
+    // a handheld's built-in pad - AYN Thor / Odin, Retroid ... - has no vibrator on its InputDevice; its
+    // motor is the device's). low / high: the game's two motor speeds, 0-65535; 0 and 0 stop it. An Xbox
+    // 360 rumble holds until the game changes it: a long one-shot, cancelled or replaced on the next call.
+    private int rumbleAmplitude;
+
+    public synchronized void deviceRumble(int low, int high) {
+        int amplitude = Math.round((low * 0.6f + high * 0.4f) / 65535f * 255f);
+        amplitude = Math.max(0, Math.min(255, amplitude));
+        if (amplitude == rumbleAmplitude) return;
+        rumbleAmplitude = amplitude;
+        try {
+            android.os.Vibrator vibrator = DeviceVibrator();
+            if (vibrator == null || !vibrator.hasVibrator()) return;
+            if (amplitude == 0) {
+                vibrator.cancel();
+            } else if (android.os.Build.VERSION.SDK_INT >= 26) {
+                vibrator.vibrate(android.os.VibrationEffect.createOneShot(60000,
+                    vibrator.hasAmplitudeControl() ? amplitude : android.os.VibrationEffect.DEFAULT_AMPLITUDE));
+            } else {
+                vibrator.vibrate(60000);
+            }
+        } catch (Exception e) {
+            Log.w("SvR2011", "rumble: device vibrator failed", e);
+        }
+    }
+
+    private android.os.Vibrator DeviceVibrator() {
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            android.os.VibratorManager manager =
+                (android.os.VibratorManager) getSystemService(android.content.Context.VIBRATOR_MANAGER_SERVICE);
+            if (manager != null) return manager.getDefaultVibrator();
+        }
+        return (android.os.Vibrator) getSystemService(android.content.Context.VIBRATOR_SERVICE);
+    }
+
+    @Override
+    protected void onPause() {
+        deviceRumble(0, 0);  // (no rumble left running behind another app)
+        super.onPause();
+    }
+
     @Override
     protected void onDestroy() {
+        deviceRumble(0, 0);
         running = false;
         super.onDestroy();
     }

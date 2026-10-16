@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -32,6 +33,9 @@ constexpr uint32_t kMaxPlayers = 4;
 
 // Player user_index's controller (kNone: no device).
 PadType PlayerPadType(uint32_t user_index);
+// Test aid (script input "padtype <player 1..8> <xbox|ps|kb|none>"): a
+// player's controller type from now on.
+void SetTestPadType(uint32_t player, const std::string& type);
 // The types the connected players use (bit 1 << PadType).
 uint32_t PadTypesInUse();
 // Bumped each time the players' devices change.
@@ -53,6 +57,9 @@ class PlayerSlots final : public rex::input::DeviceAssignment {
 // pad_types.cpp. Test aid: SVR2011_TEST_SCRIPT_PLAYER=<n> - the scripted
 // controller is player n (a second pad pressing START, without one).
 void MakeLeadPlayer(uint32_t user_index);
+// START taken at the press-START screen: player 1's device stays player 1 when controllers connect later
+// (they get the next players).
+void LockLeadPlayer();
 
 // The PlayStation (non-XInput) controllers through SDL, next to XInput.
 std::unique_ptr<rex::input::InputDriver> CreatePlayStationDriver();

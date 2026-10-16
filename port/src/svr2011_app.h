@@ -29,4 +29,5 @@ class Svr2011App : public rex::ReXApp {
   std::optional<rex::PathConfig> OnFinalizePaths(const rex::PathConfig& defaults,
                                                  std::function<void(rex::PathConfig)> resume) override;
 #endif
+  bool OnWindowCloseRequested() override;  // (the router's port mapping removed: port_map.h)
 };

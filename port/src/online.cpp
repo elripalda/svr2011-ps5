@@ -14,6 +14,7 @@
 #include <optional>
 #include <random>
 #include <sstream>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,7 +30,11 @@
 
 #include "caw_logos.h"
 #include "entrance_media.h"
+#include "online_files.h"
 #include "online_net.h"
+#include "online_overlay.h"
+#include "online_chat.h"
+#include "p2p.h"
 #include "paint_pages.h"
 
 namespace svr2011 {
@@ -145,6 +150,33 @@ void PrepareOnlineSettings(const std::filesystem::path& config, const std::files
 
 namespace {
 uint32_t g_empty_string = 0;  // guest "" (removed labels)
+// guest: why online is off (online_files.h: modified game files, an older
+// version, still checking) - filled when the game asks for the text
+constexpr uint32_t kOffTextSize = 256;
+uint32_t g_online_off_text = 0;
+rex::memory::Memory* g_online_memory = nullptr;
+// guest: the game's "no game sessions" / join failure message with why hosts
+// were left out (p2p.h P2PHiddenReason: another version or other mods)
+uint32_t g_hidden_text = 0;
+// guest: the CPU slots' help bar labels (online_cpu.cpp)
+constexpr uint32_t kAddCpuId = 0xEF10, kRemoveCpuId = 0xEF11, kWaitingId = 0xEF12;  // (16-bit: the bar holds u16 ids; blank in the game's table)
+constexpr uint32_t kPlayerInfoId = 0xB0A7;  // PLAYER INFO: the lobby's own Y label - its slot's icon is Y's glyph
+constexpr uint32_t kYIconGuess = 0xAFCA;    // (before one was seen; 0xAFCB is X's)
+uint32_t g_cpu_labels[3] = {};
+uint32_t g_scratch = 0;  // (OnlineScratch)
+// (string ids: from SVR2011_DUMP_STRINGS)
+constexpr uint32_t kNoSessionsId = 0xC6D4;  // "No game sessions were found. Search again?"
+constexpr uint32_t kJoinFailedId = 0xC67F;  // "Failed to find a session. Please try again." (an invite)
+
+// Text into a guest buffer (kOffTextSize).
+uint32_t GuestText(uint32_t buffer, const std::string& text) {
+  if (!buffer || !g_online_memory) return 0;
+  char* out = g_online_memory->TranslateVirtual<char*>(buffer);
+  const size_t n = std::min<size_t>(text.size(), kOffTextSize - 1);
+  std::memcpy(out, text.data(), n);
+  out[n] = 0;
+  return buffer;
+}
 
 // -- The Superstars' extra logos (Saves\.logos) and the server ----------------
 
@@ -323,6 +355,7 @@ bool OnPaintDownload(uint8_t* base, uint32_t screen, int page) {
 }  // namespace
 
 uint32_t OnlineString(uint32_t id) {
+  OnlineNoteString(id);  // (online_overlay.h: where the menus' cursors are)
   switch (id) {
     case 0x5339:  // VIEW GAMER CARD (button help)
     case 0xB09B:
@@ -331,16 +364,51 @@ uint32_t OnlineString(uint32_t id) {
     case 0xB0B2:  // Invite Xbox LIVE Party
     case 0xB15D:  // Invite Xbox LIVE Party Member
       return g_empty_string;
+    // The trial period messages: what entering ONLINE shows while it is off
+    // for the game files (the Online Axxess gate below) - why, instead.
+    case 50866:
+    case 50867: {
+      const std::string why = GameFilesOnlineMessage();
+      return why.empty() ? 0 : GuestText(g_online_off_text, why);
+    }
     default:
-      return 0;
+      break;
   }
+  if (id >= kAddCpuId && id <= kWaitingId && g_cpu_labels[id - kAddCpuId]) return g_cpu_labels[id - kAddCpuId];
+  // The search found only hosts this game can't play (another version or
+  // other gameplay mods): the game's own message says so.
+  if (id && (id == kNoSessionsId || id == kJoinFailedId)) {
+    int sessions = 0;
+    const std::string why = P2PHiddenReason(&sessions);
+    if (why.empty()) return 0;
+    // (the game's own wording - its C67E / C67C messages - then the details)
+    const bool mods = why.rfind("Your mods", 0) == 0;
+    const std::string head = mods ? "Unable to join the session due to a difference in downloadable content."
+                                  : "Unable to join the session due to a difference in game versions.";
+    if (id == kNoSessionsId)
+      return GuestText(g_hidden_text, std::string(sessions == 1 ? "A game session was found. " : "Game sessions were found. ") +
+                                          head + "\n" + why + "\nSearch again?");
+    return GuestText(g_hidden_text, head + "\n" + why);
+  }
+  return 0;
 }
 
 void InstallOnline(rex::memory::Memory* memory, const std::filesystem::path& saves) {
   g_empty_string = memory->SystemHeapAlloc(4);
   if (g_empty_string) std::memset(memory->TranslateVirtual<char*>(g_empty_string), 0, 4);
+  g_online_memory = memory;
+  g_online_off_text = memory->SystemHeapAlloc(kOffTextSize);
+  g_hidden_text = memory->SystemHeapAlloc(kOffTextSize);
+  g_scratch = memory->SystemHeapAlloc(4096);
+  {
+    static const char* const kLabels[3] = {"ADD CPU", "REMOVE CPU", "WAITING FOR ONE MORE PLAYER"};
+    for (int i = 0; i < 3; ++i)
+      if ((g_cpu_labels[i] = memory->SystemHeapAlloc(32)) != 0)
+        std::strncpy(memory->TranslateVirtual<char*>(g_cpu_labels[i]), kLabels[i], 31);
+  }
   if (!rex::cvar::Query<bool>("online_enabled")) return;
   g_saves = saves;
+  svr2011::StartGameFilesCheck();  // (online_files.h: the game files and the newest version)
   net::StartRelay();
   SetMissingLogoHandler(OnMissingLogo);
   SetPaintDownloadCheck(OnPaintDownload);
@@ -363,6 +431,50 @@ REX_HOOK_RAW(sub_828D1648) {
   const uint32_t data = ctx.r3.u32;
   ctx.r3.u64 = base[data + 13] == 0 ? 1 : 0;
 }
+
+// Community Creations' Created Superstar upload list: sub_8257BCD0(profile, r4) - the save's CAW record
+// (sub_8257A450: save + 0x13F9C + k * 0x6BC) - is true for one that can be uploaded. It isn't when any of: the
+// record's +1677 (an online-only CAW), +1716..1719 / +1720..1723 (per-attire marks), the CAW's roster entry (36
+// bytes, runtime table at 0x82EBE9FC by the id at +32) +17 or +32, a DLC part (sub_8257ABB8 / sub_8257BAC0 - the
+// game's own rule: "purchased content cannot be uploaded"). A player report (2.1.2: "it says I don't have any I can
+// upload, and I made it on this version") is read through this: each CAW the list leaves out is logged once a run
+// with the reason, so the next report says which.
+REX_EXTERN(__imp__sub_8257BCD0);
+REX_EXTERN(__imp__sub_8257ABB8);
+REX_HOOK_RAW(sub_8257BCD0) {
+  const uint32_t profile = ctx.r3.u32;
+  const auto saved = ctx;
+  __imp__sub_8257BCD0(ctx, base);
+  if (ctx.r3.u32 || !profile) return;
+  static std::set<uint32_t> said;
+  const uint8_t* p = base + profile;
+  const int16_t id = int16_t(uint16_t(p[32]) << 8 | p[33]);
+  if (!said.insert(uint32_t(uint16_t(id))).second) return;
+  std::string why;
+  auto add = [&](const std::string& s) { why += (why.empty() ? "" : ", ") + s; };
+  if (p[1677]) add("online-only CAW (+1677 = " + std::to_string(p[1677]) + ")");
+  for (int a = 0; a < 4; ++a)
+    if (p[1716 + a]) add("attire " + std::to_string(a + 1) + " mark +1716 = " + std::to_string(p[1716 + a]));
+  for (int a = 0; a < 4; ++a)
+    if (p[1720 + a]) add("attire " + std::to_string(a + 1) + " mark +1720 = " + std::to_string(p[1720 + a]));
+  if (id >= 0 && id < 322) {
+    const uint8_t* rec = base + 0x82EBE9FCu + uint32_t(id) * 36;
+    if (rec[17]) add("downloaded (+17 = " + std::to_string(rec[17]) + ")");
+    if (rec[32]) add("roster +32 = " + std::to_string(rec[32]));
+    auto c = saved;
+    c.r3.u64 = 0x82EBE9FCu + uint32_t(id) * 36, c.r4.u64 = uint64_t(id);  // (sub_8257ABB8(rec, id): a DLC part)
+    __imp__sub_8257ABB8(c, base);
+    if (c.r3.u32) add("a DLC part (purchased content)");
+  }
+  char name[64] = {};
+  for (int i = 0; i < 31; ++i) {  // (its name: UTF-16BE at the record's start)
+    const char ch = char(p[2 * i + 1]);
+    if (!ch || p[2 * i]) break;
+    name[i] = ch;
+  }
+  REXLOG_INFO("online: CAW id {} \"{}\" left out of the upload list: {}", id, name, why.empty() ? "a DLC part or a part the game marks" : why);
+}
+
 
 // Community Creations upload of a story: the game's check (sub_82629160,
 // asked only by the upload confirm sub_82511C18) says "This Created Content
@@ -422,6 +534,17 @@ REX_HOOK_RAW(sub_829F5608) {
 REX_EXTERN(__imp__sub_82746358);
 REX_HOOK_RAW(sub_82746358) {
   const uint32_t out = ctx.r5.u32;
+  // (the Player Match lobby's CPU slots put the Y label's state in the id's
+  // high half - online_cpu.cpp's sub_824E3E60 hook: 1 + y + 3 * waiting)
+  const uint32_t cpu = ctx.r4.u32 >> 16;
+  ctx.r4.u64 = ctx.r4.u32 & 0xFFFF;
+  {
+    static const bool log = std::getenv("SVR2011_TEST_LOBBY_LOG") != nullptr;
+    static uint32_t last = 0xFFFFFFFF;
+    if (log && ctx.r4.u32 != last) REXLOG_INFO("online: help bar {} (lr {:08X})", ctx.r4.u32, uint32_t(ctx.lr));
+    last = ctx.r4.u32;
+    svr2011::OnlineNoteHelpBar(ctx.r4.u32);
+  }
   __imp__sub_82746358(ctx, base);
   // (the bar ends at its first empty slot: the ones after a removed one
   // move up)
@@ -430,13 +553,47 @@ REX_HOOK_RAW(sub_82746358) {
   for (uint32_t slot = 0; slot < 3; ++slot) {
     const uint8_t* p = slots + slot * 4;
     const uint32_t icon = (uint32_t(p[0]) << 8) | p[1], label = (uint32_t(p[2]) << 8) | p[3];
-    if ((icon != 0xFFFF && svr2011::OnlineString(icon)) || (label != 0xFFFF && svr2011::OnlineString(label))) {
+    if ((icon == 0xFFFF && label == 0xFFFF) ||  // (an empty slot: room for the CPU label)
+        (icon != 0xFFFF && svr2011::OnlineString(icon)) || (label != 0xFFFF && svr2011::OnlineString(label))) {
       continue;
     }
     if (kept != slot) std::memmove(slots + kept * 4, p, 4);
     ++kept;
   }
-  for (; kept < 3; ++kept) std::memset(slots + kept * 4, 0xFF, 4);
+  for (uint32_t k = kept; k < 3; ++k) std::memset(slots + k * 4, 0xFF, 4);
+  // The Player Match lobby's CPU slots (online_cpu.cpp): Y ADD CPU / REMOVE
+  // CPU for the cursor's slot, and the host alone with CPUs is told why the
+  // match doesn't start.
+  const int y = cpu ? int((cpu - 1) % 3) : 0;
+  const bool waiting = cpu && (cpu - 1) / 3 != 0;
+  auto put = [&](uint32_t icon, uint32_t label) {
+    for (uint32_t k = 0; k < kept; ++k)
+      if (((uint32_t(slots[k * 4]) << 8) | slots[k * 4 + 1]) == icon && icon != 0xFFFF) {
+        slots[k * 4 + 2] = uint8_t(label >> 8), slots[k * 4 + 3] = uint8_t(label);
+        return;
+      }
+    if (kept < 3) {
+      uint8_t* p = slots + kept * 4;
+      p[0] = uint8_t(icon >> 8), p[1] = uint8_t(icon), p[2] = uint8_t(label >> 8), p[3] = uint8_t(label);
+      ++kept;
+    }
+  };
+  // (Y's glyph id: taken from the game's own Y slot - PLAYER INFO - when a bar has it)
+  static uint32_t y_icon = svr2011::kYIconGuess;
+  for (uint32_t k = 0; k < kept; ++k)
+    if (((uint32_t(slots[k * 4 + 2]) << 8) | slots[k * 4 + 3]) == svr2011::kPlayerInfoId)
+      y_icon = (uint32_t(slots[k * 4]) << 8) | slots[k * 4 + 1];
+  if (y) put(y_icon, y == 1 ? svr2011::kAddCpuId : svr2011::kRemoveCpuId);
+  if (waiting) put(0xFFFF, svr2011::kWaitingId);
+  static const bool log = std::getenv("SVR2011_TEST_LOBBY_LOG") != nullptr;
+  if (log && cpu) {
+    static std::string last;
+    std::string now = fmt::format("id {} y {} waiting {}:", ctx.r4.u32 & 0xFFFF, y, waiting);
+    for (uint32_t k = 0; k < 3; ++k)
+      now += fmt::format(" {:02X}{:02X}/{:02X}{:02X}", slots[k * 4], slots[k * 4 + 1], slots[k * 4 + 2], slots[k * 4 + 3]);
+    if (now != last) REXLOG_INFO("online cpu: bar {}", now);
+    last = now;
+  }
 }
 
 // The WWE SHOP: the PC has no marketplace and needs no Online Axxess (all
@@ -462,10 +619,145 @@ REX_HOOK_RAW(sub_8247E330) {
 // gate: entering ONLINE (without it, a "trial period" from Xbox LIVE storage
 // that can't be had: "Information related to your trial period couldn't be
 // retrieved"), the ONLINE menu's greyed items, the shop.
+// XShowPlayerReviewUI(user, xuid) - the lobby's PLAYER REVIEW (sub_82904D50,
+// the import's thunk): there is no Xbox review screen here. Its caller
+// (sub_823746F0) on success waits for the system UI to close - a
+// notification that never comes, so the game locked up; an error and the
+// game goes on (no screen).
+REX_HOOK_RAW(sub_82904D50) {
+  (void)base;
+  REXLOG_INFO("online: PLAYER REVIEW - no review screen on the PC");
+  ctx.r3.u64 = 0x1F;  // ERROR_GEN_FAILURE
+}
+
+// Test aid (SVR2011_TEST_IMG_LOG): a superstar picture asked for
+// (sub_8273A270(holder, desc): desc +0 the id, +4 the kind - SSFA/SSFB/SSFC -,
+// +8 the attire).
+REX_EXTERN(__imp__sub_8273A270);
+REX_HOOK_RAW(sub_8273A270) {
+  static const bool log = std::getenv("SVR2011_TEST_IMG_LOG") != nullptr;
+  if (log && ctx.r4.u32) {
+    auto rd = [base](uint32_t a) {
+      const uint8_t* p = base + a;
+      return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+    };
+    REXLOG_INFO("online: superstar picture id {} kind {} attire {} (lr {:08X})", int32_t(rd(ctx.r4.u32)),
+                rd(ctx.r4.u32 + 4), int32_t(rd(ctx.r4.u32 + 8)), uint32_t(ctx.lr));
+  }
+  __imp__sub_8273A270(ctx, base);
+}
+
+// Test aid (SVR2011_TEST_IMG_LOG): a picture holder told what to show
+// (sub_8273BB60(holder, desc): desc +0 the id - a Created Superstar < 50 gets
+// a CAW picture object, others the SSFC loader -, +4, +8, +12).
+REX_EXTERN(__imp__sub_8273BB60);
+REX_HOOK_RAW(sub_8273BB60) {
+  if (uint32_t(ctx.lr) == 0x8273C080 && ctx.r3.u32) svr2011::OnlineCawPictureFailed(base, ctx.r3.u32);
+  static const bool log = std::getenv("SVR2011_TEST_IMG_LOG") != nullptr;
+  if (log && ctx.r4.u32) {
+    auto rd = [base](uint32_t a) {
+      const uint8_t* p = base + a;
+      return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+    };
+    REXLOG_INFO("online: picture holder {:08X} id {} {} {} {} (lr {:08X})", ctx.r3.u32, int32_t(rd(ctx.r4.u32)),
+                int32_t(rd(ctx.r4.u32 + 4)), int32_t(rd(ctx.r4.u32 + 8)), int32_t(rd(ctx.r4.u32 + 12)),
+                uint32_t(ctx.lr));
+  }
+  __imp__sub_8273BB60(ctx, base);
+}
+
+// Test aid (SVR2011_TEST_IMG_LOG): the pictures the menus load by name
+// (sub_826A2FA8(image, "/DSC1/R123", ...), 16 characters at most).
+REX_EXTERN(__imp__sub_826A2FA8);
+REX_HOOK_RAW(sub_826A2FA8) {
+  static const bool log = std::getenv("SVR2011_TEST_IMG_LOG") != nullptr;
+  if (log && ctx.r4.u32) {
+    const char* p = reinterpret_cast<const char*>(base + ctx.r4.u32);
+    REXLOG_INFO("online: picture {:08X} <- {} (lr {:08X})", ctx.r3.u32, std::string(p, strnlen(p, 32)), uint32_t(ctx.lr));
+  }
+  __imp__sub_826A2FA8(ctx, base);
+}
+
+// A lobby chat message that arrived (sub_828A7C18(chat, msg): msg +0 the
+// sender, +8 the text, UTF-8; message kind 4096, sub_828A7E40): the line
+// "name : text" is made in a 92-byte buffer (sub_828A7B38 adds it). The
+// lobby's chat keyboard takes 21 characters (its field: 64 bytes, 21 a
+// line, one line); a longer text - an old or changed game's - is cut to
+// that, as this game would have typed it.
+constexpr size_t kChatChars = 21;
+REX_EXTERN(__imp__sub_828A7C18);
+REX_HOOK_RAW(sub_828A7C18) {
+  static const bool log = std::getenv("SVR2011_TEST_LOBBY_LOG") != nullptr;
+  // (test aid SVR2011_TEST_CHAT_LONG: every message arrives as 150 characters)
+  static const bool test_long = std::getenv("SVR2011_TEST_CHAT_LONG") != nullptr;
+  const uint32_t msg = ctx.r4.u32;
+  // (a port game's message: its whole text comes over P2P - online_chat.h - and shows instead)
+  if (msg) {
+    PPCContext c = ctx;
+    const uint8_t* m = base + msg;
+    const uint8_t* g = base + 0x82EDE910;
+    c.r3.u64 = uint32_t(g[0]) << 24 | uint32_t(g[1]) << 16 | uint32_t(g[2]) << 8 | g[3];
+    c.r4.u64 = uint32_t(m[0]) << 24 | uint32_t(m[1]) << 16 | uint32_t(m[2]) << 8 | m[3];
+    if (c.r3.u32) {
+      sub_8288EC28(c, base);
+      // (this player's own: the whole text it sent - the field held its end)
+      if (c.r3.u64 == std::strtoull(rex::cvar::Query<std::string>("online_xuid").c_str(), nullptr, 16)) {
+        if (auto own = svr2011::OnlineChatTakeOwn()) {
+          svr2011::OnlineChatShow(rex::cvar::Query<std::string>("online_name"), *own);
+          return;
+        }
+      }
+      if (svr2011::OnlineChatFromPort(c.r3.u64)) {
+        if (log) REXLOG_INFO("online: chat message of {:016X} left out (its whole one comes)", c.r3.u64);
+        return;
+      }
+    }
+  }
+  if (msg && test_long && svr2011::g_scratch) {
+    const uint32_t g_scratch = svr2011::g_scratch;
+    std::string t;
+    while (t.size() < 150) t += "LONGMESSAGE-";
+    t.resize(150);
+    std::memcpy(base + g_scratch, t.c_str(), t.size() + 1);
+    uint8_t* q = base + msg + 8;
+    q[0] = uint8_t(g_scratch >> 24), q[1] = uint8_t(g_scratch >> 16), q[2] = uint8_t(g_scratch >> 8), q[3] = uint8_t(g_scratch);
+  }
+  if (msg) {
+    const uint8_t* p = base + msg + 8;
+    const uint32_t text = uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+    if (text) {
+      char* s = reinterpret_cast<char*>(base + text);
+      const size_t bytes = strnlen(s, 4096);
+      size_t at = 0, chars = 0;  // (whole UTF-8 characters)
+      while (at < bytes && chars < kChatChars) {
+        const uint8_t c = uint8_t(s[at]);
+        at += c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        ++chars;
+      }
+      if (at < bytes) {
+        s[std::min(at, bytes)] = 0;
+        REXLOG_INFO("online: a chat message of {} bytes cut to {} characters", bytes, kChatChars);
+      } else if (log) {
+        REXLOG_INFO("online: chat message in: {} bytes", bytes);
+      }
+    }
+  }
+  __imp__sub_828A7C18(ctx, base);
+}
+
 REX_EXTERN(__imp__sub_828C19D8);
+// Online is off while the game files aren't clean (online_files.h: modified,
+// or still being checked at start): id 5 then answers no - entering ONLINE
+// shows the trial period message, whose text says why (OnlineString).
 REX_HOOK_RAW(sub_828C19D8) {
   if (ctx.r3.u32 == 5) {
-    ctx.r3.u64 = 1;
+    // (online off in the settings: as before - the files aren't checked then)
+    const std::string why =
+        rex::cvar::Query<bool>("online_enabled") ? svr2011::GameFilesOnlineMessage() : std::string();
+    ctx.r3.u64 = why.empty() ? 1 : 0;
+    static std::string told;
+    if (!why.empty() && why != told) REXLOG_WARN("online: off - {}", why);
+    told = why;
     return;
   }
   __imp__sub_828C19D8(ctx, base);
@@ -652,3 +944,7 @@ REX_HOOK_RAW(sub_82519C60) {
   if (svr2011::g_importing) svr2011::BackupSave(svr2011::g_saves / "SaveData.dat");
   __imp__sub_82519C60(ctx, base);
 }
+
+namespace svr2011 {
+uint32_t OnlineScratch() { return g_scratch; }
+}  // namespace svr2011

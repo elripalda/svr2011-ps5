@@ -9,6 +9,8 @@
 // movie when other movies are added or removed.
 #include "user_movies.h"
 
+#include "hd_movies.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +30,7 @@
 #include <rex/system/xmemory.h>
 
 #include "ascii_fold.h"  // (launcher/)
+#include "cae_mod_motions.h"
 
 #include "generated/default/svr2011_init.h"
 
@@ -223,6 +226,11 @@ REX_HOOK_RAW(sub_8287DFD0) {
     movies = items && Rd16(base, table + (category + 96) * 2) > 1 && Rd16(base, items + 6) == kNoneId;
   }
   __imp__sub_8287DFD0(ctx, base);
+  {  // (the other filler of this hook: the MODS rows of the entrance motion lists)
+    const auto r3 = ctx.r3;
+    svr2011::CaeModRows(ctx, base, list, category);
+    ctx.r3 = r3;
+  }
   if (!movies) return;
   const uint32_t count = Rd32(base, list), rows_at = Rd32(base, list + 8);
   // Tools: SVR2011_DUMP_MOVIE_NAMES=<file> writes "<id><TAB><name>" for the
@@ -292,13 +300,106 @@ REX_HOOK_RAW(sub_8287CFB0) {
   ctx.r3.u64 = reels + uint32_t(n);
 }
 
+// An entrance's movie -> the CREATE AN ENTRANCE menus (B16). Two loaders put
+// a stored entrance into a menu's picks: sub_8287E960(slots, e) (the full
+// editor; slots = screen+4288, e = the entrance in the profile +0x1C4 layout,
+// the movie id at e+14 = profile +0x1C0 +0x12) and sub_82875320(page) (the
+// one-page editor of an existing superstar's entrance: MOTION, CHAMPION and
+// MULTI-TITLE ENTRANCE, MOVIE, MUSIC). Both find a highlight reel
+// (1000-1019) in the sub-list by value and any other id in the movie list
+// (sub_828823E0); a user movie (700-899) isn't there, so they picked row 0
+// (USER MOVIES) and the sub-list's row 0 - the first user movie, which
+// FINALIZE / SAVE then wrote (the sub-list row's value when the movie row is
+// 254): editing an entrance with a user movie (a superstar mod's own, or one
+// the player picked) turned its movie into the first one in the list. Here:
+// USER MOVIES and the movie's own row in the sub-list (filled before the
+// lookup, by sub_8287CFB0); NONE if its file is gone. An empty sub-list (the
+// reel storage not ready: sub_8287CFB0 not called) leaves the game's picks.
+namespace {
+
+int IndexOf(uint8_t* base, uint32_t list, uint32_t value) {  // (as sub_828823E0)
+  if (!list) return -1;
+  const uint32_t n = Rd32(base, list), rows = Rd32(base, list + 8);
+  for (uint32_t i = 0; i < n && rows; ++i)
+    if (Rd32(base, rows + i * kListItemSize) == value) return int(i);
+  return -1;
+}
+
+// The rows to select for user movie `id`: {movie list row, sub-list row}, or
+// false to leave the game's picks.
+bool UserMoviePicks(uint8_t* base, uint32_t movies, uint32_t sub, int id, uint32_t* row, uint32_t* pick) {
+  const int r = IndexOf(base, movies, kSubListRow), p = IndexOf(base, sub, uint32_t(id));
+  if (r >= 0 && p >= 0) {
+    *row = uint32_t(r), *pick = uint32_t(p);
+    REXLOG_INFO("user movies: entrance movie {} -> USER MOVIES row {}", id, p);
+    return true;
+  }
+  if (!sub || Rd32(base, sub) == 0) return false;
+  const int none = IndexOf(base, movies, kNoneId);
+  if (none < 0) return false;
+  *row = uint32_t(none), *pick = 0;
+  REXLOG_INFO("user movies: entrance movie {} has no file - NONE", id);
+  return true;
+}
+
+// sub_82875320's own lookup of the movie id (its copy of the entrance is on
+// its stack): the user movie it missed, and the list it looked in.
+thread_local bool t_in_page = false;
+thread_local int t_page_movie = -1;
+
+}  // namespace
+
+REX_EXTERN(__imp__sub_8287E960);
+REX_HOOK_RAW(sub_8287E960) {
+  const uint32_t slots = ctx.r3.u32, e = ctx.r4.u32;
+  __imp__sub_8287E960(ctx, base);
+  if (!g_memory || !slots || !e) return;
+  const int id = uint16_t(Rd16(base, e + 14));
+  if (id < kFirstId || id > kLastId) return;
+  uint32_t row = 0, pick = 0;
+  if (UserMoviePicks(base, Rd32(base, slots + 500), Rd32(base, slots + 508), id, &row, &pick)) {
+    Wr32(base, slots + 496, row);  // {index, list} picks: the movie row, the sub-list row
+    Wr32(base, slots + 504, pick);
+  }
+}
+
+// sub_82875320(page): the movie list at page+2264, the sub-list at page+2292;
+// the picks at page+152 (movie row) / +156 (sub-list row), then copied with
+// the others (+136..+156 -> +160..+180, the "unchanged" baseline).
+REX_EXTERN(__imp__sub_828823E0);
+REX_HOOK_RAW(sub_828823E0) {
+  const uint32_t list = ctx.r3.u32, value = ctx.r4.u32;
+  __imp__sub_828823E0(ctx, base);
+  if (t_in_page && ctx.r3.s32 < 0 && int(value) >= kFirstId && int(value) <= kLastId) t_page_movie = int(value);
+  // (an entrance motion list missing the stored number - a removed mod's: a MISSING MOD row keeps it)
+  if (ctx.r3.s32 < 0)
+    if (const int row = svr2011::CaeMissingRow(ctx, base, list, value); row >= 0) ctx.r3.u64 = uint32_t(row);
+}
+REX_EXTERN(__imp__sub_82875320);
+REX_HOOK_RAW(sub_82875320) {
+  const uint32_t page = ctx.r3.u32;
+  t_in_page = true;
+  t_page_movie = -1;
+  __imp__sub_82875320(ctx, base);
+  t_in_page = false;
+  if (!g_memory || !page || t_page_movie < 0) return;
+  uint32_t row = 0, pick = 0;
+  if (UserMoviePicks(base, page + 2264, page + 2292, t_page_movie, &row, &pick)) {
+    Wr32(base, page + 152, row);
+    Wr32(base, page + 156, pick);
+    Wr32(base, page + 176, row);
+    Wr32(base, page + 180, pick);
+  }
+}
+
 // The path of entrance movie `id`: sub_828B52D8(id) -> (r3) the path.
 REX_EXTERN(__imp__sub_828B52D8);
 REX_HOOK_RAW(sub_828B52D8) {
   const int id = ctx.r3.s32;
   __imp__sub_828B52D8(ctx, base);
   // Tests: SVR2011_TEST_MOVIE=<file in the movies folder> plays it for every
-  // entrance (e.g. a test pattern, to see what the titantron shows).
+  // entrance (e.g. a test pattern, to see what the titantron shows); a full
+  // path to an .mp4: that, as an HD movie (hd_movies.h; "hdtest.bik").
   static const std::string test_movie = [] {
     char* v = nullptr;
     size_t n = 0;
@@ -306,6 +407,9 @@ REX_HOOK_RAW(sub_828B52D8) {
     if (_dupenv_s(&v, &n, "SVR2011_TEST_MOVIE") == 0 && v) {
       s = v;
       free(v);
+    }
+    if (s.size() > 4 && s.substr(s.size() - 4) == ".mp4") {
+      s = svr2011::RegisterHdMovie("hdtest.bik", std::filesystem::path(s)) ? svr2011::HdMovieFile("hdtest.bik") : "";
     }
     return s;
   }();
@@ -320,7 +424,8 @@ REX_HOOK_RAW(sub_828B52D8) {
     std::lock_guard lock(g_mutex);
     if (auto it = g_ids.find(id); it != g_ids.end()) file = it->second;
   }
-  const std::string path = file.empty() ? "GAME:\\movies\\titantron\\999.bik" : "umovie:\\" + file;
+  // (an HD movie - an .mp4 the platform decodes: its stub, hd_movies.h)
+  const std::string path = file.empty() ? "GAME:\\movies\\titantron\\999.bik" : "umovie:\\" + svr2011::HdMovieFile(file);
   if (path.size() < 250) std::memcpy(base + ctx.r3.u32, path.c_str(), path.size() + 1);
 }
 

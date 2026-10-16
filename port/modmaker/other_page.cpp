@@ -17,9 +17,12 @@
 #include <cstring>
 
 #include "app.h"
+#include "disc_list.h"
 #include "svrfmt/pac.h"
 #include "svrfmt/wwe13.h"
 #include "tool_run.h"
+
+#include <shellapi.h>
 
 namespace mm {
 namespace other_page {
@@ -31,10 +34,24 @@ namespace {
 // ---- where the other games' files are (remembered in the settings? kept for the session)
 std::wstring g_w13_pac, g_w10_pac, g_w08_pac;
 
-std::wstring Guess(const wchar_t* folder) {
+// A game's pac folder: its extracted folder in My game discs first, else the old extract next to the port.
+std::wstring Guess(const wchar_t* folder, const char* game = nullptr) {
   std::error_code ec;
+  if (game) {
+    const std::wstring mine = disc_list::PathFor(game);
+    if (!mine.empty() && fs::is_directory(fs::path(mine) / L"pac", ec)) return (fs::path(mine) / L"pac").wstring();
+  }
   const fs::path cand = fs::path(L"D:\\Xbox Games Ports") / folder / L"pac";
   return fs::exists(cand, ec) ? cand.wstring() : L"";
+}
+
+// Under a folder row: where My game discs has that game (a disc image the tools here can't read: the Port page can).
+void MyDiscNote(const char* game) {
+  const std::wstring mine = disc_list::PathFor(game);
+  std::error_code ec;
+  if (mine.empty() || fs::is_directory(mine, ec)) return;
+  ImGui::TextDisabled("Your %s disc image is in My game discs: the From another game tab reads it as it is (Superstars, Moves, ...).",
+                      disc_list::GameByKey(game) ? disc_list::GameByKey(game)->name : game);
 }
 
 void FolderRow(const char* label, std::wstring& folder, const wchar_t* title) {
@@ -54,6 +71,8 @@ bool ToolsReady(bool ffmpeg_too) {
   if (!missing.empty()) {
     ImGui::TextColored(kWarn, "Needs %s.", missing.c_str());
     ImGui::SameLine();
+    if (ImGui::SmallButton("Install what's missing...")) OpenToolsPanel();
+    ImGui::SameLine();
     if (ImGui::SmallButton("Recheck")) RecheckTools();
     return false;
   }
@@ -64,7 +83,9 @@ bool ToolsReady(bool ffmpeg_too) {
     return false;
   }
   if (ffmpeg_too && FfmpegExe().empty()) {
-    ImGui::TextColored(kWarn, "ffmpeg is needed too (on PATH or in C:\\ffmpeg\\bin) for the theme songs.");
+    ImGui::TextColored(kWarn, "ffmpeg is needed too for the theme songs.");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Install it...")) OpenToolsPanel();
     return false;
   }
   return true;
@@ -79,14 +100,58 @@ int g_w13_host = 1;  // tile (RAW: the bundled ones used it)
 Wwe13Options g_w13;
 char g_w13_drop[128] = "";
 char g_w13_name[64] = "";
+bool g_show_arena_tab = false;  // (the Port page handed a file: that tab comes up)
+
+// A WWE '12 - 2K17 arena pac onto a host tile, in the background; the result is the Arena page's project.
+void Convert(const std::wstring& file, int host, const std::string& name, const Wwe13Options& opt, bool to_editor) {
+  std::string source = Utf8(fs::path(file).stem().wstring());  // ("Arenas_wwe2k16_bg01" from the Port page, or "bg01")
+  if (source.rfind("Arenas_", 0) == 0) source = source.substr(7);
+  std::replace(source.begin(), source.end(), '_', ' ');
+  RunInBackground([file, host, opt, name, source, to_editor] {
+    Progress("Reading the arena ...");
+    Bytes w13, hostpac;
+    if (!ReadFile(Utf8(file), w13)) { Status("Could not read " + Utf8(file)); return; }
+    if (!ReadFile(ArenaPath(host), hostpac)) { Status("Could not read the host arena."); return; }
+    Progress("Converting (a minute or so) ...");
+    Bytes out;
+    Wwe13Report rep;
+    std::string err;
+    if (!BuildArenaFromWwe13(w13, hostpac, opt, out, rep, &err)) { Status("The conversion failed: " + err); return; }
+    for (const auto& n : rep.notes) Log("  " + n);
+    if (!rep.halved.empty()) Log("  " + std::to_string(rep.halved.size()) + " pictures halved to fit");
+    char b[200];
+    std::snprintf(b, sizeof b, "Converted: %d models, %d meshes, %d entries (%d from the host, %d dropped, %d ring parts).",
+                  rep.conv.models, rep.conv.meshes, rep.entries, rep.from_host, rep.dropped, rep.ring_parts);
+    Status(b);
+    OnUiThread([out, host, name, source, to_editor] { arena_page::SetArenaFromPac(out, host, name, source, to_editor); });
+  });
+}
 
 void Wwe13ArenaTab() {
-  ImGui::TextWrapped("A WWE '13 arena (its pac\\bg\\bgNN.pac, compressed or not) rebuilt as a 2011 arena in the "
+  ImGui::TextWrapped("A WWE '12, '13, 2K14, 2K15, 2K16 or 2K17 arena (its pac\\bg\\bgNN.pac, compressed or not; the From another game tab reads it off "
+                     "the disc) rebuilt as a 2011 arena in the "
                      "place of a host arena, which gives the room, the ring and the aprons. The result opens on the "
                      "Arena page: give it a banner and a name there and save it. This is how RAW IS WAR, SmackDown "
                      "1999, Royal Rumble 1998 and King of the Ring 1998 were made.");
   ImGui::Spacing();
-  if (FileRow("WWE '13 arena file...", g_w13_file, "pick a bgNN.pac", kPacFilter, 1) && g_w13_name[0] == 0)
+  {  // the arenas on My game discs (the Port page lists a disc's arenas and copies the pick here)
+    std::vector<std::string> keys;
+    for (const char* k : {"wwe12", "wwe13", "wwe2k14", "wwe2k15", "wwe2k16", "wwe2k17"})
+      if (!disc_list::PathFor(k).empty()) keys.push_back(k);
+    if (keys.empty()) {
+      ImGui::TextDisabled("No WWE '12 - 2K17 disc in My game discs yet.");
+      ImGui::SameLine();
+      if (ImGui::SmallButton("My game discs...")) GoTo(PageId::kDiscs);
+    } else {
+      ImGui::TextUnformatted("From my discs:");
+      for (const auto& k : keys) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton(disc_list::GameByKey(k)->name)) port_page::Open(L"arena_port.py", disc_list::PathFor(k));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Its arenas, read off the disc: pick one and it comes back here.");
+      }
+    }
+  }
+  if (FileRow("Arena file...", g_w13_file, "pick a bgNN.pac", kPacFilter, 1) && g_w13_name[0] == 0)
     std::snprintf(g_w13_name, sizeof g_w13_name, "%s", IdFrom(FileName(g_w13_file), "wwe13").c_str());
   ImGui::SetNextItemWidth(320 * g_scale);
   if (ImGui::BeginCombo("Host arena (the room it plays in)", g_arenas[g_w13_host].name)) {
@@ -117,7 +182,11 @@ void Wwe13ArenaTab() {
     ImGui::Unindent();
   }
   ImGui::Spacing();
-  ImGui::BeginDisabled(g_w13_file.empty() || Busy());
+  const bool special = !g_w13_file.empty() && SpecialStage(Utf8(fs::path(g_w13_file).filename().wstring()));
+  if (special)
+    ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "bg60 and up in WWE '12 - 2K17 are backstage rooms and studio stages, not arenas: on an arena "
+                                                   "slot they show a white mat over a black void, or crash (bg78).");
+  ImGui::BeginDisabled(g_w13_file.empty() || Busy() || special);
   PushAccent();
   if (ImGui::Button("Convert and open on the Arena page", ImVec2(320 * g_scale, 0))) {
     Wwe13Options opt = g_w13;
@@ -129,28 +198,28 @@ void Wwe13ArenaTab() {
       while (*p && *p != ',') ++p;
       if (*p == ',') ++p;
     }
-    const std::wstring file = g_w13_file;
-    const int host = g_w13_host;
-    const std::string name = g_w13_name;
-    RunInBackground([file, host, opt, name] {
-      Progress("Reading the WWE '13 arena ...");
-      Bytes w13, hostpac;
-      if (!ReadFile(Utf8(file), w13)) { Status("Could not read " + Utf8(file)); return; }
-      if (!ReadFile(ArenaPath(host), hostpac)) { Status("Could not read the host arena."); return; }
-      Progress("Converting (a minute or so) ...");
-      Bytes out;
-      Wwe13Report rep;
-      std::string err;
-      if (!BuildArenaFromWwe13(w13, hostpac, opt, out, rep, &err)) { Status("The conversion failed: " + err); return; }
-      for (const auto& n : rep.notes) Log("  " + n);
-      if (!rep.halved.empty()) Log("  " + std::to_string(rep.halved.size()) + " pictures halved to fit");
-      char b[200];
-      std::snprintf(b, sizeof b, "Converted: %d models, %d meshes, %d entries (%d from the host, %d dropped, %d ring parts).",
-                    rep.conv.models, rep.conv.meshes, rep.entries, rep.from_host, rep.dropped, rep.ring_parts);
-      Status(b);
-      OnUiThread([out, host, name] { arena_page::SetArenaFromPac(out, host, name); });
-    });
+    Convert(g_w13_file, g_w13_host, g_w13_name, opt, true);
   }
+  PopAccent();
+  ImGui::EndDisabled();
+}
+
+// ---- one character file from any game (superstar_port.py convert --src <pac>, on the Port page)
+
+std::wstring g_star_file;
+
+void StarFileTab() {
+  ImGui::PushTextWrapPos(0);
+  ImGui::TextWrapped("One character file from any of your other games, without the disc: a chNNN.pac of SvR 2007 to WWE "
+                     "2K17 (compressed or not) or a PS2 game's CH.PAC (it holds many characters: you pick one). The disc "
+                     "steps read which game it's from and turn it into a superstar mod with the model, its outfits, "
+                     "entrance gear and hair; it opens on the Superstar page to finish.");
+  ImGui::PopTextWrapPos();
+  ImGui::Spacing();
+  FileRow("Character file...", g_star_file, "pick a chNNN.pac or a PS2 CH.PAC", kPacFilter, 1);
+  ImGui::BeginDisabled(g_star_file.empty());
+  PushAccent();
+  if (ImGui::Button("Read it with the disc steps", ImVec2(320 * g_scale, 0))) port_page::Open(L"superstar_port.py", g_star_file);
   PopAccent();
   ImGui::EndDisabled();
 }
@@ -220,8 +289,9 @@ void Svr10StarTab() {
                      "into a move pack, the entrance and announcer name when 2011 has them. The mod opens on the "
                      "Superstar page.");
   ImGui::Spacing();
-  if (g_w10_pac.empty()) g_w10_pac = Guess(L"SvR2010 Extract");
+  if (g_w10_pac.empty()) g_w10_pac = Guess(L"SvR2010 Extract", "svr2010");
   FolderRow("SvR 2010 pac folder...", g_w10_pac, L"The SvR 2010 \"pac\" folder (its extract)");
+  MyDiscNote("svr2010");
   ImGui::SetNextItemWidth(120 * g_scale);
   ImGui::InputInt("2010 superstar id", &g_w10_id);
   Hint("The 2010 roster id (100 ...). The tool's survey lists them: run it once below.");
@@ -265,11 +335,12 @@ char g_w10_moves[256] = "";
 
 void Svr10MovesTab() {
   ImGui::TextWrapped("SvR 2010 moves the 2011 game lacks, ported into a move pack: their motions (attacker, victim, "
-                     "cameras), table records and category bits. The pack opens on the Moves page (save it as a "
+                     "cameras), table records and category bits. The pack opens on the Move pack tab (save it as a "
                      "mod, or hand it to a superstar mod).");
   ImGui::Spacing();
-  if (g_w10_pac.empty()) g_w10_pac = Guess(L"SvR2010 Extract");
+  if (g_w10_pac.empty()) g_w10_pac = Guess(L"SvR2010 Extract", "svr2010");
   FolderRow("SvR 2010 pac folder...", g_w10_pac, L"The SvR 2010 \"pac\" folder (its extract)");
+  MyDiscNote("svr2010");
   TextField("Move ids", g_w10_moves, sizeof g_w10_moves, "e.g. 3088 3274 7573 (2010 move ids, space or comma separated)", 420);
   Hint("The 2010 move ids (the Game assets page shows 2011's misc.pac MOVS/WAZE names; 2010's are in its own "
        "misc.pac). A superstar's whole missing set comes with the SvR 2010 superstar tab instead.");
@@ -305,10 +376,11 @@ bool g_w08_gimmick = true;
 void Svr08Tab() {
   ImGui::TextWrapped("SvR 2008's Parking Lot brawl stage (bg56) as 2011's parking room, with its cars and props as "
                      "the area's objects - the bundled Parking Lot (2008) mod. The settings below are the ones it "
-                     "used. The result opens on the Backstage page as an area of its own.");
+                     "used. The result opens on the Backstage tab as an area of its own.");
   ImGui::Spacing();
-  if (g_w08_pac.empty()) g_w08_pac = Guess(L"SvR2008 Extract");
+  if (g_w08_pac.empty()) g_w08_pac = Guess(L"SvR2008 Extract", "svr2008");
   FolderRow("SvR 2008 pac folder...", g_w08_pac, L"The SvR 2008 \"pac\" folder (its extract)");
+  MyDiscNote("svr2008");
   ImGui::SetNextItemWidth(160 * g_scale);
   ImGui::Combo("Turn", &g_w08_rotate, "0\0" "180 degrees (faces the 2011 camera)\0");
   ImGui::SetNextItemWidth(160 * g_scale);
@@ -319,7 +391,7 @@ void Svr08Tab() {
   if (!ToolsReady(false)) return;
   ImGui::BeginDisabled(g_w08_pac.empty() || Busy());
   PushAccent();
-  if (ImGui::Button("Convert and open on the Backstage page", ImVec2(320 * g_scale, 0))) {
+  if (ImGui::Button("Convert and open on the Backstage tab", ImVec2(320 * g_scale, 0))) {
     const fs::path work = fs::path(g_game) / L"Mods" / L".convert";
     std::error_code ec;
     fs::create_directories(work, ec);
@@ -357,6 +429,16 @@ void Svr08Tab() {
 
 }  // namespace
 
+void ConvertArena(const std::wstring& file, int host, const std::string& name, bool to_editor) {
+  Convert(file, host, name, g_w13, to_editor);
+}
+
+void UseArenaFile(const std::wstring& file, const std::string& name) {
+  g_w13_file = file;
+  std::snprintf(g_w13_name, sizeof g_w13_name, "%s", name.c_str());
+  g_show_arena_tab = true;
+}
+
 // test aid: --convert-w13 <wwe13 bgNN.pac>,<host tile>: converts at start (then --shot shows the editor)
 void TestConvertW13(const std::wstring& file, int host) {
   g_w13_file = file;
@@ -380,24 +462,85 @@ void TestConvertW13(const std::wstring& file, int host) {
   });
 }
 
+// ---- Bink 2 videos (.bk2: WWE 2K15 and later) - opt-in, the player's own tool
+
+std::string g_bink2_state;  // "" not asked, else what Find said
+bool g_bink2_asked = false;
+
+void Bink2Section() {
+  if (!ImGui::CollapsingHeader("Enable Bink 2 conversion (.bk2 videos: WWE 2K15 and later)")) return;
+  ImGui::Indent();
+  ImGui::TextWrapped("Titantrons and movies of WWE 2K15 and later are Bink 2. The Mod Maker can turn them into the "
+                     "game's movies when you have a tool that reads Bink 2 - RAD Video Tools (free from RAD) or an "
+                     "ffmpeg built with a Bink 2 decoder. Neither comes with the Mod Maker. Then \"From a video...\" "
+                     "takes .bk2 files.");
+  ImGui::SetNextItemWidth(420 * g_scale);
+  std::string shown = g_settings.bink2_tool.empty() ? std::string("(look in the usual places)") : Utf8(g_settings.bink2_tool);
+  ImGui::InputText("##bk2", shown.data(), shown.size() + 1, ImGuiInputTextFlags_ReadOnly);
+  ImGui::SameLine();
+  if (ImGui::Button("Choose the tool...")) {
+    static const COMDLG_FILTERSPEC kExe[1] = {{L"radvideo64.exe or ffmpeg.exe", L"*.exe"}};
+    const std::wstring f = PickFile(false, L"RAD Video Tools (radvideo64.exe) or a Bink 2 ffmpeg.exe", kExe, 1);
+    if (!f.empty()) g_settings.bink2_tool = f, SaveSettings(), g_bink2_asked = false;
+  }
+  if (!g_settings.bink2_tool.empty()) {
+    ImGui::SameLine();
+    if (ImGui::SmallButton("x")) g_settings.bink2_tool.clear(), SaveSettings(), g_bink2_asked = false;
+  }
+  if (!g_bink2_asked && !Busy() && ToolsReady(false)) {
+    g_bink2_asked = true;
+    g_bink2_state = "looking ...";
+    std::vector<std::wstring> args = {L"find"};
+    if (!g_settings.bink2_tool.empty()) args.push_back(L"--tool"), args.push_back(g_settings.bink2_tool);
+    RunToolJson(L"bink2_convert.py", args, [](int code, const std::string& text) {
+      const auto field = [&](const char* key) {
+        const size_t k = text.find(std::string("\"") + key + "\"");
+        if (k == std::string::npos) return std::string();
+        const size_t q1 = text.find('"', text.find(':', k) + 1), q2 = text.find('"', q1 + 1);
+        return q1 == std::string::npos || q2 == std::string::npos ? std::string() : text.substr(q1 + 1, q2 - q1 - 1);
+      };
+      g_bink2_state = code == 0 ? "found: " + field("kind") + " - " + field("path") : "not found";
+    });
+  }
+  ImGui::TextColored(g_bink2_state.rfind("found", 0) == 0 ? ImVec4(0.55f, 0.85f, 0.55f, 1) : kWarn, "%s", g_bink2_state.c_str());
+  if (g_bink2_state == "not found") {
+    ImGui::SameLine();
+    if (ImGui::SmallButton("RAD's download page"))
+      ShellOpen(L"https://www.radgametools.com/bnkdown.htm");
+  }
+  ImGui::Unindent();
+}
+
 void Draw() {
-  Heading("Other games", "Arenas, superstars, moves and backstage areas from WWE '13, SvR 2010 and SvR 2008, "
+  Heading("Other games", "Arenas from WWE '12 to 2K17, superstars, moves and backstage areas from WWE '13, SvR 2010 and SvR 2008, "
                          "converted the way the bundled mods were, each landing on its page to finish and save.");
+  DrawTabs(~0u);
+}
+
+void DrawTabs(unsigned mask) {
   if (g_game.empty()) {
     ImGui::TextDisabled("No game folder.");
     return;
   }
+  ImGui::PushTextWrapPos(0);
   ImGui::TextDisabled("Only the other games' extracted files are read; the Python tools (Mod Maker Tools) do the SvR "
                       "2010 / 2008 / WWE '13 character work. Python: %s. Tools: %s. ffmpeg: %s.",
                       PythonExe().empty() ? "not found" : Utf8(PythonExe()).c_str(),
                       ToolsDir().empty() ? "not found" : Utf8(ToolsDir()).c_str(),
                       FfmpegExe().empty() ? "not found" : "found");
+  ImGui::PopTextWrapPos();
+  if (mask & (kSvr10Star | kW13Star)) Bink2Section();  // (the themes)
   if (ImGui::BeginTabBar("other_tabs")) {
-    if (ImGui::BeginTabItem("WWE '13 arena")) { Wwe13ArenaTab(); ImGui::EndTabItem(); }
-    if (ImGui::BeginTabItem("WWE '13 superstar")) { Wwe13StarTab(); ImGui::EndTabItem(); }
-    if (ImGui::BeginTabItem("SvR 2010 superstar")) { Svr10StarTab(); ImGui::EndTabItem(); }
-    if (ImGui::BeginTabItem("SvR 2010 moves")) { Svr10MovesTab(); ImGui::EndTabItem(); }
-    if (ImGui::BeginTabItem("SvR 2008 backstage")) { Svr08Tab(); ImGui::EndTabItem(); }
+    if ((mask & kW13Arena) && ImGui::BeginTabItem("WWE '12 - 2K17 arena", nullptr, g_show_arena_tab ? ImGuiTabItemFlags_SetSelected : 0)) {
+      g_show_arena_tab = false;
+      Wwe13ArenaTab();
+      ImGui::EndTabItem();
+    }
+    if ((mask & kStarFile) && ImGui::BeginTabItem("Superstar file (any game)")) { StarFileTab(); ImGui::EndTabItem(); }
+    if ((mask & kW13Star) && ImGui::BeginTabItem("WWE '13 superstar")) { Wwe13StarTab(); ImGui::EndTabItem(); }
+    if ((mask & kSvr10Star) && ImGui::BeginTabItem("SvR 2010 superstar")) { Svr10StarTab(); ImGui::EndTabItem(); }
+    if ((mask & kSvr10Moves) && ImGui::BeginTabItem("SvR 2010 moves")) { Svr10MovesTab(); ImGui::EndTabItem(); }
+    if ((mask & kSvr08) && ImGui::BeginTabItem("SvR 2008 backstage")) { Svr08Tab(); ImGui::EndTabItem(); }
     ImGui::EndTabBar();
   }
 }

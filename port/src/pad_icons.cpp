@@ -82,19 +82,17 @@ bool g_enabled = false;
 thread_local int t_owner = -1;
 
 // The kind of pictures for the text / picture being drawn: its player's
-// controller, or (shared by everyone) what the players use - PlayStation if
-// all use one, pairs ("A / Cross") if they mix Xbox and PlayStation pads.
-Kind CurrentKind(bool pairs) {
+// controller (the match HUD, the character select panels), or - shared by
+// everyone: menus, their bars, the pause menu, tips - the controller of
+// whoever pressed something last (a key, a pad button, a trigger or stick
+// pushed: PadIconsInput), as most PC games do.
+std::atomic<int> g_last_input{0};
+Kind CurrentKind(bool) {
   auto of = [](PadType t) {
     return t == PadType::kPlayStation ? kPlayStation : t == PadType::kKeyboard ? kKeyboard : kXbox;
   };
   if (t_owner >= 0) return of(PlayerPadType(uint32_t(t_owner)));
-  const uint32_t in_use = PadTypesInUse();
-  const bool ps = in_use & (1u << uint32_t(PadType::kPlayStation));
-  const bool xbox = in_use & (1u << uint32_t(PadType::kXbox));
-  const bool kb = in_use & (1u << uint32_t(PadType::kKeyboard));
-  if (ps) return xbox || kb ? (pairs ? kPair : kXbox) : kPlayStation;
-  return kb && !xbox ? kKeyboard : kXbox;
+  return of(PlayerPadType(uint32_t(g_last_input.load())));
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +220,15 @@ const Atlas* Identify(uint32_t pw, uint32_t ph, uint32_t glyphs, uint32_t count)
     }
     if (match) return a.get();
   }
-  // (once per kind: a page we have no other pictures for)
+  // (once per kind: a page we have no other pictures for - a page with no
+  // button glyphs, such as the 64x64 one with only the E018 logo, has
+  // nothing to swap and is not logged)
+  bool buttons = false;
+  for (uint32_t i = 0; i < count && !buttons; ++i) {
+    const uint32_t code = Rd32(g_base + glyphs + i * kGlyph + 20);
+    for (const auto& b : kBinds) buttons |= b.code == code;
+  }
+  if (!buttons) return nullptr;
   static std::set<std::string> logged;
   std::string id = fmt::format("{}x{}", pw, ph);
   for (uint32_t i = 0; i < count && i < 12; ++i) {
@@ -398,10 +404,13 @@ uint32_t MakeCopy(uint32_t object, const Sprite& sp, const std::vector<uint8_t>&
   // (rows padded as the GPU reads a linear texture: the pitch in whole 32-block
   // tiles - texture_util's guest layout - so at least 256 bytes. Only 256-byte
   // rows made a picture under 128 texels wide come out squeezed to half height
-  // and mixed with the next rows: the in-match button prompts.)
+  // and mixed with the next rows: the in-match button prompts on PS5.)
   const uint32_t row = blocks_x * bpb, pitch_bytes = ((blocks_x + 31) & ~31u) * bpb;
-  // (a page more: the GPU reads the 0xE0000000 heap one page on - the data
-  // goes where it reads, through the physical address)
+  // (the 0xE0000000 heap's physical address is a page on from its virtual
+  // one: the data is written at the physical address and the fetch constant
+  // gets that one too, as the game's own textures have - with the virtual
+  // page the native renderer read the page before: the keyboard picture on
+  // character select showed bits of a font page)
   // (one copy of the data per picture: the objects that show it - again
   // after every match - share it)
   static std::map<const std::vector<uint8_t>*, uint32_t> datas;
@@ -410,7 +419,8 @@ uint32_t MakeCopy(uint32_t object, const Sprite& sp, const std::vector<uint8_t>&
   if (fresh) at = g_memory->SystemHeapAlloc(pitch_bytes * blocks_y + 4096, 4096, rex::memory::kSystemHeapPhysical);
   const uint32_t copy = g_memory->SystemHeapAlloc(64, 32);
   if (!at || !copy) return 0;
-  uint8_t* dst = g_memory->TranslatePhysical<uint8_t*>(g_memory->GetPhysicalAddress(at));
+  const uint32_t physical = g_memory->GetPhysicalAddress(at);
+  uint8_t* dst = g_memory->TranslatePhysical<uint8_t*>(physical);
   if (fresh)
     for (uint32_t y = 0; y < blocks_y; ++y) std::memcpy(dst + y * pitch_bytes, data.data() + size_t(y) * row, row);
   std::memcpy(g_base + copy, g_base + object, 52);
@@ -420,17 +430,14 @@ uint32_t MakeCopy(uint32_t object, const Sprite& sp, const std::vector<uint8_t>&
   fetch.tiled = 0;
   fetch.pitch = (pitch_bytes / bpb * 4) >> 5;
   fetch.endianness = rex::graphics::xenos::Endian::kNone;
-  fetch.base_address = at >> 12;
+  fetch.base_address = physical >> 12;
   fetch.mip_address = 0;
   fetch.mip_min_level = 0;
   fetch.mip_max_level = 0;
   fetch.packed_mips = 0;
   for (int i = 0; i < 6; ++i) Wr32(g_base + copy + 0x1C + i * 4, words[i]);
-  REXLOG_INFO("[svr2011] pad icons: copy of {:08X} ({}x{} {}) -> {:08X}, data {:08X} (physical {:08X}), fetch {:08X} {:08X} {:08X} "
-              "(original {:08X} {:08X} {:08X}), first bytes {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-              object, sp.width, sp.height, sp.dxt1 ? "DXT1" : "DXT5", copy, at, g_memory->GetPhysicalAddress(at), words[0], words[1], words[2],
-              Rd32(g_base + object + 0x1C), Rd32(g_base + object + 0x20), Rd32(g_base + object + 0x24),
-              dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
+  REXLOG_INFO("[svr2011] pad icons: copy of {:08X} ({}x{}) -> {:08X}, data {:08X} (physical {:08X}), fetch {:08X} {:08X}",
+              object, sp.width, sp.height, copy, at, g_memory->GetPhysicalAddress(at), words[0], words[1]);
   return copy;
 }
 
@@ -482,6 +489,10 @@ void PadIconsTextureUploaded(uint32_t physical_base, uint32_t width, uint32_t he
   const auto it = hash ? g_sprites.find(hash) : g_sprites.end();
   const Sprite* sp = it != g_sprites.end() && it->second.width == width && it->second.height == height ? &it->second
                                                                                                      : nullptr;
+  static const bool debug = std::getenv("SVR2011_PAD_ICONS_LOG") != nullptr;
+  if (debug && g_sprite_sizes.count({width, height}))
+    REXLOG_INFO("[svr2011] pad icons: {}x{} uploaded at {:08X}, hash {:016x}{}", width, height, physical_base, hash,
+                sp ? " - a known picture" : "");
   std::lock_guard lock(g_seen_mutex);
   if (sp) {
     g_seen[physical_base] = sp;
@@ -493,12 +504,59 @@ void PadIconsTextureUploaded(uint32_t physical_base, uint32_t width, uint32_t he
 
 void SetPadIconsOwner(int user_index) { t_owner = user_index; }
 
+// A player's pad state read by the game (XInput layout, big-endian: +4
+// buttons, +6 / +7 triggers, +8.. sticks LX LY RX RY): a new press makes it
+// the last player to press something. (the keyboard player's right stick is
+// the mouse: moving it isn't a press)
+void PadIconsInput(uint32_t user_index, const uint8_t* state) {
+  if (user_index >= 8) return;
+  struct Last {
+    uint16_t buttons = 0;
+    bool lt = false, rt = false, ls = false, rs = false;
+  };
+  static Last last[8];
+  Last now;
+  now.buttons = uint16_t(state[4] << 8 | state[5]);
+  now.lt = state[6] > 128, now.rt = state[7] > 128;
+  auto out = [&](int at) {
+    const int x = int16_t(state[at] << 8 | state[at + 1]), y = int16_t(state[at + 2] << 8 | state[at + 3]);
+    return x * x + y * y > 16000 * 16000;
+  };
+  now.ls = out(8), now.rs = out(12);
+  Last& was = last[user_index];
+  const bool keyboard = PlayerPadType(user_index) == PadType::kKeyboard;
+  const bool pressed = (now.buttons & ~was.buttons) || (now.lt && !was.lt) || (now.rt && !was.rt) ||
+                       (now.ls && !was.ls) || (!keyboard && now.rs && !was.rs);
+  was = now;
+  if (pressed && g_last_input.exchange(int(user_index)) != int(user_index) && std::getenv("SVR2011_PAD_ICONS_LOG"))
+    REXLOG_INFO("[svr2011] pad icons: player {} pressed - shared pictures follow them", user_index + 1);
+}
+
 }  // namespace svr2011
 
 // The page search: sub_826AD450(font, code) -> the page holding code (or -1).
 REX_EXTERN(__imp__sub_826AD450);
 REX_HOOK_RAW(sub_826AD450) {
-  if (svr2011::g_enabled && ctx.r4.u32 >= svr2011::kFirstCode) svr2011::Prepare(ctx.r3.u32);
+  if (svr2011::g_enabled && ctx.r4.u32 >= svr2011::kFirstCode) {
+    // (debug: SVR2011_PAD_ICONS_LOG=2 - who looks icons up with no owner: the
+    // guest call chain, each new one once)
+    static const int chains = [] { const char* v = std::getenv("SVR2011_PAD_ICONS_LOG"); return v && *v >= '2' ? *v - '0' : 0; }();
+    if (chains && (svr2011::t_owner < 0 || chains >= 3)) {
+      std::string chain = fmt::format("{:08X}", uint32_t(ctx.lr));
+      uint32_t sp = ctx.r1.u32;
+      for (int k = 0; k < 10; ++k) {  // (each frame a little above the last: the stack's own)
+        const uint32_t next = svr2011::Rd32(base + sp);
+        if (next <= sp || next - sp > 0x4000 || (next & 0xFFF) == 0) break;  // (page-aligned: the stack's top)
+        sp = next;
+        chain += fmt::format(" {:08X}", svr2011::Rd32(base + sp - 8));
+      }
+      static std::mutex m;
+      static std::set<std::string> seen;
+      std::lock_guard lock(m);
+      if (seen.insert(fmt::format("{} {}", svr2011::t_owner, chain)).second) REXLOG_INFO("pad icons: owner {}, code {:04X}: {}", svr2011::t_owner, ctx.r4.u32, chain);
+    }
+    svr2011::Prepare(ctx.r3.u32);
+  }
   __imp__sub_826AD450(ctx, base);
 }
 
@@ -537,40 +595,29 @@ uint32_t VersionOf(uint32_t object, Kind kind) {
 }
 
 // The game's 2D texture records (vtable 0x8205CF48, 0x70 bytes; +80 the D3D
-// texture object) and copies of them pointing at another version.
-struct RecordCopy {
-  uint32_t record = 0, object = 0;
-};
+// texture object).
 std::mutex g_records_mutex;
-std::map<std::pair<uint32_t, Kind>, RecordCopy> g_records;
-// {handle, record} pairs for the commands: a ring, as the commands are played
-// back later (one pair shared by a frame's commands gave each button the
-// last one's record - its size and place).
-constexpr uint32_t kPairs = 4096;
-std::atomic<uint32_t> g_pair_next{0};
-uint32_t NextPair() {
-  static const uint32_t pairs = [] { return g_memory->SystemHeapAlloc(kPairs * 8, 8); }();
-  if (!pairs) return 0;
-  return pairs + (g_pair_next.fetch_add(1, std::memory_order_relaxed) % kPairs) * 8;
-}
 
-uint32_t RecordVersion(uint32_t record, Kind kind) {
+// A texture record's picture for a player's kind: the version's copy for
+// PlayStation / keyboard (record -> {the game's object, our copy}). The copy
+// is only put in the record while the record is bound for drawing
+// (sub_826E6060, below): a copy left in the record was freed by the game
+// with the record (a match with a keyboard player crashed at load: the
+// game's heap free of an object from the port's system heap).
+struct RecordWant {
+  uint32_t original, copy;
+};
+std::map<uint32_t, RecordWant> g_record_want;
+
+void SwapRecordObject(uint32_t record, Kind kind) {
   constexpr uint32_t kTextureRecord = 0x8205CF48;  // (vtable)
-  if (!Readable(record) || Rd32(g_base + record) != kTextureRecord || Rd32(g_base + record + 52) != 0) return 0;
-  const uint32_t object = Rd32(g_base + record + 80);
-  const uint32_t version = VersionOf(object, kind);
-  if (!version) return 0;
+  if (!Readable(record) || Rd32(g_base + record) != kTextureRecord || Rd32(g_base + record + 52) != 0) return;
+  const uint32_t original = Rd32(g_base + record + 80);
+  uint32_t want = 0;
+  if (kind == kPlayStation || kind == kKeyboard) want = VersionOf(original, kind);
   std::lock_guard lock(g_records_mutex);
-  RecordCopy& c = g_records[{record, kind}];
-  if (!c.record) c.record = g_memory->SystemHeapAlloc(0x70, 32);
-  if (!c.record) return 0;
-  // (refreshed at every use: the game updates its record - the picture's
-  // size and place on screen - and a copy taken once drew the button squeezed
-  // into an old size)
-  std::memcpy(g_base + c.record, g_base + record, 0x70);
-  Wr32(g_base + c.record + 80, version);
-  c.object = version;
-  return c.record;
+  if (want) g_record_want[record] = RecordWant{original, want};
+  else g_record_want.erase(record);
 }
 
 // The player behind a character select slot: its setup record's controller
@@ -663,18 +710,17 @@ REX_HOOK_RAW(sub_826DE6B0) {
     if (auto it = g_sprites_hud.find(ctx.r4.u32 - 0x110); it != g_sprites_hud.end())
       sprite_owner.emplace(ResolveHud(it->second));
   }
+  // (the player's version goes into the record itself, +80: playback binds
+  // the record the game keeps, not a copy put in the command - a copy left
+  // the picture with no texture of its own, drawn with the font page bound
+  // before it: the "glitched" keyboard picture on character select)
+  // (per record: a copy of the record in the sprite's pair - +0x110, its own -
+  // isn't bound at playback either, the picture showed the font page again;
+  // so the COM panel, which shares player 1's bottom bar record, shows player
+  // 1's version too)
   if (g_enabled && t_owner >= 0 && ctx.r4.u32) {
-    const Kind kind = CurrentKind(false);
-    if (kind == kPlayStation || kind == kKeyboard) {
-      const uint32_t record = Readable(ctx.r4.u32) ? Rd32(base + ctx.r4.u32 + 4) : 0;
-      if (const uint32_t copy = record ? RecordVersion(record, kind) : 0) {
-        if (const uint32_t pair = NextPair()) {
-          Wr32(base + pair, Rd32(base + ctx.r4.u32));
-          Wr32(base + pair + 4, copy);
-          ctx.r4.u64 = pair;
-        }
-      }
-    }
+    const uint32_t record = Readable(ctx.r4.u32) ? Rd32(base + ctx.r4.u32 + 4) : 0;
+    if (record) SwapRecordObject(record, CurrentKind(false));
   }
   __imp__sub_826DE6B0(ctx, base);
 }
@@ -776,6 +822,28 @@ REX_HOOK_RAW(sub_82418B70) {
   __imp__sub_82418B70(ctx, base);
 }
 
+// A texture record bound for drawing: sub_826E6060(record, sampler) -
+// SetTexture(record + 80) (kind 0 records, +52 == 0). A record with a
+// version for its player draws the copy, then gets the game's object back.
+REX_EXTERN(__imp__sub_826E6060);
+REX_HOOK_RAW(sub_826E6060) {
+  using namespace svr2011;
+  const uint32_t record = ctx.r3.u32;
+  uint32_t original = 0, copy = 0;
+  if (g_enabled) {
+    std::lock_guard lock(g_records_mutex);
+    if (auto it = g_record_want.find(record); it != g_record_want.end()) {
+      if (Rd32(base + record + 80) == it->second.original && Rd32(base + record + 52) == 0)
+        original = it->second.original, copy = it->second.copy;
+      else
+        g_record_want.erase(it);  // (the record holds another picture now)
+    }
+  }
+  if (copy) Wr32(base + record + 80, copy);
+  __imp__sub_826E6060(ctx, base);
+  if (copy) Wr32(base + record + 80, original);
+}
+
 // - a character select panel: sub_82467C18(cursor + 28), the slot at +256;
 REX_EXTERN(__imp__sub_82467C18);
 REX_HOOK_RAW(sub_82467C18) {
@@ -804,5 +872,19 @@ REX_HOOK_RAW(sub_82917EC8) {
     if (kind == kPlayStation || kind == kKeyboard)
       if (const uint32_t version = VersionOf(ctx.r5.u32, kind)) ctx.r5.u64 = version;
   }
+  static const bool debug = std::getenv("SVR2011_PAD_ICONS_LOG") != nullptr;
+  if (debug && g_enabled && ctx.r5.u32) {
+    bool ours = false;
+    {
+      std::lock_guard lock(g_copies_mutex);
+      for (const auto& [key, c] : g_copies) ours |= c.object == ctx.r5.u32;
+    }
+    static std::set<uint32_t> logged;
+    if (ours && logged.insert(ctx.r5.u32).second && logged.size() < 64)
+      REXLOG_INFO("[svr2011] pad icons: SetTexture sampler {} gets copy {:08X} fetch {:08X} {:08X} kind {}", ctx.r4.u32,
+                  ctx.r5.u32, Rd32(base + ctx.r5.u32 + 0x1C), Rd32(base + ctx.r5.u32 + 0x20), int(CurrentKind(false)));
+  }
   __imp__sub_82917EC8(ctx, base);
 }
+
+

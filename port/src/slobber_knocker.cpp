@@ -16,11 +16,14 @@
 // match ends when player 1 loses. The number beaten is shown over the match.
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cfloat>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <cstring>
 #include <set>
 #include <string>
@@ -217,8 +220,9 @@ void SlobberKnockerUpdate(PPCContext& ctx, uint8_t* base) {
 // The falls / match-end judge: sub_82245618(...) -> 1 when the match is over.
 REX_EXTERN(__imp__sub_82245618);
 REX_HOOK_RAW(sub_82245618) {
-  svr2011::ThreeStagesBeforeJudge(base);  // (three_stages.cpp: a fall that doesn't end the match)
+  svr2011::ThreeStagesBeforeJudge(ctx, base);  // (three_stages.cpp: a fall that doesn't end the match)
   svr2011::LumberjackBeforeJudge(base);   // (match_types.cpp)
+  svr2011::GauntletEliminatorBeforeJudge(ctx, base);  // (gauntlet_eliminator.cpp: a fall that eliminates)
   // Test aid: SVR2011_TEST_FALL_LOG=1 - every match: the characters each time
   // one's state / lost byte changes, and the judge's result.
   static const bool fall_log = std::getenv("SVR2011_TEST_FALL_LOG") != nullptr;
@@ -301,20 +305,62 @@ REX_HOOK_RAW(sub_828061E8) {
 // fatal-4-way ELIMINATION) it reads past NULL further on (guest 0x1BC, the
 // character's +444, PC repro): +20 becomes another character still in the
 // match (state 0, another team) before it runs; with none, it's skipped.
+namespace {
+std::mutex g_targets_mutex;
+std::map<uint32_t, uint32_t> g_targets;  // character -> its AI pair's +20, last update
+}  // namespace
 REX_EXTERN(__imp__sub_8280CFD0);
 REX_HOOK_RAW(sub_8280CFD0) {
   const uint32_t pair = ctx.r3.u32;
   // (not at a match's start - there +20 is empty until the game sets it - and
   // only for a competitor: not the referee or the commentators, teams 30+)
   const uint32_t self = pair ? Rd32(base + pair) : 0;
-  if (self && !Rd32(base + pair + 20) && Rd32(base + self + kTeam) < 30 &&
-      int32_t(Rd32(base + 0x82E3CD0C)) > 300) {
-    uint32_t other = 0;
-    for (uint32_t i = 0; i < 6 && !other; ++i) {
+  // (GAUNTLET ELIMINATOR: one alone in the ring while the next entrant walks
+  // down - the game's own pick of an opponent found none and read past NULL
+  // in the same place: until someone is at ringside, the update is skipped)
+  const auto at_ringside = [&](uint32_t c) {
+    uint32_t x, z;
+    std::memcpy(&x, base + c + 288, 4), std::memcpy(&z, base + c + 296, 4);
+    x = __builtin_bswap32(x), z = __builtin_bswap32(z);
+    float fx, fz;
+    std::memcpy(&fx, &x, 4), std::memcpy(&fz, &z, 4);
+    return std::fabs(fx) < 58.0f && std::fabs(fz) < 58.0f;  // (the ramp starts at about z 60)
+  };
+  const auto valid_other = [&] {
+    for (uint32_t i = 0; i < 6; ++i) {
       const uint32_t c = Rd32(base + kChars + i * 4);
-      if (c && c != self && base[c + kState] == 0 && !base[c + kLost] && Rd32(base + c + kTeam) != Rd32(base + self + kTeam))
-        other = c;
+      if (c && c != self && base[c + kState] == 0 && !base[c + kLost] && Rd32(base + c + kTeam) < 30 &&
+          Rd32(base + c + kTeam) != Rd32(base + self + kTeam) && at_ringside(c))
+        return c;
     }
+    return 0u;
+  };
+  if (self && svr2011::GauntletEliminatorMatch() && Rd32(base + self + kTeam) < 30 && !valid_other()) {
+    static int alone = 0;
+    if (++alone <= 10 || alone % 1000 == 0)
+      REXLOG_INFO("match types: a character with no opponent in the ring ({:08X}) - skipped ({} times)", self, alone);
+    return;
+  }
+  // (B13, Android: a Road to WrestleMania gauntlet froze 1-2 moves after the
+  // next entrant came in - reads of guest 0x1BC over and over, as here; the
+  // story match's clock may start again with each entrant, and the guard only
+  // ran after match frame 300. Now also a pair that had an opponent earlier
+  // in this match - the start, where the game fills +20 itself, stays as it
+  // was. SVR2011_TEST_PAIR_OLD=1 the old way.)
+  static const bool old_way = std::getenv("SVR2011_TEST_PAIR_OLD") != nullptr;
+  bool had = false;
+  {
+    static std::mutex m;
+    static std::set<uint32_t> pairs;  // (pairs that have had an opponent this match)
+    static uint32_t first = 0;        // (person 0: a new one, a new match)
+    std::lock_guard lock(m);
+    if (const uint32_t c = Rd32(base + kChars); c != first) first = c, pairs.clear();
+    if (pair && Rd32(base + pair + 20)) pairs.insert(pair);
+    had = pair && pairs.count(pair) && !old_way;
+  }
+  if (self && !Rd32(base + pair + 20) && Rd32(base + self + kTeam) < 30 &&
+      (had || int32_t(Rd32(base + 0x82E3CD0C)) > 300)) {
+    const uint32_t other = valid_other();
     static int count = 0;
     if (++count <= 10 || count % 1000 == 0)
       REXLOG_INFO("match types: a character's opponent was gone ({:08X}) - {} ({} times)", self,
@@ -323,4 +369,16 @@ REX_HOOK_RAW(sub_8280CFD0) {
     Wr32(base + pair + 20, other);
   }
   __imp__sub_8280CFD0(ctx, base);
+  if (self) {  // (research aid: the stuck-wrestler log's AI target - match_types.h AiTargetOf)
+    std::lock_guard lock(g_targets_mutex);
+    g_targets[self] = Rd32(base + pair + 20);
+  }
 }
+
+namespace svr2011 {
+uint32_t AiTargetOf(uint32_t character) {
+  std::lock_guard lock(g_targets_mutex);
+  const auto it = g_targets.find(character);
+  return it == g_targets.end() ? 0 : it->second;
+}
+}  // namespace svr2011

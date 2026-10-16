@@ -17,6 +17,7 @@
 #include <spdlog/sinks/base_sink.h>
 
 #include "keyboard_typing.h"
+#include "pad_types.h"
 #include "story_designer.h"
 #include "touch_controls.h"
 
@@ -25,6 +26,9 @@ namespace svr2011 {
 namespace {
 
 constexpr auto kDevice = static_cast<rex::input::DeviceId>(0x53435254);  // 'SCRT'
+// Test aid: "connect" - a second, idle pad connects now (a controller nobody holds, joining late).
+constexpr auto kExtraDevice = static_cast<rex::input::DeviceId>(0x53435255);
+std::atomic<bool> g_extra_pad{false};
 constexpr auto kPollInterval = std::chrono::milliseconds(100);
 
 uint16_t ParseButtons(const std::string& spec) {
@@ -97,6 +101,18 @@ class UntilSink final : public spdlog::sinks::base_sink<std::mutex> {
 
 }  // namespace
 
+// The "until" steps' sink: added once at setup (svr2011_app.cpp, before any
+// game thread). rex::AddSink pushes onto each logger's sinks without a lock,
+// and spdlog walks them unlocked while it logs: added at the first poll (a
+// few seconds in), it raced the game files check thread's log line - a test
+// game crashed in spdlog's flush_ 4 s after start.
+void InstallScriptLogSink() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  rex::AddSink(std::make_shared<UntilSink>());
+}
+
 ScriptInputDriver::ScriptInputDriver(std::filesystem::path command_file)
     : InputDriver(nullptr, 0), file_(std::move(command_file)) {
   // (a copy the game restarted itself into - online_overlay.cpp: the commands
@@ -117,7 +133,17 @@ void ScriptInputDriver::EnumerateDevices(std::vector<rex::input::DeviceInfo>& ou
   rex::input::DeviceInfo info;
   info.id = kDevice;
   info.name = "Script";
+  // Test aid: SVR2011_TEST_SCRIPT_AS_KEYBOARD=1 - the scripted controller is listed as the keyboard (its name,
+  // no controller number), the players' order as with a keyboard player (pad_types.cpp)
+  static const bool as_keyboard = std::getenv("SVR2011_TEST_SCRIPT_AS_KEYBOARD") != nullptr;
+  if (as_keyboard) info.name = "Keyboard and Mouse", info.synthetic = true;
   out.push_back(info);
+  if (g_extra_pad.load()) {
+    rex::input::DeviceInfo extra;
+    extra.id = kExtraDevice;
+    extra.name = "Test Pad";
+    out.push_back(extra);
+  }
 }
 
 void ScriptInputDriver::ParseLine(const std::string& line) {
@@ -159,6 +185,14 @@ void ScriptInputDriver::ParseLine(const std::string& line) {
     (side == "R" || side == "r" ? step.right_trigger : step.left_trigger) =
         static_cast<uint8_t>(std::clamp(v, 0, 255));
     queue_.push_back(step);
+  } else if (verb == "connect") {  // (test aid: an idle pad connects - applied as the line is read)
+    g_extra_pad = true;
+    REXLOG_INFO("script input: connect - an idle Test Pad connects");
+  } else if (verb == "padtype") {  // (test aid: pad_types.h - applied as the line is read)
+    int player = 0;
+    std::string type;
+    in >> player >> type;
+    if (player >= 1) svr2011::SetTestPadType(uint32_t(player - 1), type);
   } else if (verb == "wait") {
     in >> step.ms;
     queue_.push_back(step);
@@ -306,9 +340,8 @@ void ScriptInputDriver::PollFile() {
 
 ScriptInputDriver::Step ScriptInputDriver::CurrentStep() {
   std::lock_guard lock(mutex_);
-  if (!started_) {  // (the first poll: the logger is up)
+  if (!started_) {  // (the first poll; the "until" sink was added at setup: InstallScriptLogSink)
     started_ = true;
-    rex::AddSink(std::make_shared<UntilSink>());
     if (const char* route = std::getenv("SVR2011_ROUTE"); route && *route && !std::getenv("SVR2011_RELAUNCHED"))
       ParseLine(std::string("route ") + route);
   }
@@ -492,6 +525,10 @@ bool ScriptInputDriver::RunSmart(Clock::time_point now, Step& out) {
 }
 
 X_RESULT ScriptInputDriver::GetDeviceState(rex::input::DeviceId id, X_INPUT_STATE* out_state) {
+  if (id == kExtraDevice && g_extra_pad.load()) {  // (the idle Test Pad: nothing pressed)
+    if (out_state) std::memset(out_state, 0, sizeof(*out_state));
+    return X_ERROR_SUCCESS;
+  }
   if (id != kDevice) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -512,7 +549,7 @@ X_RESULT ScriptInputDriver::GetDeviceState(rex::input::DeviceId id, X_INPUT_STAT
 
 X_RESULT ScriptInputDriver::GetDeviceCapabilities(rex::input::DeviceId id, uint32_t,
                                                   X_INPUT_CAPABILITIES* out_caps) {
-  if (id != kDevice) {
+  if (id != kDevice && !(id == kExtraDevice && g_extra_pad.load())) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (out_caps) {

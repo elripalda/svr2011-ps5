@@ -538,3 +538,96 @@ A No DQ match with weapons already lying in and around the ring at the bell.
 - **Not tested:** fatal-4-way IRONMAN stuck once (already allowed by the game).
 
 **Test aids:** `SVR2011_TEST_MC="<saved byte>=<value>,..."`, `SVR2011_TEST_MC_OLD=1` (the game's own tables).
+
+## Hell in a Cell: Tables & Ladders (done)
+
+**Menu:** each HELL IN A CELL row (ONE ON ONE 0x31, TWO ON TWO 0x32, TRIPLE THREAT 0x33, FATAL-4-WAY 0x34) becomes a submenu: HELL IN A CELL, then TABLES & LADDERS. Not the 6-man cell (0x35): the Extreme Rules option (+56) that loads the table and ladder models crashed 6-man matches. Switch mod `hiac_tables_ladders`.
+
+**How:** the WEAPONS EVERYWHERE machinery (`match_types.cpp`): the rule's placed-weapon list is swapped for `kPlacedCell` while the weapons are made and placed, and the live rules get the Extreme Rules bytes (+3 0, +10 0, +27 0x80, +56 1).
+- The cell's walls are at about ±55 (the AI's wall zone runs 40.3-55.3). Weapons at 44 from the middle ended up against the wall and the CPUs couldn't pick them up (8 tries, nothing in hand); at 40 they can.
+- Tested: 1-on-1 and triple threat, CPU vs CPU, 150-180 s each. The weapons are made, the CPUs go for the ladders and use them (a weapon in hand 48-60 s of a minute), no crash.
+- Test aid: `SVR2011_TEST_MODE=cell_weapons` (ONE ON ONE NORMAL plays it); with `SVR2011_TEST_RULE=33` the triple threat one.
+
+## Hell in a Cell roof (research, 2026-10-08)
+
+- The game has roof fighting: help texts CLIMB CELL WALL, STOP CLIMBING CELL, CLIMB DOWN FROM CEILING, SHOVE OPPONENT OFF CEILING, BREAK CELL CEILING (grapples on the two breakable middle sections), CELL SIGNATURE / FINISHER; commentary "THROWN FROM THE TOP OF THE CELL", "RIGHT THROUGH THE CELL".
+- The cell is live option +20 (118 functions read it through `sub_825740C8`). `sub_828B4758` (rule 0x31-0x35) has one caller.
+- The roof is a level reached through the climb, not ground at a height:
+  - a person's height (+292) written in a match is put back within a second;
+  - the start table (`sub_822AD738`, y in tenths) at -900: the game puts the person on the floor under the spot (the ring).
+- The AI has a cell-wall climbing zone (type 10, `sub_8281B040`: x 40.3-55.3).
+- The on-roof state (2026-10-13): area +444 = 10, set by the ground function `sub_8218EB88` from the REAL position vector *(char+304) (+288..296 is a copy; y is down: the roof is y -60.5, |x|,|z| < 55.3). The collision step keeps area 10 people on the roof (`sub_821E5910`), over a broken panel it drops them. No climb history needed: shove-off (1640/1641), break-through (1674, panel flags 0x82E2BE7C bits 0x2 / 0x8) and climbing down (1672/1681) key off the area, position, motion and the flags. No pins on the roof (`sub_8218DF58`: area 0 only; FCA any area but 10).
+- **Built: HELL IN A CELL: START ON THE ROOF** (each cell submenu, switch mod `hiac_roof_start`; online a PORT RULES option on the cell rules): from the bell for 1.5 s everyone is held at a corner spot (±30, ±30, off the middle panels) - on the roof from the match's first frame. CPUs fight up there; with no pins they can go on long (a 4-CPU fatal-4-way stayed up 4 min) - the game's own ways down (shove-off, break-through, climbing down) end it; no safety net (setting the panels' break flags alone left the roof model whole: an invisible hole). CPUs left alone up there climb down (below). Tested 1v1 (P1 idle: thrown off after ~1 min), 2v2 and fatal-4-way (down by ~2 min), online 1v1 (same on both).
+
+**CPUs alone on the roof climb down** (any cell match): a CPU (match slot controller -8 = 1 and controller port +1152 >= 4; humans never) alone on the roof (area +444 10, no other wrestler 0-5 up there) for 25 s of match frames takes the game's own climb-down - the action button pushed towards an edge: from its free state (post-hook of `sub_82292D50`, char = *(state+280)) the octant +2212 is set towards the farthest-out side (0 -z, 2 -x, 4 +z, 6 +x; > 20 out), the game's edge check `sub_821BE8F8` asked, then `sub_82397228(char, 1672)` (as the action dispatcher `sub_8230A760` does). Only match state decides (frames, places, slots): the same on both machines online. A CPU alone up there often comes down by itself within seconds; the stuck cases were fights up there. Test aids: `SVR2011_TEST_ROOF_DOWN=0` off, `SVR2011_TEST_ROOF_DOWN_SECS=<s>`, `SVR2011_TEST_ROOF_DOWN_LOG=1`, `SVR2011_TEST_ROOF_SKIP=<person>` (starts in the ring). Tested 1v1 (CPU alone, wait 1 s): climbed down, landed by the ring, the match went on; an idle human alone up there 2+ min was left alone.
+
+- Test aids: `SVR2011_TEST_CELL=1` (each second: the first two people's position, +441, +444, motion, +516), `SVR2011_TEST_CELL_ROOF=<y>` (put them at that height at frame 180), `SVR2011_TEST_CELL_START=<y tenths>` (the start table).
+
+## Gauntlet Eliminator (done)
+
+**Menu:** HANDICAP -> GAUNTLET ELIMINATOR and G. ELIMINATOR: EXTREME RULES (after SLOBBER KNOCKER). Switch mod `gauntlet_eliminator`.
+
+**How (`gauntlet_eliminator.cpp`, set-up in `match_types.cpp`):** the gauntlet rule 0x52 for six (its record's people count is a big-endian u16: 0x0600 crashed the set-up), each on his own team. Player 1 and the first opponent are picked on the 1 on 1 select screen; the four entrants are random (kind 3, waiting).
+- Entries: at 1:00, 2:00, 3:00, 4:00 the next waiter's state goes 0 (as the judge brings one in) and the gauntlet's entry task walks him down; sooner when only one is left in the ring. Setting only the entry time (info +40) did nothing for waiters of other teams.
+- Eliminations: before the falls judge, a fall that doesn't decide the match puts the loser out (state 4: he leaves) and takes the fall back. The last fall is the judge's: it ends the match with the pinner as the winner.
+- The AI's opponent-pair update (`sub_8280CFD0`) read past NULL when one was alone in the ring while the next entrant walked down: its own opponent pick found nobody. In this match the update is skipped while no opponent is at ringside (|x|, |z| < 58).
+- EXTREME RULES: 6-man's weapons (chairs, hand weapons; no +56) and DQ off (live +4 1).
+- HUD: "N LEFT    NEXT ENTRANT m:ss".
+- Tested: CPU vs CPU, 330 s with a forced fall every 35 s: four eliminations, the entrants in on time, the judge ended the match (winner 5); the EXTREME RULES one 150 s. Test aids `SVR2011_TEST_MODE=gauntlet_eliminator` / `gauntlet_eliminator_er`, `SVR2011_TEST_GE_BEAT=<s>`, `SVR2011_TEST_GE_LOG=1`.
+
+## Steel Cage / Inferno: Weapons Inside (done)
+
+**Menu:** each STEEL CAGE row (0x3C-0x3F) and INFERNO MATCH (0x51) becomes a submenu: the match, then WEAPONS INSIDE. Switch mods `cage_weapons`, `inferno_weapons`. Same machinery as HELL IN A CELL: TABLES & LADDERS (`kStructures` in `match_types.cpp`).
+- Weapons in the ring (`kPlacedRing`): three chairs and the hand weapons every match loads (102, 72, 28). Not tables or ladders: with the Extreme Rules option (+56, which loads those models) the cage crashed at its start (`sub_824186E8` with no event data, as 6-man did). No DQ (live +4 1).
+- Tested: CPU vs CPU, 120 s each. Weapons placed in the ring, inside the ropes (the Inferno's fire stays outside them), no crash.
+- Test aids: `SVR2011_TEST_MODE=cage_weapons` / `inferno_weapons`.
+
+## Three Stages of Hell: sets of stages (done)
+
+**Menu:** THREE STAGES OF HELL (EXTREME RULES submenus, and 6-MAN / HANDICAP) is a submenu of sets:
+- NORMAL / FCA / LMS (as before), NORMAL / BLOOD / FINISHER, NORMAL / LMS / SUBMISSION - every mode;
+- CELL: BLOOD / LMS / SUB - one on one, two on two, triple threat, fatal-4-way, played as that mode's Hell in a Cell (0x31-0x34: the cell stands from the bell).
+- TABLE / LADDER / TABLE and TABLE / TLC / LADDER - one on one, two on two, triple threat, fatal-4-way, played as that mode's TLC match (0x48-0x4B: tables, ladders and the prize from the bell). Switch mod `three_stages_tables_ladders` (inside the Three Stages submenu); online PORT RULES options on the TLC rules.
+Under the `three_stages_of_hell` switch mod.
+
+**The prize hangs again** (sets 3 and 5): a fall for the prize is the climb controller's lost code 6 (`sub_8223D7E8` / `sub_8223C170`; `SetLost` = `sub_82243660(char, reason, by)`). The climber keeps it as his held weapon (char +1828 = prize +1152) and stays in the prize-held pose 28113, which only ends with the match. For a prize fall that doesn't end the match - or a prize taken in a table stage, which doesn't count - `three_stages.cpp` takes the fall back (again for 1.5 s, the controller may give it again), then:
+- the climber lets go (+1828 = -1) and falls off his ladder the game's own way when a ladder goes over (`sub_82289118`): the ladder object (table 0x82DE0220, type +80 11) he is on gets +44 -1, +96 0, then `sub_82396E80(char, 28159, 6, 0, 0.0)` (28160 / 28364 are the other falls; r5 6 = the ladder motion class, char +216);
+- the prize manager (pointer at 0x82E3BC30; +52 the prize, +112 pull count) re-hangs it: `sub_8223BA48(manager)` (vtable +16), the game's own at a match (re)start - the prize back at its hang spot, its state block from its template, the hooks / rope re-placed.
+- Motions: 28110 hanging from the prize (pulls; a pull wins at the 4th 10 %, 5th 30 %, then always), 28113-28115 the prize pulled down / held, 1641-1643 the other grab; 20500 standing idle. A ladder +212 15010 = standing.
+- Tested: set 5 from its ladder fall (CPU vs idle P1) - the prize fall counted, the climber fell off, the prize hung again, fall 3 (TABLE) went on.
+
+**How (`three_stages.cpp` kSets / ApplyStage):** each stage starts from the match's own rules (saved at its first update) and sets only what wins a fall: +1 pinfall, +7 give up, +17 falls count anywhere, +18 table, +19 ladder, +24 TLC, +26 last man standing, +40 first blood. What loads at the bell (a cell, a cage, the prize, table / ladder models) can't change mid-match, so a set needing one is played in that rule from the start.
+- Count-outs are off in every stage: a count-out ends the match outside the falls judge (a normal fall 1 ended so).
+- Fall 1's rules are applied when the match itself starts (`InMatch`), not on the clock left over from the title's demo match.
+- FIRST BLOOD is the game's own rule (+40); with CPUs it is slow - in the game's own First Blood match (0x29) nobody bled in 4 minutes either.
+- FINISHERS (the port's): a pin or submission counts only within 10 s after a finisher or signature move's cinematic (the world held: `frame_rate.cpp`'s paused round calls `ThreeStagesCinematic`); any other fall is taken back. It does NOT check who did the move: during the cinematic both people play the same paired motion and point at each other (+96), and no attacker / defender field showed in their first 0x3000 bytes.
+- Test aids: `SVR2011_TEST_3S_SET=<0-4>` (with `SVR2011_TEST_MODE=three_stages`, and `SVR2011_TEST_RULE` the set's match), `SVR2011_TEST_3S_STAGE=<0-2>` (start at that stage), `SVR2011_TEST_PAUSE_LOG=1` (the world held), `SVR2011_TEST_CHAR_DUMP=<file>` (the first two people every 6 updates).
+
+## Online Player Match: match types (2026-10-09)
+
+**The online CREATE SESSION -> MATCH TYPE screen** (native code; its data static in the image):
+- Categories at 0x82028D10: {label 4E2C.., list, count}; each list holds online type ids (1-0x1A).
+- Online types at 0x82028A60: {id, list, count}, a list of {rule, 0, 0} (12 bytes) per people count. 1v1: type 1 NORMAL 0x00; 2 LADDER 0x48, 0x37; 3 EXTREME RULES 0x51, 0x2B, 0x36, 0x3B, 0x43, 0x44, 0x4D; 4 CAGE 0x31, 0x3C, 0x40; 5 BACKSTAGE 0x1B-0x21. 3-man ER is type 0xB (0x46, 0x2F, 0x4F).
+- Names: rule record +60 through the string lookup (`sub_82520270`).
+- Not used by it: the people lists at 0x8201C488 (`sub_82470818`) and the Match Creator families.
+- The session carries the rule (property 0x1000000C), so a joiner plays it as any rule.
+
+**FIRST BLOOD online (done):** types 3 and 0xB get 0x29 / 0x2A before EXTREME RULES MATCH (lists copied to port memory; the image's records made writable for the two words). Switch mod `online_first_blood`. Tested: listed, picked, session created, lobby "FIRST BLOOD".
+
+**The port's own types:** not as pseudo rules (no free rule ids: 0x53-0x62 are story/special, and the online flow reads the record's people/slots throughout). Design B: a game-styled PORT RULES row on CREATE SESSION (LB/RB, touch, mouse), session property 0x1000F001 = mode << 16 | set (p2p.h `SetPortRules` / `PortRules`, online-207), the same panel read-only in the lobbies; applied before setup on both sides.
+- Research aid: `SVR2011_TEST_ONLINE_TRACE=1` (family lookups, list getters, rule-record getter, with callers).
+- **Done (online_rules.cpp).** Choices by rule: normal 1v1/tag/3-man/4-man, 6-man, handicap: NONE, WEAPONS EVERYWHERE (played as the Extreme Rules rule 0x4D-0x50 where there is one), Three Stages sets 0-2; Extreme Rules 0x4D-0x50: WEAPONS EVERYWHERE; Hell in a Cell 0x31-0x34: TABLES & LADDERS, the cell Three Stages set; cage/inferno 0x3C-0x3F, 0x51: WEAPONS INSIDE. Hidden in Ranked (`P2PRanked()`).
+- CREATE SESSION is the class with vtable 0x82023D50: made by `sub_824EAD88`, freed by `sub_824EBB78` when the session is created; `sub_824EBFF0` runs each frame of its life, `sub_824EAAF8` twice a frame while it is on top (once while the MATCH TYPE list covers it).
+- The picked match: the screen reads its name through the rule-name helper `sub_824CCB38` (rule in r3) from 0x824EB3B8, as it is made and when the MATCH TYPE list returns. Not it: the session-info property-6 read `sub_824FDC78` (search results only), and 0x1000000C (not set before CONTINUE).
+- The MATCH TYPE list sets up matches (`sub_827374A0`) as it is browsed: the rules are applied only while no CREATE SESSION exists.
+- Tested (2026-10-09): host cycles on normal and HIAC; LAN host + joiner: the joiner gets 00010000 before joining, both set up rule 00 as 0x4D, the lobby panel on both. The match itself not watched yet.
+
+## Live rule bytes (corrected 2026-10-12, B11)
+
+The live rules are the first 64 bytes of the match struct at 0x82E3DE00 (built by `sub_828C48E8`, which masks every byte with 0x7F at its end: live bytes never hold the 0x80 lock bit).
+- **+27 DISQUALIFICATION** (0 off). The referee's DQ count (`sub_822473B0`, `sub_82246BF0`) runs only when it is non-zero. Writing the record's locked value 0x80 after the mask left DQ on, and the pause menu's MATCH RULES row showed "Press Start Button" (its ON/OFF string table indexed past its end).
+- **+4 RING OUT: no exiting** (1), **+5 count-out** (0 off, else the count). Not DQ, as older notes here said.
+- **+3 rope breaks**, +37 elimination, +1 pin / give up, +8 time limit, +2 K.O.
+- MATCH CREATOR rows (saved record): +15 DQ -> live +27, +16 rope breaks -> +3, +17 ring out / count-out -> +4/+5.
+- The rule record (100 bytes) +8: 2 where everyone is legal (triple threat, fatal-4-way, tornado 0x0F, 2 on 2 Extreme Rules 0x4E), 0 in tag rules. 6-MAN WEAPONS EVERYWHERE sets it (a tornado 6-man), restored after the match.
+- 6-MAN WEAPONS EVERYWHERE now: tornado, DQ off, count-outs off, out of the ring allowed; floor weapons on the camera side at z 45 (at z 54-55 they lay against the barrier, and a wrestler picking one up froze, B11).

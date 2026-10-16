@@ -31,7 +31,11 @@ set(SVR2011_SOURCES
     src/discord_presence.cpp
     src/online.cpp
     src/online_net.cpp
+    src/online_files.cpp
+    src/online_cpu.cpp
     src/online_cas.cpp
+    src/online_mods.cpp
+    src/online_chat.cpp
     src/online_overlay.cpp
     src/leaderboards.cpp
     src/menu_hooks.cpp
@@ -40,13 +44,23 @@ set(SVR2011_SOURCES
     src/dlc.cpp
     src/caw_logos.cpp
     src/user_movies.cpp
+    src/cae_mod_motions.cpp
+    src/cam_mod_moves.cpp
     src/entrance_media.cpp
     src/movie_transcode.cpp
+    src/hd_movies.cpp
     src/p2p.cpp
+    src/net_stats.cpp
+    src/net_sim.cpp
     src/paint_pages.cpp
     src/match_types.cpp
     src/match_hud.cpp
     src/slobber_knocker.cpp
+    src/gauntlet_eliminator.cpp
+    src/movie_sync.cpp
+    src/port_map.cpp
+    src/thread_cpu.cpp
+    src/online_rules.cpp
     src/three_stages.cpp
     src/mystery_opponent.cpp
     src/backgrounds_page.cpp
@@ -55,7 +69,11 @@ set(SVR2011_SOURCES
     src/sort_filters.cpp
     src/arena_mods.cpp
     src/ring_rules.cpp
+    src/hctp_room.cpp
+    src/hair_dump.cpp
     src/superstar_mods.cpp
+    src/universe_mods.cpp
+    src/universe_welcome.cpp
     src/crowd_signs.cpp
     src/media_mods.cpp
     src/move_packs.cpp
@@ -69,6 +87,7 @@ set(SVR2011_SOURCES
     src/title_belts.cpp
     src/post_effects.cpp
     src/replays.cpp
+    src/reel_save.cpp
     src/replay_worker.cpp
     src/pad_types.cpp
     src/pad_icons.cpp
@@ -76,6 +95,7 @@ set(SVR2011_SOURCES
     src/test_match.cpp
     src/managers.cpp
     src/small_rig.cpp
+    src/pose_dump.cpp
     src/game_files.cpp
 )
 
@@ -87,6 +107,7 @@ if(SVR2011_D3D_TRACE)
 else()
     # Native renderer (native_renderer=main), drawing through plume. Its hooks
     # overlap the census hooks, so it is left out of census builds.
+    list(APPEND SVR2011_SOURCES src/model_mem.cpp)   # hooks sub_82914DD0, as the census does
     list(APPEND SVR2011_SOURCES
         src/native/gpu.cpp
         src/native/backend_vulkan.cpp
@@ -135,7 +156,8 @@ if(NOT SVR2011_BUILD_COMMIT)
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" "${CMAKE_CURRENT_SOURCE_DIR}/BUILD_COMMIT.txt")
-set_source_files_properties(src/svr2011_app.cpp PROPERTIES COMPILE_DEFINITIONS
+# (online_files.cpp too: the online version gate compares it with the newest release)
+set_source_files_properties(src/svr2011_app.cpp src/online_files.cpp PROPERTIES COMPILE_DEFINITIONS
     "SVR2011_PORT_VERSION=\"${SVR2011_PORT_VERSION}\";SVR2011_BUILD_COMMIT=\"${SVR2011_BUILD_COMMIT}\"")
 
 # Windows only: XAudio2 audio, crash reports, PC music (XAudio2 + Media
@@ -175,7 +197,29 @@ if(NOT WIN32 AND NOT ANDROID)
 endif()
 
 if(WIN32)
-    add_executable(svr2011 WIN32 ${SVR2011_SOURCES} src/svr2011.rc)
+    # The release version (VERSION.txt) for the programs' version information
+    # (src/svr2011.rc, launcher/launcher.rc): version_info.h, e.g. 2,1,3,0 / "2.1.3.0".
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" SVR2011_RC_VERSION LIMIT_COUNT 1)
+    string(STRIP "${SVR2011_RC_VERSION}" SVR2011_RC_VERSION)
+    string(REGEX MATCHALL "[0-9]+" SVR2011_RC_PARTS "${SVR2011_RC_VERSION}")
+    list(LENGTH SVR2011_RC_PARTS SVR2011_RC_COUNT)
+    while(SVR2011_RC_COUNT LESS 4)
+        list(APPEND SVR2011_RC_PARTS 0)
+        math(EXPR SVR2011_RC_COUNT "${SVR2011_RC_COUNT} + 1")
+    endwhile()
+    list(SUBLIST SVR2011_RC_PARTS 0 4 SVR2011_RC_PARTS)
+    string(REPLACE ";" "," SVR2011_RC_NUM "${SVR2011_RC_PARTS}")
+    string(REPLACE ";" "." SVR2011_RC_STR "${SVR2011_RC_PARTS}")
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/version_inc/version_info.h"
+        CONTENT "#define SVR2011_VER_NUM ${SVR2011_RC_NUM}
+#define SVR2011_VER_STR \"${SVR2011_RC_STR}\"
+")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt")
+    # (on the resource scripts only: a new version doesn't rebuild the sources)
+    set_property(SOURCE src/svr2011.rc launcher/launcher.rc APPEND PROPERTY INCLUDE_DIRECTORIES
+        ${CMAKE_CURRENT_BINARY_DIR}/version_inc)
+    # (src/utf8.manifest: UTF-8 code page - game folders with any letters)
+    add_executable(svr2011 WIN32 ${SVR2011_SOURCES} src/svr2011.rc src/utf8.manifest)
 elseif(ANDROID)
     # Android: libmain.so, which SDL's Java activity loads and starts (SDL_main).
     add_library(svr2011 SHARED ${SVR2011_SOURCES})
@@ -245,11 +289,15 @@ if(WIN32 OR ANDROID)
     target_include_directories(svr2011 PRIVATE launcher)
 endif()
 if(WIN32)
-    target_link_libraries(svr2011 PRIVATE xaudio2 ole32 winmm d3d12 d3d11 dxgi dxguid dbghelp ws2_32 winhttp
+    target_link_libraries(svr2011 PRIVATE xaudio2 ole32 winmm d3d12 d3d11 dxgi dxguid dbghelp ws2_32 iphlpapi winhttp
         mfplat mfreadwrite mfuuid delayimp)
     # d3d12.dll is loaded only when the game draws with Direct3D 12: Windows
     # without it (or GPUs without it, on Direct3D 11) still start the game.
     target_link_options(svr2011 PRIVATE -Wl,/DELAYLOAD:d3d12.dll)
+    # Media Foundation (user music, movie transcoding) only when used: a Windows
+    # "N" edition without the Media Feature Pack has no mfplat.dll and would not
+    # start the game at all (each use loads them with LoadLibraryExW first).
+    target_link_options(svr2011 PRIVATE -Wl,/DELAYLOAD:mfplat.dll -Wl,/DELAYLOAD:mfreadwrite.dll)
     # A PDB (function names + line tables) for crash reports and profiling.
     target_compile_options(svr2011 PRIVATE -gline-tables-only)
     target_link_options(svr2011 PRIVATE -Wl,/DEBUG)
@@ -284,35 +332,50 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${doc_path}")
     endforeach()
     add_executable(svr2011_modmaker WIN32
-        modmaker/app.cpp modmaker/arena_page.cpp modmaker/star_page.cpp modmaker/signs_page.cpp
-        modmaker/media_page.cpp modmaker/moves_page.cpp modmaker/anims_page.cpp modmaker/assets_page.cpp
+        modmaker/app.cpp modmaker/arena_page.cpp modmaker/star_page.cpp modmaker/simple_star.cpp modmaker/simple_steps.cpp modmaker/simple_arena.cpp modmaker/simple_port.cpp modmaker/disc_list.cpp modmaker/mod_check.cpp modmaker/signs_page.cpp modmaker/backgrounds_page.cpp
+        modmaker/media_page.cpp modmaker/full_preview.cpp modmaker/audio_out.cpp modmaker/video_mf.cpp modmaker/hair_sim.cpp modmaker/model_materials.cpp modmaker/material_panel.cpp modmaker/moves_page.cpp modmaker/anims_page.cpp modmaker/assets_page.cpp
         modmaker/icons_page.cpp modmaker/caw_page.cpp modmaker/help_page.cpp modmaker/other_page.cpp modmaker/match_page.cpp
-        modmaker/tool_run.cpp launcher/movie_maker.c launcher/bink_encode.c launcher/caw_import.c launcher/stfs.c
+        modmaker/tool_run.cpp modmaker/session_log.cpp launcher/movie_maker.c launcher/bink_encode.c launcher/caw_import.c launcher/stfs.c
+        launcher/setup_tab.c launcher/updater.c
         modmaker/svrfmt/wwe13.cpp ${REXSDK_DIR}/thirdparty/libmspack/libmspack/mspack/lzxd.c modmaker/editor.cpp modmaker/char_preview.cpp modmaker/svrfmt/ring_kit.cpp modmaker/svrfmt/arena_build.cpp
-        modmaker/svrfmt/pac.cpp modmaker/svrfmt/texture.cpp modmaker/svrfmt/jboy.cpp
+        modmaker/svrfmt/pac.cpp modmaker/svrfmt/archive.cpp modmaker/svrfmt/texture.cpp modmaker/svrfmt/jboy.cpp modmaker/svrfmt/disc.cpp modmaker/pac_editor.cpp modmaker/loudness.cpp modmaker/port_page.cpp modmaker/attire_page.cpp
+        modmaker/pac_attires.cpp modmaker/installed_page.cpp modmaker/svrfmt/char_fbx.cpp modmaker/rig_map.cpp launcher/unzip.c
         modmaker/svrfmt/fbx_write.cpp modmaker/svrfmt/png.cpp modmaker/svrfmt/arena.cpp
         modmaker/svrfmt/arena_import.cpp modmaker/svrfmt/zip_write.cpp
         modmaker/third_party/ufbx/ufbx.c launcher/bink_decode.c
         ${IMGUI_SRC}/imgui.cpp ${IMGUI_SRC}/imgui_draw.cpp ${IMGUI_SRC}/imgui_tables.cpp
         ${IMGUI_SRC}/imgui_widgets.cpp ${IMGUI_SRC}/backends/imgui_impl_win32.cpp
         ${IMGUI_SRC}/backends/imgui_impl_dx11.cpp
-        launcher/launcher.rc)
+        launcher/launcher.rc src/utf8.manifest)
     target_include_directories(svr2011_modmaker PRIVATE modmaker modmaker/third_party/ufbx ${CMAKE_CURRENT_BINARY_DIR}/modmaker_inc
         ${REXSDK_DIR}/thirdparty/libmspack/libmspack/mspack
         ${IMGUI_SRC} ${IMGUI_SRC}/backends ${REXSDK_DIR}/thirdparty/stb)
-    target_compile_definitions(svr2011_modmaker PRIVATE _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+    target_compile_definitions(svr2011_modmaker PRIVATE _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE SVRFMT_INFLATE
+        SVR2011_RC_MODMAKER)
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" SVR2011_MM_VERSION LIMIT_COUNT 1)
     target_compile_definitions(svr2011_modmaker PRIVATE "PORT_VERSION=\"${SVR2011_MM_VERSION}\"")
-    target_link_libraries(svr2011_modmaker PRIVATE d3d11 dxgi d3dcompiler ole32 shell32 windowscodecs comdlg32
-        mfplat mfreadwrite mfuuid propsys)
+    target_link_libraries(svr2011_modmaker PRIVATE version d3d11 dxgi d3dcompiler ole32 shell32 windowscodecs comdlg32
+        mfplat mfreadwrite mfuuid propsys delayimp xaudio2 bcrypt winhttp rstrtmgr)
+    # (Media Foundation only when used: Windows "N" without the Media Feature Pack)
+    target_link_options(svr2011_modmaker PRIVATE -Wl,/DELAYLOAD:mfplat.dll -Wl,/DELAYLOAD:mfreadwrite.dll)
     set_target_properties(svr2011_modmaker PROPERTIES OUTPUT_NAME "SvR2011 Mod Maker")
-    add_executable(svr2011_launcher WIN32 launcher/svr2011_launcher.c launcher/apk_package.c launcher/report.c launcher/stfs.c launcher/caw_import.c launcher/verify.c launcher/movie_maker.c launcher/bink_encode.c launcher/bink_decode.c launcher/updater.c launcher/unzip.c launcher/mods_tab.c launcher/music_tab.c launcher/roster_tab.c launcher/texpacks_tab.c launcher/ui_theme.c launcher/launcher.rc)
+    add_executable(svr2011_launcher WIN32 launcher/svr2011_launcher.c launcher/apk_package.c launcher/report.c launcher/stfs.c launcher/caw_import.c launcher/verify.c launcher/movie_maker.c launcher/bink_encode.c launcher/bink_decode.c launcher/updater.c launcher/unzip.c launcher/mods_tab.c launcher/backgrounds.c launcher/music_tab.c launcher/roster_tab.c launcher/texpacks_tab.c launcher/ui_theme.c launcher/setup_tab.c launcher/launcher.rc src/utf8.manifest)
     set_target_properties(svr2011_launcher PROPERTIES OUTPUT_NAME "SvR2011 Launcher")
+    # The hybrid CRT: the VC++ part (vcruntime) built in, the Universal CRT from Windows (ucrtbase.dll /
+    # api-ms-win-crt-*, part of Windows 10+; Windows 7/8.1 with update KB2999226). The launcher starts
+    # without the VC++ runtime, tells a player who has none / an old one where to get it (setup_tab.c), and
+    # never holds the DLLs it may remove - and is an ordinary-sized program again (the fully static CRT
+    # made it look packed to antivirus heuristics).
+    set_property(TARGET svr2011_launcher PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    target_link_options(svr2011_launcher PRIVATE -Wl,/NODEFAULTLIB:libucrt.lib -Wl,/DEFAULTLIB:ucrt.lib)
     target_compile_definitions(svr2011_launcher PRIVATE
         UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
     target_link_options(svr2011_launcher PRIVATE -Wl,/ENTRY:wWinMainCRTStartup)
     target_link_libraries(svr2011_launcher PRIVATE
-        comctl32 comdlg32 shell32 ole32 uxtheme windowscodecs mfplat mfreadwrite mfuuid propsys winhttp gdiplus)
+        comctl32 comdlg32 shell32 ole32 uxtheme windowscodecs mfplat mfreadwrite mfuuid propsys winhttp gdiplus delayimp
+        bcrypt version rstrtmgr)
+    # (Media Foundation only when used: Windows "N" without the Media Feature Pack)
+    target_link_options(svr2011_launcher PRIVATE -Wl,/DELAYLOAD:mfplat.dll -Wl,/DELAYLOAD:mfreadwrite.dll)
     # The release version (VERSION.txt; package.ps1 names the zip after it and the
     # launcher's updater compares it with the newest GitHub release).
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" SVR2011_VERSION LIMIT_COUNT 1)

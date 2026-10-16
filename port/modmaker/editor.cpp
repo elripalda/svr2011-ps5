@@ -1,4 +1,4 @@
-﻿// The Arena Editor (Mod Maker, arenas branch). See editor.h.
+// The Arena Editor (Mod Maker, arenas branch). See editor.h.
 //
 // Game space: 1 unit = 10 cm, y points down (floor ~0, ring mat -12). The
 // view keeps game space and looks with "up" = -y. Objects are the arena's
@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -82,8 +83,11 @@ M4 LookAt(V3 eye, V3 at, V3 up) {
   std::memcpy(r.m, v, sizeof v);
   return r;
 }
+// x flipped: the game's view is left-handed - with the plain LookAt basis the writing on barriers and the stage
+// read mirrored next to the game's own shots (as the Full preview's did, 165a6fe). `mirror`
+// shows it the other way round. Only the view flips: positions are the game's either way.
 M4 Perspective(float fovy, float aspect, float zn, float zf, bool mirror) {
-  const float ys = 1.0f / std::tan(fovy / 2), xs = ys / aspect * (mirror ? -1.0f : 1.0f);
+  const float ys = 1.0f / std::tan(fovy / 2), xs = ys / aspect * (mirror ? 1.0f : -1.0f);
   M4 r;
   const float v[16] = {xs, 0, 0, 0, 0, ys, 0, 0, 0, 0, zf / (zf - zn), 1, 0, 0, -zn * zf / (zf - zn), 0};
   std::memcpy(r.m, v, sizeof v);
@@ -97,6 +101,19 @@ M4 Place(V3 t, float yaw) {
   std::memcpy(r.m, v, sizeof v);
   return r;
 }
+// A corner's turnbuckle link (ar_tb1, 952): the model is one link along x from its post (-32, -32) - x -33.3 ..
+// -26.6 at z -32. In game each corner's three run from the post to the corner pad (ar_cover10-13 at +-28, +-28):
+// turned 45 degrees about the post, then the corner by quarter turns about the ring's centre (only the quarter turns
+// left the links lying along a side, pointing away from the pads - "turnbuckles in the wrong place").
+M4 TurnbuckleAt(int corner, float y) {
+  constexpr float kPost = -32.0f;
+  const float d = -0.78539816f;  // (+x -> the diagonal into the ring)
+  const float cd = std::cos(d), sd = std::sin(d);
+  const float ox = kPost - (kPost * cd + kPost * sd), oz = kPost - (-kPost * sd + kPost * cd);  // post - R(d) post
+  const float a = float(corner) * 1.57079633f, ca = std::cos(a), sa = std::sin(a);
+  return Place({ox * ca + oz * sa, y, -ox * sa + oz * ca}, a + d);
+}
+
 bool Invert(const M4& a, M4& out) {
   const float* m = a.m;
   float inv[16];
@@ -173,6 +190,10 @@ struct Obj {
   // not shown, not listed, kept as it is
   bool outside = false;
   bool ceiling = false;  // a room's ceiling / lights rig (backstage): hidden in the view unless "Show ceilings"
+  // its flag table line (stage lights): l(<n>) the light set it is lit by (100 without), m(<n>) the
+  // object motion that places it, "e" entrance only, "g" match only, "b" billboard
+  int light_set = 100, motion = -1;
+  bool entrance_only = false, match_only = false, billboard = false;
   V3 pos;           // edit offset
   float yaw = 0;    // radians
   float scale = 1;
@@ -211,6 +232,17 @@ ID3D11VertexShader* g_vs = nullptr;
 ID3D11PixelShader* g_ps = nullptr;
 ID3D11InputLayout* g_layout = nullptr;
 ID3D11Buffer* g_cb = nullptr;
+ID3D11Buffer* g_cb_mode = nullptr;   // (b1: mode.x 1 = self-lit, the textures in g_self_lit)
+ID3D11Buffer* g_cb_light = nullptr;  // (b2: the arena's light set for the next draws - SetStageLight)
+int g_cb_light_now = -2;
+int g_cb_mode_now = -1;
+std::set<std::string> g_self_lit;    // (SetSelfLit: screens drawn at their own brightness)
+std::set<std::string> g_led_mask;    // (SetSelfLit's masks: a screen's dot grid over it, its holes the lit dots)
+ID3D11BlendState* g_led_blend = nullptr;
+bool g_game_alpha = false;           // (SetGameTransparency: alpha cuts only on the C351-flagged models, as the game)
+const svrfmt::Arena* g_cut_arena = nullptr;
+std::vector<char> g_cut;             // (per model: its C351 line has a transparency flag)
+std::map<uint32_t, std::string> ModelFlagsOf(const svrfmt::Arena& arena);
 ID3D11SamplerState* g_sampler = nullptr;
 ID3D11RasterizerState* g_solid = nullptr;
 ID3D11RasterizerState* g_wire = nullptr;
@@ -218,6 +250,7 @@ ID3D11DepthStencilState* g_depth = nullptr;
 ID3D11DepthStencilState* g_depth_ro = nullptr;  // (glows: test, no write)
 ID3D11BlendState* g_add = nullptr;               // (glows: additive)
 ID3D11ShaderResourceView* g_white = nullptr;
+ID3D11ShaderResourceView* g_screen_off = nullptr;  // (MovieSurface: a screen that is off)
 // the viewport's target
 ID3D11Texture2D* g_rt = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
@@ -257,6 +290,8 @@ bool g_show_ceilings = false;
 float g_spot[5] = {};
 float g_yaw = 0.6f, g_pitch = 0.5f, g_dist = 180;
 bool g_mirror = false;
+// +1 / -1: which way the camera's x shows on screen (drags and arrow keys follow the screen, mirrored or not)
+float ScreenX() { return g_mirror ? 1.0f : -1.0f; }
 bool g_show_ring = true;
 M4 g_viewproj;
 ImVec2 g_vp_min, g_vp_size;
@@ -279,7 +314,10 @@ std::thread g_budget_thread;
 std::atomic<bool> g_budget_busy{false};
 std::mutex g_budget_mutex;
 size_t g_budget_file = 0, g_budget_unpacked = 0, g_budget_file_max = 0, g_budget_unpacked_max = 0;
+size_t g_budget_biggest = 0;
+uint32_t g_budget_biggest_id = 0;
 
+bool g_readonly = false;  // (the view scene: camera only)
 bool g_quiet = false;  // (budget builds)
 bool g_glow_pass = false;
 
@@ -306,6 +344,8 @@ cbuffer C : register(b0) {
   float4 tint;
   float4 flat;
 };
+cbuffer D : register(b1) { float4 mode; };
+cbuffer L : register(b2) { float4 ldir[6]; float4 lcol[6]; float4 lon; };  // (the arena's light set: 2 fills, 4 directional)
 struct VI { float3 p : POSITION; float3 n : NORMAL; float4 c : COLOR; float2 uv : TEXCOORD; };
 struct VO { float4 p : SV_Position; float3 n : NORMAL; float4 c : COLOR; float2 uv : TEXCOORD; };
 VO vs(VI i) {
@@ -322,9 +362,16 @@ SamplerState s : register(s0);
 float4 ps(VO i) : SV_Target {
   if (flat.w > 0.5) return float4(flat.rgb, 1);
   float4 tx = t.Sample(s, i.uv);
-  if (flat.w < -0.5) return float4(tx.rgb * tx.a * i.c.rgb * tint.rgb * 0.6, 0);
-  if (tx.a < 0.25) discard;
+  if (flat.w < -0.5) return float4(tx.rgb * tx.a * i.c.rgb * tint.rgb, 0);  // (glows and beams, added at full strength as the game - 0.6 left them faint)
+  if (mode.x > 1.5) return float4(tint.rgb * 0.55, 1 - tx.a);  // (an LED mask: its holes are lit dots, blended)
+  if (tx.a < 0.25 && mode.y < 0.5) discard;  // (mode.y: an opaque model - the game's alpha there isn't see-through)
+  if (mode.x > 0.5) return float4(tx.rgb * tint.rgb, 1);  // (self-lit: a screen)
   float3 n = normalize(i.n + 1e-5);
+  if (lon.x > 0.5) {  // (the arena's own light set: fills half-lit from behind, directional ones as they face)
+    float3 l = lcol[0].rgb * (0.5 + 0.5 * dot(n, ldir[0].xyz)) + lcol[1].rgb * (0.5 + 0.5 * dot(n, ldir[1].xyz));
+    [unroll] for (int k = 2; k < 6; ++k) l += lcol[k].rgb * max(0, dot(n, ldir[k].xyz));
+    return float4(tx.rgb * i.c.rgb * tint.rgb * l * lon.y, 1);
+  }
   float d = abs(dot(n, normalize(float3(0.35, -1.0, 0.25))));
   return float4(tx.rgb * i.c.rgb * tint.rgb * (0.55 + 0.45 * d), 1);
 }
@@ -354,6 +401,10 @@ bool CreatePipeline() {
   bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
   bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
   g_dev->CreateBuffer(&bd, nullptr, &g_cb);
+  bd.ByteWidth = 16;
+  g_dev->CreateBuffer(&bd, nullptr, &g_cb_mode);
+  bd.ByteWidth = 13 * 16;
+  g_dev->CreateBuffer(&bd, nullptr, &g_cb_light);
   D3D11_SAMPLER_DESC sd = {};
   sd.Filter = D3D11_FILTER_ANISOTROPIC;
   sd.MaxAnisotropy = 8;
@@ -386,6 +437,9 @@ bool CreatePipeline() {
   bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
   bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
   g_dev->CreateBlendState(&bl, &g_add);
+  bl.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;  // (LED masks: dest x (1 - a) + dot colour x a)
+  bl.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+  g_dev->CreateBlendState(&bl, &g_led_blend);
   // a white texture for meshes without one
   const uint32_t white = 0xFFFFFFFFu;
   D3D11_TEXTURE2D_DESC td = {};
@@ -398,6 +452,11 @@ bool CreatePipeline() {
   ID3D11Texture2D* tex = nullptr;
   g_dev->CreateTexture2D(&td, &srd, &tex);
   g_dev->CreateShaderResourceView(tex, nullptr, &g_white);
+  tex->Release();
+  const uint32_t off = 0xFF1A1816u;  // (a movie screen that is off: near black)
+  srd.pSysMem = &off;
+  g_dev->CreateTexture2D(&td, &srd, &tex);
+  g_dev->CreateShaderResourceView(tex, nullptr, &g_screen_off);
   tex->Release();
   return true;
 }
@@ -427,12 +486,38 @@ void ResizeTarget(int w, int h) {
   depth->Release();
 }
 
+std::map<std::string, ID3D11ShaderResourceView*> g_tex_override;  // (SetTextureOverride: the Full preview's titantron)
+
+// The texture a model names, in the arena's sets: as written, else whatever the case - the game finds them so
+// (the practice arena's Sheat_A seats ask for st_sheata / st_sheata_blue, its set has st_sheatA / st_sheatA_Blue;
+// RAW's billboards rawtest02 for RAWtest02) - drawn white they were the "white stands".
+const BundleTexture* FindTextureAnyCase(const std::string& name) {
+  if (!g_arena) return nullptr;
+  if (const BundleTexture* t = g_arena->FindTexture(name)) return t;
+  auto low = [](std::string x) {
+    for (char& c : x) c = char(std::tolower(uint8_t(c)));
+    return x;
+  };
+  const std::string want = low(name);
+  for (const auto& b : g_arena->bundles)
+    for (const auto& t : b.textures)
+      if (low(t.name) == want) return &t;
+  return nullptr;
+}
+
+// Surfaces the game fills with a movie at run time (no such texture in any pac): RAW's screens titantron_movie and
+// arena_movie (the superstar's movies	itantron\<id>.bik: 320 x 320, the titantron above, a name strip below).
+// Without a movie set on them (SetTextureOverride) they are drawn as a screen that is off, not white.
+bool MovieSurface(const std::string& name) { return name == "titantron_movie" || name == "arena_movie"; }
+
 ID3D11ShaderResourceView* TextureFor(const std::string& name) {
+  if (auto o = g_tex_override.find(name); o != g_tex_override.end() && o->second) return o->second;
   if (name.empty()) return g_white;
+  if (MovieSurface(name) && g_screen_off) return g_screen_off;
   auto it = g_tex.find(name);
   if (it != g_tex.end()) return it->second ? it->second : g_white;
   ID3D11ShaderResourceView* srv = nullptr;
-  if (const BundleTexture* t = g_arena ? g_arena->FindTexture(name) : nullptr) {
+  if (const BundleTexture* t = FindTextureAnyCase(name)) {
     DdsInfo info;
     if (DdsInfoOf(t->data, info)) {
       DXGI_FORMAT f = DXGI_FORMAT_UNKNOWN;
@@ -588,6 +673,34 @@ void DrawMesh(int model, int mesh) {
   g_ctx->IASetIndexBuffer(g->ib, DXGI_FORMAT_R16_UINT, 0);
   ID3D11ShaderResourceView* srv = TextureFor(g->tex);
   g_ctx->PSSetShaderResources(0, 1, &srv);
+  int mode = g_led_mask.count(g->tex) ? 2 : g_self_lit.count(g->tex) ? 1 : 0;
+  if (g_game_alpha && g_arena) {
+    if (g_cut_arena != g_arena) {  // (2011's transparency flags, docs: s a k c i j o as words of a model's C351 line)
+      g_cut_arena = g_arena;
+      g_cut.assign(g_arena->models.size(), 0);
+      const auto flags = ModelFlagsOf(*g_arena);
+      for (size_t i = 0; i < g_arena->models.size(); ++i) {
+        const auto f = flags.find(g_arena->models[i].id);
+        if (f == flags.end()) {
+          g_cut[i] = 1;  // (no line: as before)
+          continue;
+        }
+        for (const char* w : {" s ", " a ", " k ", " c ", " i ", " j ", " o "})
+          if (f->second.find(w) != std::string::npos) g_cut[i] = 1;
+      }
+    }
+    if (model >= 0 && size_t(model) < g_cut.size() && !g_cut[size_t(model)] && mode == 0) mode = 3;
+  }
+  if (mode != g_cb_mode_now && g_cb_mode && !g_glow_pass) {
+    if (mode == 2 || g_cb_mode_now == 2) g_ctx->OMSetBlendState(mode == 2 ? g_led_blend : nullptr, nullptr, 0xFFFFFFFF);
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(g_ctx->Map(g_cb_mode, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+      const float v[4] = {mode == 3 ? 0.0f : float(mode), mode == 3 ? 1.0f : 0.0f, 0, 0};
+      std::memcpy(ms.pData, v, sizeof v);
+      g_ctx->Unmap(g_cb_mode, 0);
+      g_cb_mode_now = mode;
+    }
+  }
   g_ctx->DrawIndexed(g->count, 0, 0);
 }
 
@@ -675,10 +788,9 @@ std::string Label(const ArenaModel& am) {
 
 // The arena's per-model flag table (entry 50001, text: "<model id> <flags>"):
 // "m(<n>)" placed by animation track n, "r" also drawn mirrored (x -> -x).
-std::map<uint32_t, std::string> ModelFlags() {
+std::map<uint32_t, std::string> ModelFlagsOf(const svrfmt::Arena& arena) {
   std::map<uint32_t, std::string> flags;
-  if (!g_arena) return flags;
-  for (const auto& e : g_arena->entries) {
+  for (const auto& e : arena.entries) {
     if (e.id != 50001) continue;
     const Bytes t = Unpack(e.data);
     std::string text(t.begin(), t.end()), line;
@@ -693,6 +805,223 @@ std::map<uint32_t, std::string> ModelFlags() {
     }
   }
   return flags;
+}
+std::map<uint32_t, std::string> ModelFlags() { return g_arena ? ModelFlagsOf(*g_arena) : std::map<uint32_t, std::string>(); }
+
+// ---------------------------------------------------------------- stage lights
+// What the game lights an arena with, from the arena's own entries:
+// - 0x7530 (30000): a YMKs bank of light sets. Per set id, channels (the YMKs y) 0 and 1 = two
+//   opposite fill lights (the ground / sky colours), 10-13 = up to four directional lights, 50-59 =
+//   the moving crowd lights (set 20 only). Keys, 25 bytes: u8 frames to the next key, f32x3 position
+//   (x 0.01; the light comes from there towards the centre), s16x3 rotation, u16x3 colour (/ 4096).
+// - 0xC351 l(<n>): the set a model is lit by; a model without one gets set 100.
+// - 0x7531 (30001): object motions (YMKs, no header), one per m(<n>) of 0xC351, a 29-byte record a
+//   frame: u8, f32x3 position (x 0.01), f32x3 rotation (radians, x then y then z), f32 scale. They
+//   put the beams, glows and light rigs (modelled at the centre) in place, 60 frames a second.
+struct StageKey {
+  int frame = 0;
+  float v[9] = {};  // lights: position, rotation, colour; motions: position, rotation, scale
+};
+struct StageTrack {
+  int frames = 1;
+  std::vector<StageKey> keys;
+};
+using StageBank = std::map<std::pair<int, int>, StageTrack>;  // (id, channel) -> track
+StageBank g_light_bank, g_motions;
+const svrfmt::Arena* g_stage_of = nullptr;
+float g_stage_time = 0;          // seconds (SetStageTime: the Full preview's clock; the editor: still)
+bool g_stage_entrance = false;   // the entrance's look: "e" models shown, "g" ones not
+bool g_stage_lights = !std::getenv("SVR2011_MM_NO_STAGE_LIGHTS");  // (the lighting panel's; the env: an A/B test shot)
+
+float LeF32(const uint8_t* p) {
+  float f;
+  std::memcpy(&f, p, 4);
+  return f;
+}
+uint32_t LeU32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24; }
+uint16_t LeU16(const uint8_t* p) { return uint16_t(p[0] | p[1] << 8); }
+
+// A YMKs bank (the 16-byte "YMKs" head optional: the 2007-2009 banks and 0x7531 have none) -> its
+// tracks. motion: 0x7531's 29-byte records, else 0x7530's 25-byte light keys.
+StageBank ReadStageBank(const Bytes& raw, bool motion) {
+  StageBank out;
+  size_t p = raw.size() >= 16 && !std::memcmp(raw.data(), "YMKs", 4) ? 16 : 0;
+  if (raw.size() < p + 0x104) return out;
+  const uint32_t n = LeU32(raw.data() + p + 0x100);
+  const size_t dir = p + 0x104, base = dir + 16 * size_t(n);
+  if (n > 4096 || base > raw.size()) return out;
+  const size_t pose = motion ? 29 : 25;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint8_t* d = raw.data() + dir + 16 * i;
+    const int y = d[0], id = LeU16(d + 2);
+    const size_t off = LeU32(d + 4);
+    StageTrack t;
+    t.frames = int(std::max<uint32_t>(1, LeU32(d + 8)));
+    size_t q = base + off;
+    for (int f = 0; q < raw.size() && f < t.frames;) {
+      const uint8_t b = raw[q];
+      if (b < 0x60) {
+        f += b, ++q;
+        continue;
+      }
+      size_t sz = b - 0x60;
+      if (b == 0x60) {
+        if (q + 3 > raw.size()) break;
+        sz = LeU16(raw.data() + q + 1), q += 3;
+      } else {
+        ++q;
+      }
+      if (q + sz > raw.size()) break;
+      const uint8_t* r = raw.data() + q;
+      size_t rs = sz;
+      if (rs && (r[0] & 0x80)) {  // (an event block first)
+        const size_t ev = 1 + (r[0] & 0x7f);
+        r += std::min(ev, rs), rs -= std::min(ev, rs);
+      }
+      if (rs >= pose) {
+        StageKey k;
+        k.frame = f;
+        for (int a = 0; a < 3; ++a) k.v[a] = LeF32(r + 1 + 4 * a) * 0.01f;
+        if (motion) {
+          for (int a = 0; a < 3; ++a) k.v[3 + a] = LeF32(r + 13 + 4 * a);
+          k.v[6] = LeF32(r + 25);
+        } else {
+          for (int a = 0; a < 3; ++a) k.v[3 + a] = int16_t(LeU16(r + 13 + 2 * a)) * (2 * kPi / 65536.0f);
+          for (int a = 0; a < 3; ++a) k.v[6 + a] = LeU16(r + 19 + 2 * a) / 4096.0f;
+        }
+        t.keys.push_back(k);
+      }
+      q += sz, ++f;
+    }
+    if (!t.keys.empty()) out[{id, y}] = std::move(t);
+  }
+  return out;
+}
+
+// a track's values at the stage clock (looped; linear between keys)
+void SampleTrack(const StageTrack& t, float out[9]) {
+  const float f = std::fmod(g_stage_time * 60.0f, float(t.frames));
+  size_t k = 0;
+  while (k + 1 < t.keys.size() && float(t.keys[k + 1].frame) <= f) ++k;
+  const StageKey& a = t.keys[k];
+  if (k + 1 >= t.keys.size() || t.keys[k + 1].frame <= a.frame) {
+    std::memcpy(out, a.v, sizeof a.v);
+    return;
+  }
+  const StageKey& b = t.keys[k + 1];
+  const float u = std::clamp((f - float(a.frame)) / float(b.frame - a.frame), 0.0f, 1.0f);
+  for (int i = 0; i < 9; ++i) out[i] = a.v[i] + (b.v[i] - a.v[i]) * u;
+}
+
+void LoadStage() {
+  if (g_stage_of == g_arena) return;
+  g_stage_of = g_arena;
+  g_light_bank.clear(), g_motions.clear();
+  if (!g_arena) return;
+  for (const auto& e : g_arena->entries) {
+    if (e.id == 30000) g_light_bank = ReadStageBank(Unpack(e.data), false);
+    if (e.id == 30001) g_motions = ReadStageBank(Unpack(e.data), true);
+  }
+}
+
+// l(<n>), m(<n>), e / g / b of a flag table line (" ... ")
+void ReadStageFlags(const std::string& f, Obj& o) {
+  if (const size_t l = f.find(" l("); l != std::string::npos) o.light_set = std::atoi(f.c_str() + l + 3);
+  if (const size_t m = f.find(" m("); m != std::string::npos) o.motion = std::atoi(f.c_str() + m + 3);
+  auto word = [&](const char* w) {
+    for (size_t at = f.find(w); at != std::string::npos; at = f.find(w, at + 1))
+      if (at > 0 && std::isspace(uint8_t(f[at - 1])) && at + 1 < f.size() && std::isspace(uint8_t(f[at + 1]))) return true;
+    return false;
+  };
+  o.entrance_only = word("e"), o.match_only = word("g"), o.billboard = word("b");
+}
+
+// the light set's values now: two fills and four directional lights (direction to the light, colour)
+struct StageLight {
+  float dir[6][4] = {};  // xyz (towards the light), w unused
+  float col[6][4] = {};  // rgb
+};
+bool StageLightOf(int set, StageLight& out) {
+  static const int kCh[6] = {0, 1, 10, 11, 12, 13};
+  bool any = false;
+  for (int c = 0; c < 6; ++c) {
+    const auto t = g_light_bank.find({set, kCh[c]});
+    if (t == g_light_bank.end()) continue;
+    float v[9];
+    SampleTrack(t->second, v);
+    const V3 d = Norm({v[0], v[1], v[2]});
+    out.dir[c][0] = d.x, out.dir[c][1] = d.y, out.dir[c][2] = d.z;
+    out.col[c][0] = v[6], out.col[c][1] = v[7], out.col[c][2] = v[8];
+    any = true;
+  }
+  return any;
+}
+
+// an effect model's place now (its m(<n>) motion): scale, rotation x then y then z, the move
+bool MotionPlace(int motion, M4& out) {
+  const auto t = g_motions.find({motion, 0});
+  if (t == g_motions.end()) return false;
+  float v[9];
+  SampleTrack(t->second, v);
+  const float s = v[6] != 0 ? v[6] : 1.0f;
+  const float cx = std::cos(v[3]), sx = std::sin(v[3]), cy = std::cos(v[4]), sy = std::sin(v[4]), cz = std::cos(v[5]),
+              sz = std::sin(v[5]);
+  // row vectors: p * Rx * Ry * Rz (x first)
+  M4 rx, ry, rz, sc, tr;
+  rx.m[5] = cx, rx.m[6] = sx, rx.m[9] = -sx, rx.m[10] = cx;
+  ry.m[0] = cy, ry.m[2] = -sy, ry.m[8] = sy, ry.m[10] = cy;
+  rz.m[0] = cz, rz.m[1] = sz, rz.m[4] = -sz, rz.m[5] = cz;
+  sc.m[0] = sc.m[5] = sc.m[10] = s;
+  tr.m[12] = v[0], tr.m[13] = v[1], tr.m[14] = v[2];
+  out = Mul(Mul(Mul(Mul(sc, rx), ry), rz), tr);
+  return true;
+}
+
+// the light set the next draws are lit by (-1, no bank or the lights off: the editor's own light)
+void SetStageLight(int set) {
+  if (!g_cb_light) return;
+  if (!g_stage_lights || g_light_bank.empty()) set = -1;
+  if (set == g_cb_light_now) return;  // (the clock moves between frames only)
+  StageLight sl;
+  // (0.75: matched against game shots of RAW and the practice arena from the game's own cameras - at 1 the fills and
+  // directional lights together washed stage floors and stands out; test aid SVR2011_MM_STAGE_GAIN)
+  static const float gain = std::getenv("SVR2011_MM_STAGE_GAIN") ? std::strtof(std::getenv("SVR2011_MM_STAGE_GAIN"), nullptr) : 0.75f;
+  float on[4] = {0, gain, 0, 0};
+  if (set >= 0 && (StageLightOf(set, sl) || StageLightOf(100, sl))) on[0] = 1;
+  D3D11_MAPPED_SUBRESOURCE ms;
+  if (FAILED(g_ctx->Map(g_cb_light, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) return;
+  auto* f = static_cast<float*>(ms.pData);
+  std::memcpy(f, sl.dir, sizeof sl.dir);
+  std::memcpy(f + 24, sl.col, sizeof sl.col);
+  std::memcpy(f + 48, on, sizeof on);
+  g_ctx->Unmap(g_cb_light, 0);
+  g_cb_light_now = set;
+}
+
+V3 g_eye;  // the camera's position this frame (RenderScene): "b" models turn to it
+
+// A "b" (billboard) model turned about its own length to face the camera, as the game draws its beams: every "b"
+// model of the stock arenas (RAW's ar_ten_beam / raw_glow_mo*, the practice arena's tf_ / stand_glow_mo*) runs along
+// its local x from the lamp, its quads lying in local x / y and facing local z. at: its place (scale, rotation, move;
+// row vectors), the turn about local x goes first.
+M4 FaceCamera(const M4& at) {
+  const V3 ax = Norm({at.m[0], at.m[1], at.m[2]}), yw = Norm({at.m[4], at.m[5], at.m[6]}),
+           zw = Norm({at.m[8], at.m[9], at.m[10]});
+  V3 v = g_eye - V3{at.m[12], at.m[13], at.m[14]};
+  v = v - ax * Dot(v, ax);  // (towards the camera, across the beam)
+  if (Dot(v, v) < 1e-6f) return at;
+  v = Norm(v);
+  // p * Rx(t): local z -> (0, -sin t, cos t), so the face's normal becomes -sin t yw + cos t zw = v
+  const float t = std::atan2(-Dot(v, yw), Dot(v, zw)), c = std::cos(t), sn = std::sin(t);
+  M4 rx;
+  rx.m[5] = c, rx.m[6] = sn, rx.m[9] = -sn, rx.m[10] = c;
+  return Mul(rx, at);
+}
+
+// an effect model (m(<n>)) is drawn where its motion puts it, in the look it belongs to
+bool ShowEffect(const Obj& o) {
+  if (!g_stage_lights || o.motion < 0 || !g_motions.count({o.motion, 0})) return false;
+  return g_stage_entrance ? !o.match_only : !o.entrance_only;
 }
 
 void BuildObjects() {
@@ -710,6 +1039,7 @@ void BuildObjects() {
       o.effect = f->second.find("m(") != std::string::npos;
       for (char sep : {' ', '\t', '\r'})  // (a standalone "r")
         for (char sep2 : {' ', '\t', '\r'}) o.mirrored |= f->second.find(std::string(1, sep) + "r" + sep2) != std::string::npos;
+      ReadStageFlags(f->second, o);
     }
     o.model = int(mi);
     o.label = Label(am);
@@ -1075,6 +1405,12 @@ int Pick(V3 o, V3 d, float* t_out = nullptr) {
   return best;
 }
 
+// the read-only view's camera and extra drawing (SetViewCamera / SetViewExtra: the Full preview)
+bool g_vcam_set = false;
+M4 g_vcam_view, g_vcam_proj;
+ViewExtraFn g_view_extra;
+bool g_view_hint = true;
+
 void RenderScene() {
   const float clear[4] = {0.05f, 0.055f, 0.065f, 1};
   g_ctx->ClearRenderTargetView(g_rtv, clear);
@@ -1092,10 +1428,42 @@ void RenderScene() {
   g_ctx->PSSetShader(g_ps, nullptr, 0);
   g_ctx->VSSetConstantBuffers(0, 1, &g_cb);
   g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+  g_ctx->PSSetConstantBuffers(1, 1, &g_cb_mode);
+  g_ctx->PSSetConstantBuffers(2, 1, &g_cb_light);
+  g_cb_mode_now = -1;  // (its value: set again by the first mesh)
+  g_cb_light_now = -2;
+  LoadStage();
+  g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);  // (an LED mask drawn last mustn't leave its blend on)
   g_ctx->PSSetSamplers(0, 1, &g_sampler);
-  const M4 view = LookAt(Eye(), g_target, {0, -1, 0});
-  const M4 proj = Perspective(0.9f, float(g_rt_w) / float(std::max(1, g_rt_h)), 1.0f, 5000.0f, g_mirror);
+  const bool given = g_readonly && g_vcam_set;  // (the view's camera from the caller)
+  M4 view = given ? g_vcam_view : LookAt(Eye(), g_target, {0, -1, 0});
+  M4 proj = given ? g_vcam_proj : Perspective(0.9f, float(g_rt_w) / float(std::max(1, g_rt_h)), 1.0f, 5000.0f, g_mirror);
+  // test aid SVR2011_MM_EDITOR_VIEW "<16 floats: the game's row-vector view>,<fov>": the game's own camera (its camera
+  // dump), the projection as the Full preview's --full-preview-view - for side-by-sides with game shots
+  static float test_view[17];
+  static const bool test_on = [] {
+    const char* e = std::getenv("SVR2011_MM_EDITOR_VIEW");
+    int n = 0;
+    for (const char* p = e; p && *p && n < 17;) {
+      char* end = nullptr;
+      test_view[n] = std::strtof(p, &end);
+      if (end == p) break;
+      ++n;
+      for (p = end; *p == ',' || *p == ' ';) ++p;
+    }
+    return n == 17;
+  }();
+  if (const char* t = std::getenv("SVR2011_MM_STAGE_TIME"); t && !g_readonly)  // (test aid "<seconds>[,e]": the clock / look)
+    g_stage_time = std::strtof(t, nullptr), g_stage_entrance = std::strchr(t, 'e') != nullptr;
+  if (test_on) {
+    std::memcpy(view.m, test_view, 64);
+    const float xs = 1 / std::tan(test_view[16] * kPi / 360.0f), zn = 1, zf = 5000;
+    proj = M4();
+    proj.m[0] = xs, proj.m[5] = -xs * float(g_rt_w) / float(std::max(1, g_rt_h)), proj.m[10] = zf / (zf - zn), proj.m[11] = 1;
+    proj.m[14] = -zn * zf / (zf - zn), proj.m[15] = 0;
+  }
   g_viewproj = Mul(view, proj);
+  if (M4 inv; Invert(view, inv)) g_eye = {inv.m[12], inv.m[13], inv.m[14]};
   float light[3];
   LightTint(light);
   const bool per_rope = [] {
@@ -1105,7 +1473,16 @@ void RenderScene() {
   }();
   const M4 ident;
   for (const Obj& o : g_objs) {
-    if (o.hidden || o.effect || o.outside || (o.ceiling && !g_show_ceilings)) continue;
+    if (o.hidden || o.outside || (o.ceiling && !g_show_ceilings)) continue;
+    SetStageLight(o.light_set);
+    if (o.effect) {  // (placed by its motion)
+      M4 at;
+      if (o.glow || !ShowEffect(o) || !MotionPlace(o.motion, at)) continue;
+      if (o.billboard) at = FaceCamera(at);
+      SetCb(at, light);
+      for (int k : o.meshes) DrawMesh(o.model, k);
+      continue;
+    }
     switch (o.role) {
       case Role::kNotDrawn:
         break;
@@ -1151,18 +1528,22 @@ void RenderScene() {
         if (!g_show_ring || !g_ring.turnbuckles) break;
         for (int corner = 0; corner < 4; ++corner)
           for (int r = 0; r < 3; ++r) {
-            SetCb(Place({0, RopeY(r), 0}, corner * kPi / 2), light);
+            SetCb(TurnbuckleAt(corner, RopeY(r)), light);
             for (int k : o.meshes) DrawMesh(o.model, k);
           }
         break;
       case Role::kApron: {
         if (!g_show_ring) break;
-        const bool second = g_arena->models[o.model].id == 974;
+        // The game makes four panels, 974 / 973 / 974 / 973 round the ring (the ring object's +152..+164), so
+        // bs_ar_epron2 (974) is on the two z sides - the ramp's, with the arena's second picture (Superstars:
+        // WWE.COM) - and bs_ar_epron (973) on the two x sides. A panel's front (its triangles' winding; the
+        // normals say +z, for the light) faces -z at z = 0: each goes out along its front, so the picture
+        // reads from outside the ring.
+        const bool z_sides = g_arena->models[o.model].id == 974;
         for (int side = 0; side < 2; ++side) {
-          const float yaw = (second ? kPi / 2 : 0) + side * kPi;
+          const float yaw = (z_sides ? 0 : kPi / 2) + side * kPi;
           const float c = std::cos(yaw), s = std::sin(yaw);
-          // the panel faces +z at z = 0: move it out along its facing
-          SetCb(Place({kApronOut * s, 0, kApronOut * c}, yaw), light);
+          SetCb(Place({-kApronOut * s, 0, -kApronOut * c}, yaw), light);
           for (int k : o.meshes) DrawMesh(o.model, k);
         }
         break;
@@ -1178,6 +1559,15 @@ void RenderScene() {
   for (const Obj& o : g_objs)
     if (o.glow && !o.hidden && !o.effect && !o.outside && !(o.ceiling && !g_show_ceilings) && o.role == Role::kNormal)
       for (int k : o.meshes) DrawMesh(o.model, k);
+  for (const Obj& o : g_objs) {  // (the beams and glows the arena's motions put in place)
+    M4 at;
+    if (!o.glow || !o.effect || o.hidden || o.outside || !ShowEffect(o) || !MotionPlace(o.motion, at)) continue;
+    if (o.billboard) at = FaceCamera(at);
+    g_glow_pass = true;
+    SetCb(at, light);
+    g_glow_pass = false;
+    for (int k : o.meshes) DrawMesh(o.model, k);
+  }
   {  // (the mirrored copies)
     M4 mirror;
     mirror.m[0] = -1;
@@ -1199,6 +1589,7 @@ void RenderScene() {
     for (int k : g_objs[i].meshes) DrawMesh(g_objs[i].model, k);
   }
   g_ctx->RSSetState(g_solid);
+  if (g_readonly && g_view_extra) g_view_extra(g_rtv, g_dsv, g_rt_w, g_rt_h, view.m, proj.m);
   ID3D11RenderTargetView* none = nullptr;
   g_ctx->OMSetRenderTargets(1, &none, nullptr);
 }
@@ -1216,24 +1607,38 @@ void UpdateBudget() {
   ApplyBuild(*copy);
   g_quiet = false;
   g_budget_thread = std::thread([copy] {
-    size_t unpacked = 0;
+    size_t unpacked = 0, biggest = 0;
+    uint32_t biggest_id = 0;
+    auto note = [&](const ArenaModel& m, size_t size) {
+      if (size > biggest) biggest = size, biggest_id = m.id;
+    };
     for (const auto& e : copy->entries) {
       bool done = false;
       for (const auto& m : copy->models)
-        if (m.id == e.id && m.changed) unpacked += JboyWrite(m.model).size(), done = true;
+        if (m.id == e.id && m.changed) {
+          const size_t n = JboyWrite(m.model).size();
+          unpacked += n, done = true;
+          note(m, n);
+        }
       for (const auto& b : copy->bundles)
         if (b.id == e.id && b.changed) unpacked += BundleWrite(b.textures).size(), done = true;
       if (!done) unpacked += Unpack(e.data).size();
     }
     for (const auto& m : copy->models)
-      if (m.added) unpacked += JboyWrite(m.model).size();
+      if (m.added) {
+        const size_t n = JboyWrite(m.model).size();
+        unpacked += n;
+        note(m, n);
+      }
     const size_t file = copy->Save().size();
     std::lock_guard lock(g_budget_mutex);
     g_budget_file = file, g_budget_unpacked = unpacked;
+    g_budget_biggest = biggest, g_budget_biggest_id = biggest_id;
     g_budget_file_max = copy->original_file, g_budget_unpacked_max = copy->original_unpacked;
     g_budget_busy = false;
   });
 }
+
 
 // ---------------------------------------------------------------- lighting
 
@@ -1383,6 +1788,10 @@ void LightingPanel() {
   if (ImGui::SliderFloat("Strength", &g_light.strength, 0.3f, 1.6f, "%.2f")) p = int(std::size(kPresets)) - 1, Edited();
   ImGui::TextDisabled("Every arena material's colour (not the crowd).");
   if (ImGui::Checkbox("Crowd in the seats", &g_light.crowd)) Edited();
+  ImGui::Checkbox("The arena's own stage lights", &g_stage_lights);  // (the view only: the game always uses them)
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("The view lit as the game lights this arena: each object by its own light set, and the\n"
+                      "light beams and glows put where the arena's motions place them.\nOff: the editor's plain light.");
 }
 
 void Inspector() {
@@ -1689,17 +2098,17 @@ void ViewportInput(bool hovered) {
     if (io.MouseWheel != 0) g_dist = std::clamp(g_dist * std::pow(0.88f, io.MouseWheel), 10.0f, 2000.0f);
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
       const ImVec2 d = io.MouseDelta;
-      g_yaw -= d.x * 0.006f;
+      g_yaw -= ScreenX() * d.x * 0.006f;
       g_pitch = std::clamp(g_pitch + d.y * 0.006f, -0.2f, 1.55f);
     }
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
       const ImVec2 d = io.MouseDelta;
       const V3 fwd = Norm(g_target - Eye()), right = Norm(Cross({0, -1, 0}, fwd)), up = Cross(fwd, right);
-      g_target = g_target - right * (d.x * g_dist * 0.0015f) + up * (d.y * g_dist * 0.0015f);
+      g_target = g_target - right * (ScreenX() * d.x * g_dist * 0.0015f) + up * (d.y * g_dist * 0.0015f);
     }
   }
   Obj* sel = g_sel >= 0 && g_sel < int(g_objs.size()) ? &g_objs[g_sel] : nullptr;
-  const bool can_edit = sel && sel->movable && g_tool != Tool::kSelect;
+  const bool can_edit = !g_readonly && sel && sel->movable && g_tool != Tool::kSelect;
   // the start of every selected object (a drag moves them together)
   static std::vector<std::pair<int, std::array<float, 5>>> drag_starts;
   if (g_grid) {  // a 1 m grid on the floor round the view's target, 5 m lines brighter
@@ -1713,6 +2122,7 @@ void ViewportInput(bool hovered) {
       if (ToScreen({cx - 300, y, cz + k * 10.f}, a) && ToScreen({cx + 300, y, cz + k * 10.f}, b)) dl->AddLine(a, b, col);
     }
   }
+  if (g_readonly) return;  // (the view scene: no selection, no gizmo, no edits)
   // gizmo: axes from the selection's pivot (screen space), 6 m long
   ImVec2 base_s, axis_s[3];
   bool gizmo = false;
@@ -1831,7 +2241,7 @@ void ViewportInput(bool hovered) {
     } else if (g_drag_axis == 4) {
       const float dx = m.x - g_drag_mouse.x;
       if (g_tool == Tool::kRotate) {
-        float yaw = g_drag_start_yaw + dx * 0.01f;
+        float yaw = g_drag_start_yaw + ScreenX() * dx * 0.01f;
         if (g_snap) yaw = std::round(yaw / (kPi / 12)) * (kPi / 12);
         sel->yaw = yaw;
       } else if (g_tool == Tool::kScale) {
@@ -1870,8 +2280,8 @@ void ViewportInput(bool hovered) {
     {
       V3 d;
       const float step = g_snap_step * (io.KeyShift ? 10 : 1);
-      if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) d.x -= step;
-      if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) d.x += step;
+      if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) d.x -= ScreenX() * step;  // (left / right on the screen from the hard camera)
+      if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) d.x += ScreenX() * step;
       if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) d.z -= step;
       if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) d.z += step;
       if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) d.y -= step;
@@ -1934,6 +2344,7 @@ void ViewPreset(int which) {
     case 0: g_target = {0, -12, 0}, g_yaw = 0.0f, g_pitch = 0.32f, g_dist = 190; break;   // hard camera
     case 1: g_target = {0, -12, 0}, g_yaw = 0.0f, g_pitch = 1.5f, g_dist = 420; break;    // top
     case 2: g_target = {0, -12, 0}, g_yaw = kPi, g_pitch = 0.25f, g_dist = 260; break;    // from the stage
+    case 3: g_target = {0, -12, 0}, g_yaw = kPi / 2, g_pitch = 0.25f, g_dist = 190; break;  // from the side (test aid --editor-view 3)
   }
 }
 
@@ -2000,6 +2411,166 @@ void FocusArea() {
 bool Busy() { return g_budget_busy; }
 bool HasArena() { return g_arena != nullptr; }
 int EditCount() { return g_edits; }
+
+// ---- the view scene
+struct ViewScene {
+  Arena* arena = nullptr;
+  std::string title;
+  std::vector<Obj> objs;
+  std::map<std::pair<int, int>, GpuMesh> gpu;
+  std::map<std::string, ID3D11ShaderResourceView*> tex;
+  std::vector<bool> model_dirty;
+  int sel = -1;
+  std::vector<int> multi;
+  RingSpec ring;
+  Lighting light;
+  std::vector<Snapshot> undo, redo;
+  V3 target{0, -12, 0};
+  int area_lo = -1;
+  std::vector<std::pair<int, int>> area;
+  float spot[5] = {};
+  float yaw = 0.0f, pitch = 0.32f, dist = 190;
+  int edits = 0, budget_edits = -1;
+  std::chrono::steady_clock::time_point last_edit;
+};
+ViewScene g_view;
+
+// The view scene in, the edited one out (and back: the same call again).
+void SwapScene() {
+  ViewScene& v = g_view;
+  std::swap(g_arena, v.arena), std::swap(g_title, v.title), std::swap(g_objs, v.objs), std::swap(g_gpu, v.gpu);
+  std::swap(g_tex, v.tex), std::swap(g_model_dirty, v.model_dirty), std::swap(g_sel, v.sel), std::swap(g_multi, v.multi);
+  std::swap(g_ring, v.ring), std::swap(g_light, v.light), std::swap(g_undo, v.undo), std::swap(g_redo, v.redo);
+  std::swap(g_target, v.target), std::swap(g_area_lo, v.area_lo), std::swap(g_area, v.area);
+  for (int k = 0; k < 5; ++k) std::swap(g_spot[k], v.spot[k]);
+  std::swap(g_yaw, v.yaw), std::swap(g_pitch, v.pitch), std::swap(g_dist, v.dist);
+  const int e = g_edits;
+  g_edits = v.edits, v.edits = e;
+  std::swap(g_budget_edits, v.budget_edits), std::swap(g_last_edit, v.last_edit);
+}
+
+std::vector<RingPart> RingPlacements(const svrfmt::Arena& a) {
+  std::vector<RingPart> out;
+  const auto flags = ModelFlagsOf(a);
+  bool per_rope = false;  // (the twelve per-rope models replace the four side ones, as the game draws them)
+  for (const auto& am : a.models) per_rope |= RoleOf(am.id) == Role::kRopePerRope;
+  auto put = [&](int mi, const M4& m) {
+    RingPart p;
+    p.model = mi;
+    std::memcpy(p.m, m.m, sizeof p.m);
+    out.push_back(p);
+  };
+  auto rope_y = [](int r) { return kMatY - kGameBase - float(r) * kGameGap; };  // (the game's own rope heights)
+  for (int mi = 0; mi < int(a.models.size()); ++mi) {
+    const auto& am = a.models[size_t(mi)];
+    if (am.zone != Zone::kRing) continue;
+    const uint32_t id = am.id;
+    switch (RoleOf(id)) {
+      case Role::kNormal: {
+        const auto f = flags.find(id);
+        if (f != flags.end() && f->second.find("m(") != std::string::npos) break;  // (placed by an animation track)
+        put(mi, M4());
+        bool mirrored = false;
+        if (f != flags.end())
+          for (char s1 : {' ', '\t', '\r'})
+            for (char s2 : {' ', '\t', '\r'}) mirrored |= f->second.find(std::string(1, s1) + "r" + s2) != std::string::npos;
+        if (mirrored) {  // (the game's mirrored copy, x -> -x)
+          M4 m;
+          m.m[0] = -1;
+          put(mi, m);
+        }
+        break;
+      }
+      case Role::kRopeSide:
+        if (!per_rope)
+          for (int r = 0; r < 3; ++r) put(mi, Place(RopeOffset(id) + V3{0, rope_y(r), 0}, 0));
+        break;
+      case Role::kRopePerRope:
+        put(mi, Place(RopeOffset(kSideRope[(id - 900) % 4]) + V3{0, rope_y(int(id - 900) / 4), 0}, 0));
+        break;
+      case Role::kPad:
+        for (int r = 0; r < 3; ++r) put(mi, Place({0, rope_y(r), 0}, 0));
+        break;
+      case Role::kTurnbuckle:
+        for (int corner = 0; corner < 4; ++corner)
+          for (int r = 0; r < 3; ++r) put(mi, TurnbuckleAt(corner, rope_y(r)));
+        break;
+      case Role::kApron:  // (as drawn above: 974 on the z sides, 973 on the x sides, each out along its front)
+        for (int side = 0; side < 2; ++side) {
+          const float yaw = (id == 974 ? 0 : kPi / 2) + float(side) * kPi, c = std::cos(yaw), s = std::sin(yaw);
+          put(mi, Place({-kApronOut * s, 0, -kApronOut * c}, yaw));
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return out;
+}
+
+void ViewArena(Arena* arena, const std::string& title, const std::string& manifest) {
+  if (g_budget_thread.joinable()) g_budget_thread.join();  // (it reads the edited arena)
+  SwapScene();
+  ForgetGpu();
+  ForgetTextures();
+  g_arena = arena, g_title = title;
+  FromManifest(manifest);
+  if (g_arena) BuildObjects();
+  ViewPreset(0);
+  SwapScene();
+}
+
+void DrawView(float w, float h) {
+  if (!g_view.arena) {
+    ImGui::TextDisabled("No arena to show.");
+    return;
+  }
+  SwapScene();
+  g_readonly = true;
+  const int iw = std::max(16, int(w)), ih = std::max(16, int(h));
+  ResizeTarget(iw, ih);
+  g_vp_min = ImGui::GetCursorScreenPos();
+  g_vp_size = ImVec2(float(iw), float(ih));
+  RenderScene();
+  ImGui::InvisibleButton("view_vp", g_vp_size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
+  const bool hovered = ImGui::IsItemHovered();
+  ImGui::GetWindowDrawList()->AddImage(ImTextureID(reinterpret_cast<uintptr_t>(g_rt_srv)), g_vp_min, ImVec2(g_vp_min.x + iw, g_vp_min.y + ih));
+  if (!g_vcam_set) ViewportInput(hovered);
+  if (g_view_hint)
+    ImGui::GetWindowDrawList()->AddText(ImVec2(g_vp_min.x + 8, g_vp_min.y + 6), IM_COL32(200, 200, 210, 160),
+                                        "Right drag: orbit   Middle drag: pan   Wheel: zoom   (a view: nothing here changes the arena)");
+  g_readonly = false;
+  SwapScene();
+}
+
+void SetViewCamera(const float view[16], const float proj[16]) {
+  std::memcpy(g_vcam_view.m, view, sizeof g_vcam_view.m);
+  std::memcpy(g_vcam_proj.m, proj, sizeof g_vcam_proj.m);
+  g_vcam_set = true;
+}
+void ClearViewCamera() { g_vcam_set = false; }
+void SetTextureOverride(const std::string& name, ID3D11ShaderResourceView* srv) {
+  if (srv) g_tex_override[name] = srv;
+  else g_tex_override.erase(name);
+}
+void SetViewExtra(ViewExtraFn fn) { g_view_extra = std::move(fn); }
+void SetGameTransparency(bool on) { g_game_alpha = on, g_cut_arena = nullptr; }
+void SetStageTime(float seconds, bool entrance) { g_stage_time = std::max(0.0f, seconds), g_stage_entrance = entrance; }
+
+void SetSelfLit(const std::vector<std::string>& textures, const std::vector<std::string>& masks) {
+  g_self_lit = std::set<std::string>(textures.begin(), textures.end());
+  g_led_mask = std::set<std::string>(masks.begin(), masks.end());
+}
+void SetViewHint(bool on) { g_view_hint = on; }
+
+void ClearView() {
+  SwapScene();
+  ForgetGpu();
+  ForgetTextures();
+  g_objs.clear(), g_model_dirty.clear(), g_undo.clear(), g_redo.clear();
+  g_arena = nullptr;
+  SwapScene();
+}
 
 void TestEdit() {
   if (!g_arena) return;
@@ -2221,5 +2792,122 @@ void Draw() {
   if (ImGui::CollapsingHeader("Size budget", ImGuiTreeNodeFlags_DefaultOpen)) BudgetPanel();
   ImGui::EndChild();
 }
+
+bool Budget(BudgetInfo& out) {
+  std::lock_guard lock(g_budget_mutex);
+  if (!g_budget_file_max) return false;
+  out.file = g_budget_file, out.file_max = g_budget_file_max;
+  out.unpacked = g_budget_unpacked, out.unpacked_max = g_budget_unpacked_max;
+  out.biggest = g_budget_biggest, out.biggest_id = g_budget_biggest_id;
+  return true;
+}
+
+// ---- for the Simple arena maker (editor.h)
+
+std::vector<std::string> TextureNames() {
+  std::vector<std::string> out;
+  if (!g_arena) return out;
+  for (const auto& b : g_arena->bundles)
+    for (const auto& t : b.textures) out.push_back(t.name);
+  return out;
+}
+
+std::vector<std::string> ModelTextures(uint32_t lo, uint32_t hi) {
+  std::vector<std::string> out;
+  if (!g_arena) return out;
+  for (const auto& am : g_arena->models)
+    if (am.id >= lo && am.id <= hi)
+      for (const auto& s : am.model.meshes) {
+        const int slot = DiffuseSlot(s);
+        if (slot >= 0 && slot < int(am.model.textures.size()) &&
+            std::find(out.begin(), out.end(), am.model.textures[size_t(slot)]) == out.end())
+          out.push_back(am.model.textures[size_t(slot)]);
+      }
+  return out;
+}
+
+bool TextureImage(const std::string& name, Image& out, int* w, int* h) {
+  const BundleTexture* t = g_arena ? g_arena->FindTexture(name) : nullptr;
+  if (!t) return false;
+  DdsInfo info;
+  if (!DdsInfoOf(t->data, info)) return false;
+  if (w) *w = info.w;
+  if (h) *h = info.h;
+  return DdsDecode(t->data, out);
+}
+
+bool ReplaceTexture(const std::string& name, const Image& img) {
+  if (!g_arena || img.rgba.empty()) return false;
+  for (auto& b : g_arena->bundles)
+    for (auto& t : b.textures) {
+      if (t.name != name) continue;
+      DdsInfo info;
+      if (!DdsInfoOf(t.data, info)) return false;
+      const DxtFormat fmt = info.format == DxtFormat::kArgb ? DxtFormat::kDxt5 : info.format;
+      t.data = DdsEncode(Resize(img, info.w, info.h), fmt, info.mips > 1);
+      b.changed = true;
+      ForgetTextures();
+      Edited();
+      return true;
+    }
+  return false;
+}
+
+void DrawViewport(float w, float h) {
+  if (!g_arena) {
+    ImGui::TextDisabled("No arena yet.");
+    return;
+  }
+  const int iw = std::max(16, int(w)), ih = std::max(16, int(h));
+  UpdateBudget();  // (the size, for the problems list: measured after edits, as the editor's panel does)
+  ResizeTarget(iw, ih);
+  g_vp_min = ImGui::GetCursorScreenPos();
+  g_vp_size = ImVec2(float(iw), float(ih));
+  RenderScene();
+  ImGui::InvisibleButton("simple_vp", g_vp_size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
+  const bool hovered = ImGui::IsItemHovered();
+  ImGui::GetWindowDrawList()->AddImage(ImTextureID(reinterpret_cast<uintptr_t>(g_rt_srv)), g_vp_min, ImVec2(g_vp_min.x + iw, g_vp_min.y + ih));
+  if (hovered) {  // (a look: turn, move and zoom the camera - nothing here selects or edits)
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.MouseWheel != 0) g_dist = std::clamp(g_dist * std::pow(0.88f, io.MouseWheel), 10.0f, 2000.0f);
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) || ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+      const ImVec2 d = io.MouseDelta;
+      g_yaw -= ScreenX() * d.x * 0.006f;
+      g_pitch = std::clamp(g_pitch + d.y * 0.006f, -0.2f, 1.55f);
+    }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+      const ImVec2 d = io.MouseDelta;
+      const V3 fwd = Norm(g_target - Eye()), right = Norm(Cross({0, -1, 0}, fwd)), up = Cross(fwd, right);
+      g_target = g_target - right * (ScreenX() * d.x * g_dist * 0.0015f) + up * (d.y * g_dist * 0.0015f);
+    }
+  }
+  ImGui::GetWindowDrawList()->AddText(ImVec2(g_vp_min.x + 8, g_vp_min.y + 6), IM_COL32(200, 200, 210, 200),
+                                      "Drag: turn   Middle drag: move   Wheel: zoom");
+}
+
+bool TextureBytes(const std::string& name, Bytes& out) {
+  const BundleTexture* t = g_arena ? g_arena->FindTexture(name) : nullptr;
+  if (!t) return false;
+  out = t->data;
+  return true;
+}
+
+bool SetTextureBytes(const std::string& name, const Bytes& dds) {
+  if (!g_arena) return false;
+  for (auto& b : g_arena->bundles)
+    for (auto& t : b.textures)
+      if (t.name == name) {
+        t.data = dds;
+        b.changed = true;
+        ForgetTextures();
+        Edited();
+        return true;
+      }
+  return false;
+}
+
+void SetViewPreset(int which) { ViewPreset(which); }
+void DrawRingKit() { RingKitPanel(); }
+void DrawLighting() { LightingPanel(); }
 
 }  // namespace editor

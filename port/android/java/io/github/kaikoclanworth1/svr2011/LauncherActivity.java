@@ -519,6 +519,13 @@ public class LauncherActivity extends Activity {
         }
         if (drivers_ != null && !drivers_.readyToPlay(this::play)) return;  // (Mali: alpha mode first)
         settings_.save();
+        String clash = ModsPage.attireGuard(null);  // (two attire mods on one attire: the newer one moves)
+        if (!clash.isEmpty()) {
+            new android.app.AlertDialog.Builder(this).setTitle("Attire mods").setMessage(clash)
+                .setPositiveButton("Play", (dl, w) -> startActivity(new Intent(this, GameActivity.class)))
+                .setNegativeButton("Not now", null).show();
+            return;
+        }
         startActivity(new Intent(this, GameActivity.class));
     }
 
@@ -623,6 +630,8 @@ public class LauncherActivity extends Activity {
                 if (loading_ || !touched[0] || values[position].equals(settings_.getString(key, fallback))) return;
                 if (quoted) settings_.setString(key, values[position]);
                 else settings_.setInt(key, Integer.parseInt(values[position]));
+                // (the in-game 900P / 1080P choice would win over this one: graphics_page.cpp)
+                if (key.equals("native_max_scale")) settings_.setInt("native_scene_height", 0);
                 saved(label);
             }
 
@@ -652,6 +661,13 @@ public class LauncherActivity extends Activity {
         choice(display, "Language", "The game's text (the commentary stays English); at the next start",
             "user_language", new String[] {"English", "Français", "Deutsch", "Español", "Italiano"},
             new String[] {"1", "4", "3", "5", "6"}, false, "1");
+
+        // (src/pad_types.cpp: player 1's rumble on the device's own motor when the controller has none -
+        // handhelds' built-in pads; a Bluetooth pad without rumble too)
+        LinearLayout controls = card(c, "Controls");
+        toggle(controls, "Vibrate the device when the controller can't",
+            "Built-in controllers of handhelds (AYN, Retroid ...) and pads without rumble: the device vibrates instead",
+            "device_vibration", true);
 
         LinearLayout quality = card(c, "Quality");
         choice(quality, "Render resolution", "The most the game renders at; lower is faster", "native_max_scale",
@@ -692,6 +708,7 @@ public class LauncherActivity extends Activity {
             settings_.setString("native_renderer", "main");
             settings_.setInt("user_language", 1);
             settings_.setInt("native_max_scale", 4);
+            settings_.setInt("native_scene_height", 0);
             settings_.setBool("native_2x_msaa", true);
             settings_.setBool("native_scale_effects", false);
             settings_.setBool("unlock_30fps", true);
@@ -699,6 +716,7 @@ public class LauncherActivity extends Activity {
             settings_.setBool("native_prepare_pipelines", true);
             settings_.setBool("native_dump_textures", false);
             settings_.setBool("audio_mute", false);
+            settings_.setBool("device_vibration", true);
             settings_.setBool("unlock_everything", true);
             settings_.setBool("skip_intros", false);
             settings_.setBool("skip_training", false);

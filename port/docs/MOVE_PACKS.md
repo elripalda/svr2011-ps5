@@ -55,6 +55,16 @@ Extreme Neckbreaker Drop. The game's own files are never written.
   the most similar stock move (same EXH group and x, fewest differing EXH
   bytes, its victim chained to a motion), in the BM and MOTP copies.
 
+- Top-rope moves: 2011 seats the opponent on the top turnbuckle first (stock
+  23100 lifts him; its last event, op 79 y -1000, raises his base 1000 units),
+  and slots 0x140-0x146 play moves that start from that seat (WAZE +0x73 13
+  facing out, 14 facing in; 23163's victim starts at root Y -210). A 2010 one
+  (situation 10/11: Super Hurricanrana 5735, Superplex 5736, Sunset Powerbomb
+  5771) lifts him from the mat itself, so played there he went a body-height
+  above the turnbuckle (Sabu). Not converted: `svr10_superstar.py` puts only
+  situation 13/14 moves in those slots (a same-name 2011 move, else the base's).
+  Slot 0x10A (corner grapple, standing opponent) still takes situation 10.
+
 `svr10_moves.py fix <2010 pac> <2011 pac> <mod.svrmod>...` applies both to a
 built mod (version +0.1, a pack.txt line so the overlay rebuilds; a second
 run changes nothing).
@@ -99,6 +109,21 @@ Where a pack goes:
 A `disabled` file in the mod or pack folder turns it off. Keys the game
 already has are left alone.
 
+A pack of its own may carry a `manifest.txt` (`type=moves`, `name=`): its
+entrances are listed in CREATE AN ENTRANCE as `MOD: <name>` (as a superstar
+mod's are), else as the entrance script's name and the game from `pack.txt`'s
+first line. The Mod Maker's Simple entrance porting names them after the
+superstar.
+
+A move a pack adds only plays for a wrestler whose moveset has it (a superstar
+mod's `moves.txt`, or Create-A-Moveset): each wrestler's match bank is gathered
+from the `MOT/RR..` banks by his profile. Forced in a test
+(`SVR2011_TEST_FORCE_MOVE`) on a wrestler without it, it isn't found.
+
+`tools/moves_port.py` (WWE '12 / '13) writes such packs from other games' moves:
+the source's bodies on a 2011 template move's record, banks and events
+(docs/OTHER_GAMES.md).
+
 ## How the game uses them
 
 Packs are read in path order: `Mods\Moves\<pack>`, then
@@ -138,6 +163,31 @@ old exported move pack hides a mod's fixed motions that way.
      (`superstar_mods.cpp`).
    - `tools/plist_fix.py` can refresh an arc instead, for tests on patched
      files.
+4. **Installed DLC:**
+   - DLC Vol. 2 brings its own `pac\m_dlc02.pac` (MOT/RR00-02, RB00, BMD0,
+     RRBS, BA00) and `pac\mpsp_dlc02.pac` (all of MOTP/GAME). With it
+     installed the game reads those, not the overlay's, so the packs go into
+     copies of them too: `Mods\PacOverlay\dlc\<package>\<name>`.
+   - The package (`<user data>\0000000000000000\5451085D\00000002\<package>`)
+     is only ever read. Test folders link their user data to the player's,
+     and an older build that merged into the package changed the player's
+     DLC. If a package still has a `<name>.orig` from that build, it is put
+     back at start-up.
+   - The package's `info\catalog_hd.arc` / `catalog_sd.arc` are pre-built
+     directories of its pacs (each entry's name, big-endian sector and size).
+     The game reads the pacs through them, so a merged copy read at the old
+     places crashed every match. Copies of the catalogs with the copies'
+     places go beside them. An entry is found by name plus old place; a copy
+     that can't be found so isn't served.
+   - When the game mounts the package (`dlc0:`, `dlc1:` ... in the order it
+     finds them; SDK `SetContentMountHook`) its root gets links
+     `<root>:\pac\<name>` and `<root>:\info\<catalog>` to the copies. The SDK
+     picks the longest matching link, and an open checks a link for the file
+     itself before its folder's.
+   - One merge at a time: `Mods\PacOverlay\merge.lock` (a folder), and every
+     pac is written as `.part` and renamed.
+   - The DLC's `misc.pac` is not copied (one with the packs' records crashed
+     the pac loading); its MOVS/WAZE gets the packs' records as it loads.
 
 ## Tests
 

@@ -14,6 +14,7 @@
 // its rows by their parent node, +0x38). No file size limit applies.
 #include "match_types.h"
 #include "mystery_opponent.h"
+#include "pad_types.h"
 
 #include <algorithm>
 #include <cctype>
@@ -24,6 +25,8 @@
 #include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <random>
 #include <string>
@@ -37,6 +40,9 @@
 
 #include "arena_mods.h"
 #include "match_hud.h"
+#include "online_rules.h"
+#include "p2p.h"
+#include "script_input.h"
 #include "generated/default/svr2011_init.h"
 
 namespace {
@@ -134,6 +140,28 @@ struct WeaponsRow {
   uint32_t index;  // its place in the group
 };
 std::vector<WeaponsRow> g_weapons_rows;
+// HELL IN A CELL: START ON THE ROOF - a third row of each cell submenu (match
+// type mod hiac_roof_start): everyone is put on the cell's roof at the bell
+// (MatchTypesUpdate). The roof is the area +444 10, the height y -60.5 (y is
+// down) of the real position vector *(char +304) - the shove-off, the
+// break-through and climbing down work from there as after a climb; no pins
+// count up there (the game's own rule), so the fight comes down to finish.
+constexpr uint32_t kRoofLabel = 0x0FA0B120, kRoofText = 0x0FA0B121;
+std::vector<WeaponsRow> g_roof_rows;
+bool g_pending_roof = false;
+// CPUs left alone on the cell's roof climb down: a CPU wrestler (its match
+// slot's controller, slot -8, 1, and controller port +1152 4 or more) alone up there (area +444 10, no other
+// wrestler 0-5 on it) for 25 s of match frames takes the game's own
+// way down - the climb-down a player starts with the action button pushed
+// towards an edge (sub_8230A760: area 10, the edge check sub_821BE8F8, then
+// sub_82397228(char, 1672)) - from his free state (the post-hook of its
+// handler sub_82292D50). The CPUs' AI never picks it on purpose (a 4-CPU
+// fatal-4-way stayed up 4 min). Only match state decides (frames, places,
+// slots): the same on both machines online. Humans are never touched. Test
+// aids: SVR2011_TEST_ROOF_DOWN=0 off; SVR2011_TEST_ROOF_DOWN_SECS=<s>.
+constexpr uint32_t kRoofArea = 10, kClimbDown = 1672;
+uint32_t g_roof_alone_since[6] = {};  // match frame + 1 since that person is alone on the roof (0: not)
+bool g_roof = false;  // the match set up starts on the cell's roof
 bool g_pending_weapons = false;
 bool g_weapons = false;  // the match set up is a WEAPONS EVERYWHERE one
 uint32_t g_weapons_text[2] = {};
@@ -148,6 +176,23 @@ int g_slobber_row = -1;  // its place in the group
 bool g_pending_slobber = false;
 bool g_slobber = false;  // the match set up is a Slobber Knocker
 uint32_t g_slobber_text[2] = {};
+// GAUNTLET ELIMINATOR (gauntlet_eliminator.cpp): HANDICAP rows after SLOBBER
+// KNOCKER - the gauntlet 0x52 for six, each on his own: player 1 and the
+// first opponent picked (the 1 on 1 select screen), four random entrants who
+// come in on a timer; a pin or submission eliminates. Its EXTREME RULES row
+// adds weapons lying about (6-MAN's set: the Extreme Rules option crashed
+// six-person matches) and no disqualifications.
+constexpr uint32_t kGeLabel = 0x0FA0B10C, kGeText = 0x0FA0B10D, kGeErLabel = 0x0FA0B10E, kGeErText = 0x0FA0B10F;
+constexpr int kGePeople = 6;
+int g_ge_row = -1, g_ge_er_row = -1;  // their places in the group
+bool g_pending_ge = false;
+bool g_ge = false;  // the match set up is a Gauntlet Eliminator
+// ONLINE: the session's port rules play another rule than the session's own
+// (GAUNTLET ELIMINATOR: 6-MAN 0x08 -> the gauntlet 0x52). The lobby's set-up
+// (sub_827374A0) sees it, but the match's live rules are built again from
+// the session's rule at its start (sub_828C48E8): there it's swapped too.
+uint32_t g_online_from = ~0u, g_online_to = ~0u;
+uint32_t g_ge_text[4] = {};
 
 // ELIMINATION: after NORMAL in TRIPLE THREAT (rule 0x0D) and FATAL-4-WAY
 // (0x0E), a copy whose match has the ELIMINATION rule on (as MATCH CREATOR ->
@@ -163,8 +208,72 @@ constexpr uint32_t kElimLabel = 0x0FA0B104, kElimText = 0x0FA0B105;
 // after WEAPONS EVERYWHERE (its match: the mode's normal one, kModes), and a
 // row in 6-MAN and HANDICAP.
 constexpr uint32_t kStagesLabel = 0x0FA0B106, kStagesText = 0x0FA0B107;
-std::vector<WeaponsRow> g_stages_rows;
+// Its submenu: one row per set of stages (three_stages.cpp kSets), labels
+// kStagesSetLabel + 2 * set (+1 its description: 0x0FA0B114-0x0FA0B11F).
+// Sets 3 (TABLE / TLC / LADDER), 5 (TABLE / LADDER / TABLE) and 4 (HELL IN A
+// CELL) only where the mode has those matches: one on one, two on two,
+// triple threat, fatal-4-way; 3 and 5 are the switch mod
+// three_stages_tables_ladders.
+constexpr uint32_t kStagesSetLabel = 0x0FA0B114;
+struct StagesRow {
+  uint32_t group, index;
+  int set;
+};
+// A structure's match with weapons inside (WEAPONS EVERYWHERE's way, its own
+// placed list): its row becomes a submenu of the match and the weapons one.
+// - HELL IN A CELL: TABLES & LADDERS (one on one, two on two, triple threat,
+//   fatal-4-way: 0x31-0x34) - tables, ladders and chairs inside the cell
+//   (kPlacedCell). Not the 6-man cell (0x35): the Extreme Rules option that
+//   loads the table and ladder models crashed 6-man matches.
+// - STEEL CAGE: WEAPONS INSIDE (0x3C-0x3F) and INFERNO MATCH: WEAPONS INSIDE
+//   (0x51) - in the ring (kPlacedRing): the cage stands at the ring's edge,
+//   the fire around it. The models every match loads (chairs, hand weapons):
+//   with the Extreme Rules option (+56: tables, ladders) the cage crashed at
+//   its start (sub_824186E8 with no event data, as 6-man).
+constexpr uint32_t kCellFirst = 0x31, kCellLast = 0x34;
+struct StructureWeapons {
+  uint32_t first, last;
+  const char* mod;       // (its match type mod)
+  uint32_t label, text;  // (B108/B109: mystery_opponent.h)
+  const char* name;
+  const char* about;
+};
+constexpr StructureWeapons kStructures[] = {
+    {kCellFirst, kCellLast, "hiac_tables_ladders", 0x0FA0B10A, 0x0FA0B10B, "TABLES & LADDERS",
+     "Hell in a Cell with tables, ladders and chairs lying inside the cell - no disqualifications."},
+    {0x3C, 0x3F, "cage_weapons", 0x0FA0B110, 0x0FA0B111, "WEAPONS INSIDE",
+     "A Steel Cage match with chairs and other weapons lying in the ring - no disqualifications."},
+    {0x51, 0x51, "inferno_weapons", 0x0FA0B112, 0x0FA0B113, "WEAPONS INSIDE",
+     "An Inferno match with chairs and other weapons lying in the ring - no disqualifications."},
+};
+uint32_t g_structure_text[std::size(kStructures)][2] = {};
+const StructureWeapons* StructureOf(uint32_t rule) {
+  for (const StructureWeapons& s : kStructures)
+    if (rule >= s.first && rule <= s.last) return &s;
+  return nullptr;
+}
+std::vector<StagesRow> g_stages_rows;
 bool g_pending_stages = false;
+int g_pending_set = 0;
+uint32_t g_stages_set_text[2 * svr2011::kThreeStagesSets] = {};
+// A set's match in a mode (its normal one): the TLC one for sets 3 and 5, the
+// cell one for set 4.
+uint32_t SetRule(uint32_t normal, int set) {
+  constexpr uint32_t kNormals[] = {0x00, 0x03, 0x0D, 0x0E}, kTlc[] = {0x48, 0x49, 0x4A, 0x4B}, kCell[] = {0x31, 0x32, 0x33, 0x34};
+  for (int i = 0; i < 4; ++i)
+    if (normal == kNormals[i]) return set == 3 || set == 5 ? kTlc[i] : set == 4 ? kCell[i] : normal;
+  return normal;
+}
+// The sets a mode's submenu offers, in row order: the three normal ones, then
+// (one on one, two on two, triple threat, fatal-4-way) the table / ladder
+// ones (switch mod three_stages_tables_ladders) and the cell one.
+std::vector<int> SetsFor(uint32_t normal) {
+  std::vector<int> sets{0, 1, 2};
+  if (SetRule(normal, 3) == normal) return sets;
+  if (svr2011::MatchTypeSwitchOn("three_stages_tables_ladders")) sets.push_back(5), sets.push_back(3);
+  sets.push_back(4);
+  return sets;
+}
 
 // The modes with an EXTREME RULES row (group, its normal match: THREE STAGES
 // OF HELL's first fall). Their EXTREME RULES becomes a submenu of EXTREME
@@ -185,13 +294,15 @@ constexpr PlainMode kPlainModes[] = {{0xA09C, 0x0A, 0x08}, {0xA086, 0x0B, 0x0F}}
 // A WEAPONS EVERYWHERE match's rule: Extreme Rules, or 6-MAN's / HANDICAP's normal one.
 bool WeaponsRule(uint32_t rule) {
   if (rule >= kExtremeFirst && rule <= kExtremeLast) return true;
+  if (StructureOf(rule)) return true;
+  if (rule == 0x52) return true;  // (GAUNTLET ELIMINATOR: EXTREME RULES)
   for (const PlainMode& m : kPlainModes)
     if (rule == m.normal) return true;
   return false;
 }
 bool StagesRule(uint32_t rule) {
   for (const ExtremeMode& m : kExtremeModes)
-    if (rule == m.normal) return true;
+    if (rule == m.normal || rule == SetRule(m.normal, 3) || rule == SetRule(m.normal, 4)) return true;
   for (const PlainMode& m : kPlainModes)
     if (rule == m.normal) return true;
   return false;
@@ -213,7 +324,7 @@ int g_test_rule = -1;
 // Test aid: SVR2011_TEST_MODE=<mode> - ONE ON ONE NORMAL (route match) plays
 // a mode only a runtime row gives: three_stages, elimination_tt,
 // elimination_f4w, weapons, slobber, lumberjack (as if its row was picked).
-enum class TestMode { kNone, kThreeStages, kElimTT, kElimF4W, kWeapons, kSlobber, kLumberjack };
+enum class TestMode { kNone, kThreeStages, kElimTT, kElimF4W, kWeapons, kSlobber, kLumberjack, kGauntletElim, kGauntletElimEr, kMystery, kRoof };
 TestMode g_test_mode = TestMode::kNone;
 
 // Node ids (+0x1C): the game finds a node by binary search over the table
@@ -228,6 +339,7 @@ TestMode g_test_mode = TestMode::kNone;
 std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
   if (size < kFirst || Rd32(table) != 1) return {};
   g_weapons_rows.clear();
+  g_roof_rows.clear();
   g_stages_rows.clear();
   g_elim_rows.clear();
   const uint32_t total = Rd32(table + 4), shown = Rd32(table + 8);
@@ -259,17 +371,55 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
   std::vector<uint8_t> tail;  // the submenus' areas: new groups, at the end
   uint32_t added = 0;
   // (match type mods switched off: their rows aren't added)
-  const bool elimination = svr2011::MatchTypeOn("elimination"), slobber = svr2011::MatchTypeOn("slobber_knocker");
-  const bool mystery = svr2011::MatchTypeOn("mystery_opponent"), weapons = svr2011::MatchTypeOn("weapons_everywhere");
-  const bool stages = svr2011::MatchTypeOn("three_stages_of_hell");
-  const bool more_backstage = svr2011::MatchTypeOn("backstage_more_people");
-  const bool free_roam_on = svr2011::MatchTypeOn("free_roaming_backstage");
+  const bool elimination = svr2011::MatchTypeSwitchOn("elimination"), slobber = svr2011::MatchTypeSwitchOn("slobber_knocker");
+  const bool mystery = svr2011::MatchTypeSwitchOn("mystery_opponent"), weapons = svr2011::MatchTypeSwitchOn("weapons_everywhere");
+  const bool stages = svr2011::MatchTypeSwitchOn("three_stages_of_hell");
+  bool structure_on[std::size(kStructures)];
+  for (size_t s = 0; s < std::size(kStructures); ++s) structure_on[s] = svr2011::MatchTypeSwitchOn(kStructures[s].mod);
+  const bool gauntlet_elim = svr2011::MatchTypeSwitchOn("gauntlet_eliminator");
+  const bool roof_start = svr2011::MatchTypeSwitchOn("hiac_roof_start");
+  const bool more_backstage = svr2011::MatchTypeSwitchOn("backstage_more_people");
+  const bool free_roam_on = svr2011::MatchTypeSwitchOn("free_roaming_backstage");
+  // THREE STAGES OF HELL's sets: rows of a submenu (its node `parent`, depth
+  // word +0x14 `depth`), in group `in_group`, nodes from `first_node`, each
+  // a copy of a match row of the mode (`leaf_like`: the table's first row of
+  // that rule) playing the set's match.
+  struct StageSets {
+    uint32_t parent = 0, depth = 0, normal = 0;
+  } stage_sets;
+  const auto AddStageSets = [&](const StageSets& s, uint32_t in_group, uint32_t first_node) {
+    const uint8_t* like = nullptr;
+    for (uint32_t j = 0; j < total && !like; ++j) {
+      const uint8_t* r = table + kFirst + j * kRec;
+      if (Rd32(r + 0x54) == kScreenMatch && Rd32(r + 0x5C) == s.normal) like = r;
+    }
+    if (!like) return;
+    const std::vector<int> offered = SetsFor(s.normal);
+    const int sets = int(offered.size());
+    for (int row = 0; row < sets; ++row) {
+      const int k = offered[size_t(row)];
+      std::vector<uint8_t> leaf(like, like + kRec);
+      Wr32(leaf.data() + 0x00, kStagesSetLabel + uint32_t(2 * k));
+      Wr32(leaf.data() + 0x04, kStagesSetLabel + uint32_t(2 * k + 1));
+      Wr32(leaf.data() + 0x14, s.depth);
+      Wr32(leaf.data() + 0x18, in_group);
+      Wr32(leaf.data() + 0x1C, first_node + uint32_t(row));
+      Wr32(leaf.data() + 0x38, s.parent);
+      Wr32(leaf.data() + 0x40, 0);
+      Wr32(leaf.data() + 0x3C, row + 1 == sets ? Rd32(like + 0x3C) | 2u : Rd32(like + 0x3C) & ~2u);
+      Wr32(leaf.data() + 0x5C, SetRule(s.normal, k));
+      g_stages_rows.push_back({in_group, uint32_t(row), k});
+      tail.insert(tail.end(), leaf.begin(), leaf.end());
+      ++added;
+    }
+    REXLOG_INFO("match types: THREE STAGES OF HELL sets (rule {:02X}): {} rows, group {:02X}", s.normal, sets, in_group);
+  };
   for (uint32_t i = 0; i < total; ++i) {
     const uint8_t* rec = table + kFirst + i * kRec;
     out.insert(out.end(), rec, rec + kRec);
     if (Rd32(rec + 0x54) != kScreenMatch) continue;
     for (const Row& row : kRows) {
-      if (Rd32(rec) != row.anchor || Rd32(rec + 0x18) != row.group || !svr2011::MatchTypeOn(row.mod)) continue;
+      if (Rd32(rec) != row.anchor || Rd32(rec + 0x18) != row.group || !svr2011::MatchTypeSwitchOn(row.mod)) continue;
       uint8_t* prev = out.data() + out.size() - kRec;
       std::vector<uint8_t> copy(prev, prev + kRec);
       Wr32(copy.data() + 0x00, row.label);
@@ -319,6 +469,25 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
       ++added;
       REXLOG_INFO("match types: SLOBBER KNOCKER at group {:02X} row {}", kHandicapGroup, index);
     }
+    if (gauntlet_elim && Rd32(rec) == kGauntletRow && Rd32(rec + 0x18) == kHandicapGroup) {
+      for (int k = 0; k < 2; ++k) {  // (GAUNTLET ELIMINATOR, its EXTREME RULES one)
+        std::vector<uint8_t> copy(rec, rec + kRec);
+        Wr32(copy.data() + 0x00, k ? kGeErLabel : kGeLabel);
+        Wr32(copy.data() + 0x04, k ? kGeErText : kGeText);
+        Wr32(copy.data() + 0x40, 0);
+        uint8_t* prev = out.data() + out.size() - kRec;  // (the group's last row stays last)
+        const uint32_t flags = Rd32(prev + 0x3C);
+        Wr32(prev + 0x3C, flags & ~2u);
+        Wr32(copy.data() + 0x3C, (Rd32(copy.data() + 0x3C) & ~2u) | (flags & 2u));
+        int index = 0;
+        for (size_t at = kFirst; at < out.size(); at += kRec)
+          if (Rd32(out.data() + at + 0x18) == kHandicapGroup) ++index;
+        (k ? g_ge_er_row : g_ge_row) = index;
+        out.insert(out.end(), copy.begin(), copy.end());
+        ++added;
+      }
+      REXLOG_INFO("match types: GAUNTLET ELIMINATOR at group {:02X} rows {} and {}", kHandicapGroup, g_ge_row, g_ge_er_row);
+    }
     if (mystery && Rd32(rec + 0x5C) == 0x00 && Rd32(rec + 0x18) == kFullGroup && submenu) {
       // NORMAL MATCH becomes a submenu (its own node) of NORMAL MATCH and
       // MYSTERY OPPONENT (a new group), as EXTREME RULES below.
@@ -351,6 +520,52 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
       REXLOG_INFO("match types: NORMAL MATCH submenu with MYSTERY OPPONENT, group {:02X}", group);
       node += 2;
       ++group;
+    }
+    if (const uint32_t rule = Rd32(rec + 0x5C), st = StructureOf(rule) ? uint32_t(StructureOf(rule) - kStructures) : ~0u;
+        st != ~0u && (structure_on[st] || (st == 0 && roof_start)) && submenu) {
+      // (the cell: its weapons row and / or START ON THE ROOF)
+      const bool with_weapons = structure_on[st], with_roof = st == 0 && roof_start;
+      // The row becomes a submenu (a new node in its place) of the match and
+      // its weapons one (a new group).
+      out.resize(out.size() - kRec);
+      std::vector<uint8_t> row(submenu, submenu + kRec);
+      Wr32(row.data() + 0x00, Rd32(rec + 0x00));
+      Wr32(row.data() + 0x04, Rd32(rec + 0x04));  // (description)
+      Wr32(row.data() + 0x18, Rd32(rec + 0x18));
+      Wr32(row.data() + 0x1C, Rd32(rec + 0x1C));  // (its node: the cell row's own)
+      Wr32(row.data() + 0x38, Rd32(rec + 0x38));
+      Wr32(row.data() + 0x3C, (Rd32(row.data() + 0x3C) & ~2u) | (Rd32(rec + 0x3C) & 2u));
+      Wr32(row.data() + 0x40, Rd32(rec + 0x40));
+      out.insert(out.end(), row.begin(), row.end());
+      // (the match, the weapons one, the roof one)
+      const uint32_t leaves = 1 + (with_weapons ? 1 : 0) + (with_roof ? 1 : 0);
+      for (uint32_t k = 0; k < leaves; ++k) {
+        const bool is_weapons = k == 1 && with_weapons, is_roof = k == leaves - 1 && with_roof;
+        std::vector<uint8_t> leaf(rec, rec + kRec);
+        Wr32(leaf.data() + 0x18, group);
+        Wr32(leaf.data() + 0x1C, node + k);
+        Wr32(leaf.data() + 0x38, Rd32(rec + 0x1C));
+        Wr32(leaf.data() + 0x14, Rd32(rec + 0x14) + 0x100);  // (depth +0x16: one down)
+        Wr32(leaf.data() + 0x40, 0);
+        Wr32(leaf.data() + 0x3C, k == leaves - 1 ? Rd32(rec + 0x3C) | 2u : Rd32(rec + 0x3C) & ~2u);
+        if (is_weapons) {
+          Wr32(leaf.data() + 0x00, kStructures[st].label);
+          Wr32(leaf.data() + 0x04, kStructures[st].text);
+          g_weapons_rows.push_back({group, k});
+        }
+        if (is_roof) {
+          Wr32(leaf.data() + 0x00, kRoofLabel);
+          Wr32(leaf.data() + 0x04, kRoofText);
+          g_roof_rows.push_back({group, k});
+        }
+        tail.insert(tail.end(), leaf.begin(), leaf.end());
+        ++added;
+      }
+      REXLOG_INFO("match types: rule {:02X} submenu with {}{}, group {:02X}", rule, with_weapons ? kStructures[st].name : "",
+                  with_roof ? " + START ON THE ROOF" : "", group);
+      node += leaves;
+      ++group;
+      continue;
     }
     const ExtremeMode* mode = nullptr;
     for (const ExtremeMode& m : kExtremeModes)
@@ -385,18 +600,27 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
           Wr32(leaf.data() + 0x00, kWeaponsLabel);
           Wr32(leaf.data() + 0x04, kWeaponsText);
           g_weapons_rows.push_back({group, k});
-        } else if (kinds[k] == 2) {
-          Wr32(leaf.data() + 0x00, kStagesLabel);
-          Wr32(leaf.data() + 0x04, kStagesText);
-          Wr32(leaf.data() + 0x5C, mode->normal);  // (the mode's normal match; three_stages.cpp changes its rules)
-          g_stages_rows.push_back({group, k});
+        } else if (kinds[k] == 2) {  // (a submenu of the sets: a new node, its rows a new group)
+          std::vector<uint8_t> row(submenu, submenu + kRec);
+          Wr32(row.data() + 0x00, kStagesLabel);
+          Wr32(row.data() + 0x04, kStagesText);
+          Wr32(row.data() + 0x14, Rd32(submenu + 0x14) + 0x100);  // (one down from EXTREME RULES)
+          Wr32(row.data() + 0x18, group);
+          Wr32(row.data() + 0x1C, node + k);
+          Wr32(row.data() + 0x38, Rd32(rec + 0x1C));
+          Wr32(row.data() + 0x3C, (Rd32(row.data() + 0x3C) & ~2u) | (Rd32(leaf.data() + 0x3C) & 2u));
+          Wr32(row.data() + 0x40, 0);
+          leaf = row;
+          stage_sets = {node + k, Rd32(rec + 0x14) + 0x200, mode->normal};
         }
         tail.insert(tail.end(), leaf.begin(), leaf.end());
         ++added;
       }
+      if (stage_sets.parent) AddStageSets(stage_sets, group + 1, node + uint32_t(kinds.size()));
       REXLOG_INFO("match types: EXTREME RULES (rule {:02X}) submenu with WEAPONS EVERYWHERE, group {:02X}", rule, group);
       node += uint32_t(kinds.size());
       ++group;
+      if (stage_sets.parent) node += uint32_t(SetsFor(stage_sets.normal).size()), ++group, stage_sets = {};
     } else if (const uint32_t rule = Rd32(rec + 0x5C);
                weapons && rule >= kExtremeFirst && rule <= kExtremeLast && !mode) {
       const uint32_t in_group = Rd32(rec + 0x18);
@@ -425,6 +649,19 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
         Wr32(copy.data() + 0x04, k == 0 ? kWeaponsText : kStagesText);
         Wr32(copy.data() + 0x5C, m.normal);
         Wr32(copy.data() + 0x40, 0);
+        if (k == 1 && submenu) {  // (THREE STAGES OF HELL: a submenu of the sets - a new node, its rows a new group)
+          std::vector<uint8_t> row(submenu, submenu + kRec);
+          Wr32(row.data() + 0x00, kStagesLabel);
+          Wr32(row.data() + 0x04, kStagesText);
+          Wr32(row.data() + 0x18, m.group);
+          Wr32(row.data() + 0x1C, node);
+          Wr32(row.data() + 0x38, Rd32(rec + 0x38));
+          Wr32(row.data() + 0x40, 0);
+          copy = row;
+          AddStageSets({node, Rd32(rec + 0x14) + 0x100, m.normal}, group, node + 1);
+          node += 1 + uint32_t(SetsFor(m.normal).size());
+          ++group;
+        }
         uint8_t* prev = out.data() + out.size() - kRec;  // (the group's last row stays last)
         const uint32_t flags = Rd32(prev + 0x3C);
         Wr32(prev + 0x3C, flags & ~2u);
@@ -432,7 +669,7 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
         uint32_t index = 0;
         for (size_t at = kFirst; at < out.size(); at += kRec)
           if (Rd32(out.data() + at + 0x18) == m.group) ++index;
-        (k == 0 ? g_weapons_rows : g_stages_rows).push_back({m.group, index});
+        if (k == 0) g_weapons_rows.push_back({m.group, index});
         out.insert(out.end(), copy.begin(), copy.end());
         ++added;
         REXLOG_INFO("match types: {} (rule {:02X}) at group {:02X} row {}",
@@ -595,7 +832,22 @@ void ShapeRule(uint8_t* base, uint32_t rule, uint32_t like, bool select_only) {
     // Slobber Knocker: the 2 waiting opponents (people 2-3, kind 3) as manager
     // slots while the select screen runs (it would have them picked); kind 3
     // again as the people are built (sub_828BBEF0 below).
-    if (rule == kGauntlet && g_slobber) {
+    if (rule == kGauntlet && g_ge) {  // (six: people 2-5 the entrants, each his own team)
+      rec[0] = 0, rec[1] = uint8_t(kGePeople);  // (a big-endian u16)
+      rec2[34] = uint8_t(kGePeople);
+      // (kind 2 - manager slots - while the select screen runs, 3 as the people
+      // are built; online there's no select screen and the people builder
+      // isn't run: 3 at once)
+      const uint8_t kind = g_online_to == kGauntlet ? 3 : 2;
+      for (int i = 2; i < kGePeople; ++i) rec[2 + i * 3] = uint8_t(i), rec[2 + i * 3 + 1] = uint8_t(i), rec[2 + i * 3 + 2] = kind;
+    }
+    if (rule == kGauntlet && g_slobber && g_online_to == kGauntlet) {
+      // ONLINE (co-op): six - the 2 players a team (0), the lobby's 4 CPUs the
+      // other (1); the kinds are the match slots' (sub_828BB290 below)
+      rec[0] = 0, rec[1] = 6;
+      rec2[34] = 6;
+      for (int i = 0; i < 6; ++i) rec[2 + i * 3] = uint8_t(i), rec[2 + i * 3 + 1] = i < 2 ? 0 : 1, rec[2 + i * 3 + 2] = i < 3 ? 0 : 3;
+    } else if (rule == kGauntlet && g_slobber) {
       // (and a third: person 4 - the gauntlet has 4 people, the 5-person one
       // 0x58 shows 5 work)
       const uint8_t* five = base + rules + 0x58 * kRuleSize;  // (the 5-person gauntlet's count)
@@ -615,14 +867,16 @@ void ShapeRule(uint8_t* base, uint32_t rule, uint32_t like, bool select_only) {
 
 namespace svr2011 {
 
-bool MatchTypeOn(const char* id) {
+bool MatchTypeSwitchOn(const char* id) {
   static const std::map<std::string, bool> on = [] {
     std::map<std::string, bool> m;
     const std::filesystem::path dir = rex::filesystem::GetExecutableFolder() / "Mods" / "MatchTypes";
     std::error_code ec;
     for (const char* k : {"falls_count_anywhere", "championship_scramble", "royal_rumble_15_25", "lumberjack",
                           "free_roaming_backstage", "backstage_more_people", "weapons_everywhere", "slobber_knocker",
-                          "three_stages_of_hell", "elimination", "mystery_opponent"}) {
+                          "three_stages_of_hell", "elimination", "mystery_opponent", "hiac_tables_ladders", "hiac_roof_start",
+                          "three_stages_tables_ladders",
+                          "gauntlet_eliminator", "cage_weapons", "inferno_weapons", "online_first_blood"}) {
       m[k] = !std::filesystem::exists(dir / k / "disabled", ec);
       if (!m[k]) REXLOG_INFO("match types: {} off (mod switched off)", k);
     }
@@ -631,6 +885,8 @@ bool MatchTypeOn(const char* id) {
   const auto it = on.find(id);
   return it == on.end() || it->second;
 }
+
+bool MatchTypeOn(const char* id) { return MatchTypeSwitchOn(id) || svr2011::P2PMatchLobby().in; }
 
 void InstallMatchTypes(rex::memory::Memory* memory) {
   g_memory = memory;
@@ -645,8 +901,15 @@ void InstallMatchTypes(rex::memory::Memory* memory) {
                                {"elimination_tt", TestMode::kElimTT, int(kTripleThreat)},
                                {"elimination_f4w", TestMode::kElimF4W, int(kFatal4Way)},
                                {"weapons", TestMode::kWeapons, int(kExtremeFirst)},
+                               {"cell_weapons", TestMode::kWeapons, int(kCellFirst)},
+                               {"cage_weapons", TestMode::kWeapons, 0x3C},
+                               {"inferno_weapons", TestMode::kWeapons, 0x51},
                                {"slobber", TestMode::kSlobber, int(kGauntlet)},
-                               {"lumberjack", TestMode::kLumberjack, int(kLumberjack)}};
+                               {"gauntlet_eliminator", TestMode::kGauntletElim, int(kGauntlet)},
+                               {"gauntlet_eliminator_er", TestMode::kGauntletElimEr, int(kGauntlet)},
+                               {"lumberjack", TestMode::kLumberjack, int(kLumberjack)},
+                               {"mystery", TestMode::kMystery, 0},
+                               {"roof", TestMode::kRoof, int(kCellFirst)}};
     for (const Mode& k : kModes)
       if (m == k.name) {
         g_test_mode = k.mode;
@@ -662,6 +925,73 @@ void InstallMatchTypes(rex::memory::Memory* memory) {
 }
 
 }  // namespace svr2011
+
+// A wrestler's free state (standing, nothing on): sub_82292D50(state), the
+// character *(state +280). After it: a CPU alone on the roof long enough
+// climbs down (above, g_roof_alone_since) - as if it pressed the action button
+// towards the nearest edge.
+REX_EXTERN(__imp__sub_82292D50);
+REX_HOOK_RAW(sub_82292D50) {
+  const uint32_t c = Rd32(base + ctx.r3.u32 + 280);
+  const uint32_t motion = c ? Rd32(base + c + 212) : 0;
+  const PPCContext saved = ctx;
+  __imp__sub_82292D50(ctx, base);
+  // Once a match, who plays each wrestler: its character's port +1152 is its player (0-3; a CPU's too - the
+  // game plays a person whose player has no controller), so: that player's controller, or the CPU (problem
+  // reports - "the CPU only reverses": a controller nobody holds played him).
+  if (c) {
+    static uint32_t told_match = 0, told = 0;
+    const uint32_t m = Rd32(base + 0x82EDEB48), person = Rd32(base + c + 1156), port = Rd32(base + c + 1152);
+    if (m != told_match) told_match = m, told = 0;
+    if (m && person < 6 && !(told >> person & 1)) {
+      told |= 1u << person;
+      static const char* const kType[] = {"none", "Xbox", "PlayStation", "keyboard"};
+      const svr2011::PadType t = port < svr2011::kMaxPlayers ? svr2011::PlayerPadType(port) : svr2011::PadType::kNone;
+      REXLOG_INFO("[svr2011] match: person {} - {}", person,
+                  t != svr2011::PadType::kNone ? fmt::format("player {}'s controller ({})", port + 1, kType[int(t)])
+                                               : std::string("the CPU"));
+    }
+  }
+  static const bool off = [] { const char* v = std::getenv("SVR2011_TEST_ROOF_DOWN"); return v && *v == '0'; }();
+  static const uint32_t alone_frames = [] {
+    const char* v = std::getenv("SVR2011_TEST_ROOF_DOWN_SECS");
+    return uint32_t((v ? std::max(1, std::atoi(v)) : 25) * 60);
+  }();
+  if (off || !c || base[c + 444] != kRoofArea || Rd32(base + c + 212) != motion) return;  // (on the roof, nothing started)
+  const uint32_t person = Rd32(base + c + 1156), frames = Rd32(base + 0x82E3CD0C);
+  // (test aid: SVR2011_TEST_ROOF_DOWN_LOG=1 - once a second, a free wrestler on the roof and what the check sees)
+  if (static const bool log = std::getenv("SVR2011_TEST_ROOF_DOWN_LOG") != nullptr; log && frames && frames % 60 == 0) {
+    const uint32_t m = Rd32(base + 0x82EDEB48);
+    REXLOG_INFO("match types: roof - person {} alone {} frames, slot ctl {}, port {}, held {:X}, x {:.0f} z {:.0f}", person,
+                person < 6 && g_roof_alone_since[person] ? frames + 1 - g_roof_alone_since[person] : 0,
+                m && person < 6 ? base[m + 432 + person * 2116 - 8] : 255, Rd32(base + c + 1152), Rd32(base + c + 1828),
+                [&] { const uint32_t u = Rd32(base + c + 288); float f; std::memcpy(&f, &u, 4); return f; }(),
+                [&] { const uint32_t u = Rd32(base + c + 296); float f; std::memcpy(&f, &u, 4); return f; }());
+  }
+  if (person >= 6 || !g_roof_alone_since[person] || frames + 1 - g_roof_alone_since[person] < alone_frames) return;
+  if (Rd32(base + c + 1828) != ~0u) return;  // (holding something: the edge check goes by it)
+  const uint32_t match = Rd32(base + 0x82EDEB48);
+  // (a CPU only: its slot's controller 1 and its character's controller port +1152 not a pad's, 0-3 - a
+  // test match's cpu=all marks person 0's slot too while a pad still plays him)
+  if (!match || base[match + 432 + person * 2116 - 8] != 1 || Rd32(base + c + 1152) < 4) return;
+  // The nearest edge: the way the wrestler is farthest out (octants of +2212:
+  // 0 -z, 2 -x, 4 +z, 6 +x) - the edge check wants more than 20 out that way.
+  const auto rd_f = [&](uint32_t at) { const uint32_t u = Rd32(base + at); float f; std::memcpy(&f, &u, 4); return f; };
+  const float x = rd_f(c + 288), z = rd_f(c + 296);
+  const uint32_t octant = std::fabs(x) > std::fabs(z) ? (x < 0 ? 2u : 6u) : (z < 0 ? 0u : 4u);
+  if (std::max(std::fabs(x), std::fabs(z)) <= 20.0f) return;  // (near the middle: later, as he moves)
+  Wr32(base + c + 2212, octant);
+  PPCContext k = saved;
+  k.r3.u64 = c;
+  sub_821BE8F8(k, base);
+  if (!k.r3.u32) return;
+  k = saved;
+  k.r3.u64 = c, k.r4.u64 = kClimbDown;
+  sub_82397228(k, base);
+  REXLOG_INFO("match types: CPU person {} alone on the roof {} s - climbs down (x {:.0f} z {:.0f}, octant {}, motion {})",
+              person, (frames + 1 - g_roof_alone_since[person]) / 60, x, z, octant, Rd32(base + c + 212));
+  g_roof_alone_since[person] = 0;
+}
 
 // The menu table is read: sub_82BAA6E8(menus, table, size).
 REX_EXTERN(__imp__sub_82BAA6E8);
@@ -679,6 +1009,7 @@ REX_HOOK_RAW(sub_82BAA6E8) {
     return;
   }
   std::memcpy(base + copy, rows.data(), rows.size());
+  svr2011::ScriptMenuTable(rows.data(), rows.size());  // (scripted tests' "menu" steps: the rows as shown)
   ctx.r4.u64 = copy;
   ctx.r5.u64 = uint32_t(rows.size());
   __imp__sub_82BAA6E8(ctx, base);
@@ -703,21 +1034,27 @@ REX_HOOK_RAW(sub_8243FCC8) {
   g_pending_like = ~0u;
   g_pending_own_row = -1;
   g_pending_slobber = group == kHandicapGroup && g_slobber_row >= 0 && ctx_row == uint32_t(g_slobber_row);
-  if (g_pending_slobber) {  // (the 1 on 1 select screen: player 1 and the first opponent)
+  g_pending_ge = group == kHandicapGroup && ((g_ge_row >= 0 && ctx_row == uint32_t(g_ge_row)) ||
+                                             (g_ge_er_row >= 0 && ctx_row == uint32_t(g_ge_er_row)));
+  const bool ge_er = g_pending_ge && g_ge_er_row >= 0 && ctx_row == uint32_t(g_ge_er_row);
+  if (g_pending_slobber || g_pending_ge) {  // (the 1 on 1 select screen: player 1 and the first opponent)
     g_pending_rule_lo = g_pending_rule_hi = kGauntlet;
     g_pending_like = kLumberjackLike;
     g_pending_select_only = true;
   }
   g_pending_stages = false;
-  for (const WeaponsRow& w : g_stages_rows)
-    if (group == w.group && ctx_row == w.index) g_pending_stages = true;
+  for (const StagesRow& w : g_stages_rows)
+    if (group == w.group && ctx_row == w.index) g_pending_stages = true, g_pending_set = w.set;
   g_pending_mystery = group == g_mystery_row.group && ctx_row == g_mystery_row.index;
   g_pending_elimination = false;
   for (const WeaponsRow& w : g_elim_rows)
     if (group == w.group && ctx_row == w.index) g_pending_elimination = true;
-  g_pending_weapons = false;
+  g_pending_weapons = ge_er;  // (GAUNTLET ELIMINATOR: EXTREME RULES)
   for (const WeaponsRow& w : g_weapons_rows)
     if (group == w.group && ctx_row == w.index) g_pending_weapons = true;
+  g_pending_roof = false;
+  for (const WeaponsRow& w : g_roof_rows)
+    if (group == w.group && ctx_row == w.index) g_pending_roof = true;
   for (int k = 0; k < 8; ++k)
     if (group == kBackstage1v1Group && g_own_row_index[k] >= 0 && ctx_row == uint32_t(g_own_row_index[k]))
       g_pending_own_row = k;
@@ -740,10 +1077,25 @@ REX_HOOK_RAW(sub_8243FCC8) {
   // (test aid SVR2011_TEST_MODE: ONE ON ONE NORMAL as the mode's row)
   if (g_test_mode != TestMode::kNone && result == 2000) {
     switch (g_test_mode) {
-      case TestMode::kThreeStages: g_pending_stages = true; break;
+      case TestMode::kThreeStages: {  // (SVR2011_TEST_3S_SET=<0-5>: the set; its match is SVR2011_TEST_RULE's)
+        g_pending_stages = true;
+        const char* s = std::getenv("SVR2011_TEST_3S_SET");
+        g_pending_set = s ? std::atoi(s) : 0;
+        break;
+      }
       case TestMode::kElimTT:
       case TestMode::kElimF4W: g_pending_elimination = true; break;
       case TestMode::kWeapons: g_pending_weapons = true; break;
+      case TestMode::kMystery: g_pending_mystery = true; break;
+      case TestMode::kRoof: g_pending_roof = true; break;
+      case TestMode::kGauntletElim:
+      case TestMode::kGauntletElimEr:
+        g_pending_ge = true;
+        g_pending_weapons = g_test_mode == TestMode::kGauntletElimEr;
+        g_pending_rule_lo = g_pending_rule_hi = kGauntlet;
+        g_pending_like = kLumberjackLike;
+        g_pending_select_only = true;
+        break;
       case TestMode::kSlobber:
         g_pending_slobber = true;
         g_pending_rule_lo = g_pending_rule_hi = kGauntlet;
@@ -763,7 +1115,33 @@ REX_HOOK_RAW(sub_8243FCC8) {
 // A match is set up: sub_827374A0(match, rule, ...).
 REX_EXTERN(__imp__sub_827374A0);
 REX_HOOK_RAW(sub_827374A0) {
-  const uint32_t rule = ctx.r4.u32;
+  uint32_t rule = ctx.r4.u32;
+  // ONLINE: the session's PORT RULES (online_rules.h) - the same modes as the
+  // offline rows, on both sides, before the match is set up.
+  const svr2011::OnlineRulesSetup online = svr2011::OnlineRulesFor(rule);
+  svr2011::MysteryOpponentOnline(online.on && online.mystery && !Rd32(base + kStoryContext));
+  g_online_from = g_online_to = ~0u;
+  if (online.on && !Rd32(base + kStoryContext) && online.rule != rule) g_online_from = rule, g_online_to = online.rule;
+  if (online.on && !Rd32(base + kStoryContext)) {
+    rule = online.rule;
+    ctx.r4.u64 = rule;
+    g_pending_weapons = online.weapons;
+    g_pending_stages = online.stages;
+    if (online.roof) g_pending_roof = true;
+    if (online.slobber) {  // (as the SLOBBER KNOCKER row, for six: the players a team against the CPUs)
+      g_pending_slobber = true;
+      g_pending_rule_lo = g_pending_rule_hi = kGauntlet;
+      g_pending_like = kLumberjackLike;
+      g_pending_select_only = true;
+    }
+    if (online.ge) {  // (as the GAUNTLET ELIMINATOR row: the gauntlet reshaped for six, each his own team)
+      g_pending_ge = true;
+      g_pending_rule_lo = g_pending_rule_hi = kGauntlet;
+      g_pending_like = kLumberjackLike;
+      g_pending_select_only = true;
+    }
+    g_pending_set = online.set;
+  }
   // Test aid: SVR2011_TEST_SETUP_TRACE=1 - each match set-up with its caller
   // and the story context (a guest stack walk read unmapped pages: left out).
   if (std::getenv("SVR2011_TEST_SETUP_TRACE"))
@@ -798,11 +1176,20 @@ REX_HOOK_RAW(sub_827374A0) {
   }
   g_slobber = g_pending_slobber && rule == kGauntlet && !Rd32(base + kStoryContext);
   g_pending_slobber = false;
+  g_roof = g_pending_roof && rule >= kCellFirst && rule <= kCellLast && !Rd32(base + kStoryContext);
+  g_pending_roof = false;
+  if (g_roof) REXLOG_INFO("match types: HELL IN A CELL - START ON THE ROOF (rule {:02X})", rule);
+  g_ge = g_pending_ge && rule == kGauntlet && !Rd32(base + kStoryContext);
+  g_pending_ge = false;
+  if (g_ge) {
+    REXLOG_INFO("match types: GAUNTLET ELIMINATOR");
+    svr2011::GauntletEliminatorStart();
+  }
   if (g_slobber) {
     REXLOG_INFO("match types: SLOBBER KNOCKER");
     svr2011::SlobberKnockerStart();
   }
-  svr2011::ThreeStagesSetup(g_pending_stages && StagesRule(rule) && !Rd32(base + kStoryContext));
+  svr2011::ThreeStagesSetup(g_pending_stages && StagesRule(rule) && !Rd32(base + kStoryContext), g_pending_set);
   g_pending_stages = false;
   svr2011::MysteryOpponentSetup(base, g_pending_mystery && rule == 0x00 && !Rd32(base + kStoryContext));
   g_pending_mystery = false;
@@ -817,6 +1204,20 @@ REX_HOOK_RAW(sub_827374A0) {
   if (g_pending_like != ~0u && ((rule >= g_pending_rule_lo && rule <= g_pending_rule_hi) ||
                          (!g_pending_select_only && rule == kWholeBackstage2)))
     ShapeRule(base, played, g_pending_like, g_pending_select_only);
+  // 6-MAN WEAPONS EVERYWHERE: a tornado match - everyone legal, no tags (B11:
+  // it played as a 6-man tag). The rule record's +8 is 2 where everyone is
+  // legal (triple threat, fatal-4-way, the tornado rules 0x0F and 2 on 2
+  // Extreme Rules 0x4E), 0 in the tag rules; back after the match (RestoreRule).
+  if (g_weapons && rule == 0x08)
+    if (const uint32_t rules = Rd32(base + kRules)) {
+      if (g_saved.rule != rule) {
+        g_saved.rule = rule;
+        std::memcpy(g_saved.rec, base + rules + rule * kRuleSize, kRuleSize);
+        std::memcpy(g_saved.rec2, base + rules + kRule2 + rule * kRule2Size, kRule2Size);
+      }
+      base[rules + rule * kRuleSize + 8] = 2;
+      REXLOG_INFO("match types: WEAPONS EVERYWHERE - 6-man as a tornado match");
+    }
   ctx.r4.u64 = played;
   __imp__sub_827374A0(ctx, base);
 }
@@ -989,14 +1390,51 @@ REX_HOOK_RAW(sub_828BBEF0) {
   if (base[0x82E3DE00] == kLumberjack && !Rd32(base + kStoryContext) && ctx.r3.u32) {
     FillLumberjackSlots(base, ctx.r3.u32);
   }
-  if (g_slobber && base[0x82E3DE00] == kGauntlet && ctx.r3.u32) {  // (the 2 waiting opponents)
+  if (g_slobber && g_online_to != kGauntlet && base[0x82E3DE00] == kGauntlet && ctx.r3.u32) {  // (the 2 waiting opponents; online: the lobby's)
     if (const uint32_t rules = Rd32(base + kRules))
       for (int i = 2; i < kSlobberPeople; ++i) base[rules + kGauntlet * kRuleSize + 2 + i * 3 + 2] = 3;
     FillRandomSlots(base, ctx.r3.u32, kSlobberPeople - 2, 1, 3, "slobber knocker opponents");
     for (uint32_t i = kSlobberPeople; i < 6; ++i) Wr32(base + ctx.r3.u32 + kSlots + i * kSlotSize + 8, 51200);
   }
+  if (g_ge && base[0x82E3DE00] == kGauntlet && ctx.r3.u32) {  // (the 4 entrants: random, each his own team)
+    if (const uint32_t rules = Rd32(base + kRules))
+      for (int i = 2; i < kGePeople; ++i) base[rules + kGauntlet * kRuleSize + 2 + i * 3 + 2] = 3;
+    FillRandomSlots(base, ctx.r3.u32, kGePeople - 2, 2, 3, "gauntlet eliminator entrants");
+    for (uint32_t i = 2; i < uint32_t(kGePeople); ++i) base[ctx.r3.u32 + kSlots + i * kSlotSize + 5] = uint8_t(i);
+  }
   svr2011::MysteryOpponentFill(base, ctx.r3.u32);  // (mystery_opponent.h)
   __imp__sub_828BBEF0(ctx, base);
+}
+
+// ONLINE: the match's slots are filled from the lobby (sub_828BB290(match),
+// not the offline people builder above): GAUNTLET ELIMINATOR's entrants
+// (people 2-5) are waiting ones and everyone is his own team, as offline.
+// The person's kind is the slot's +0 word (the rule record's kind, copied
+// by the set-up sub_828BD278 from the match's rule at +8 - online the
+// session's 6-man, kinds 0): 3 = a waiting entrant (role 3, state 1 when the
+// character is made). (+4 is the slot's no-pad / CPU flag.)
+REX_EXTERN(__imp__sub_828BB290);
+REX_HOOK_RAW(sub_828BB290) {
+  const uint32_t match = ctx.r3.u32;
+  __imp__sub_828BB290(ctx, base);
+  if (g_ge && g_online_to == kGauntlet && match) {
+    for (uint32_t i = 0; i < uint32_t(kGePeople); ++i) {
+      uint8_t* slot = base + match + kSlots + i * kSlotSize;
+      slot[5] = uint8_t(i);
+      if (i >= 2) slot[0] = 0, slot[1] = 0, slot[2] = 0, slot[3] = 3;
+    }
+    REXLOG_INFO("match types: online GAUNTLET ELIMINATOR - people 2-5 waiting entrants, each his own team");
+  }
+  // SLOBBER KNOCKER (co-op): the players (0, 1) team 0; the CPUs team 1 -
+  // person 2 in the ring, 3-5 waiting (kind 3) to come in in turn
+  if (g_slobber && g_online_to == kGauntlet && match) {
+    for (uint32_t i = 0; i < 6; ++i) {
+      uint8_t* slot = base + match + kSlots + i * kSlotSize;
+      slot[5] = i < 2 ? 0 : 1;
+      slot[0] = 0, slot[1] = 0, slot[2] = 0, slot[3] = i >= 3 ? 3 : 0;
+    }
+    REXLOG_INFO("match types: online SLOBBER KNOCKER - the players a team against the CPUs, 3 waiting");
+  }
 }
 
 // -- The whole backstage ---------------------------------------------------
@@ -1145,14 +1583,16 @@ REX_HOOK_RAW(sub_82227150) {
 // What the match camera frames: sub_82227690(camera) -> a sphere (centre
 // +16/+20/+24, radius +32) around every competitor. Backstage with more than
 // two people, it is centred on their average position instead (radius: the
-// farthest of them from it).
+// farthest of them from it). In an HCTP room's row (hctp=), fighters at
+// different heights (one up on the cage top, -Y up) are framed head to feet: the centre
+// between the lowest feet and the highest head, the radius at least half that.
 REX_EXTERN(__imp__sub_82227690);
 REX_HOOK_RAW(sub_82227690) {
   __imp__sub_82227690(ctx, base);
   const uint32_t sphere = ctx.r3.u32;
   if (!sphere || Rd32(base + kLiveSettings + 64) != 78) return;
   constexpr uint32_t kChars = 0x82E3CC50;
-  float xs[9], zs[9];
+  float xs[9], ys[9], zs[9];
   int n = 0;
   const auto saved = ctx;
   for (uint32_t i = 0; i < 9; ++i) {
@@ -1164,12 +1604,30 @@ REX_HOOK_RAW(sub_82227690) {
     const uint32_t pos = Rd32(base + ch + 304);
     if (!competitor || !pos) continue;
     xs[n] = RdF(base + pos);
+    ys[n] = RdF(base + pos + 4);
     zs[n] = RdF(base + pos + 8);
     ++n;
   }
   ctx = saved;
   ctx.r3.u64 = sphere;
-  if (n <= 2) return;
+  if (n == 0) return;
+  // (a wrestler stands about 19 tall)
+  float top = ys[0], feet = ys[0];
+  for (int i = 1; i < n; ++i) top = std::min(top, ys[i]), feet = std::max(feet, ys[i]);
+  // (an HCTP room's row only: 2011's own areas keep the game's framing)
+  const bool hctp_row = svr2011::g_active_row >= 0 &&
+                        size_t(svr2011::g_active_row) < svr2011::BackstageRows().size() &&
+                        svr2011::BackstageRows()[size_t(svr2011::g_active_row)].hctp > 0;
+  const auto frame_heights = [&] {
+    if (!hctp_row || feet - top <= 8.0f) return;
+    const float head = top - 19.0f;
+    WrF(base + sphere + 20, (head + feet) / 2);
+    if (RdF(base + sphere + 32) < (feet - head) / 2 + 4.0f) WrF(base + sphere + 32, (feet - head) / 2 + 4.0f);
+  };
+  if (n <= 2) {
+    frame_heights();
+    return;
+  }
   // Around the fighters near the player (1P: the first competitor): their
   // average; anyone farther away (another fight elsewhere) is left out, so
   // the camera stays close to the player's fight.
@@ -1192,6 +1650,7 @@ REX_HOOK_RAW(sub_82227690) {
   WrF(base + sphere + 16, mx);
   WrF(base + sphere + 24, mz);
   WrF(base + sphere + 32, r);
+  frame_heights();
 }
 
 // -- The whole backstage's fight box --------------------------------------
@@ -1301,6 +1760,57 @@ REX_HOOK_RAW(sub_822AD738) {
   const uint32_t placer = ctx.r3.u32;
   svr2011::SetMatchLoading(false);  // (its loading screen is up)
   LogMatch(ctx, base, ctx.r4.u32);
+  // Research aid (Hell in a Cell roof): SVR2011_TEST_CELL_START=<y tenths> -
+  // in a cell match people 0 and 1 start at that height (x -150 / +150, z 0).
+  if (static const char* cy = std::getenv("SVR2011_TEST_CELL_START");
+      cy && placer && ctx.r4.u32 >= 0x31 && ctx.r4.u32 <= 0x35) {
+    uint8_t* entry = base + Rd32(base + placer + 4) + ctx.r4.u32 * 88 + 4;
+    uint8_t saved[24];
+    std::memcpy(saved, entry, 24);
+    const int16_t y = int16_t(std::atoi(cy));
+    for (int i = 0; i < 2; ++i) {
+      uint8_t* p = entry + i * 12;
+      const int16_t v[4] = {int16_t(i ? 150 : -150), y, 0, int16_t(i ? 2700 : 900)};
+      for (int k = 0; k < 4; ++k) p[4 + k * 2] = uint8_t(uint16_t(v[k]) >> 8), p[5 + k * 2] = uint8_t(v[k]);
+    }
+    REXLOG_INFO("match types: cell test - the two start at height {} (tenths); were {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}", y,
+                saved[4], saved[5], saved[6], saved[7], saved[8], saved[9], saved[10], saved[11]);
+    __imp__sub_822AD738(ctx, base);
+    std::memcpy(entry, saved, 24);
+    return;
+  }
+  // A backstage mod's own area with start=: its fighters' places (x, z,
+  // facing; tenths, y 0) for the match, the room's table back after.
+  if (placer && !Rd32(base + kStoryContext) && svr2011::g_active_row >= 0 &&
+      size_t(svr2011::g_active_row) < svr2011::BackstageRows().size()) {
+    const auto& row = svr2011::BackstageRows()[size_t(svr2011::g_active_row)];
+    const uint32_t rule = ctx.r4.u32;
+    static int checks = 0;
+    if (checks++ < 6)
+      REXLOG_INFO("match types: start places? rule {:02X} area {} starts {}", rule, row.area, row.starts.size());
+    if (!row.starts.empty() && rule == kBackstage1v1FirstRule + uint32_t(row.area)) {
+      uint8_t* people = base + Rd32(base + placer + 4) + rule * 88 + 4;
+      const size_t n = std::min<size_t>(row.starts.size(), 7);
+      uint8_t saved[7 * 12];
+      std::memcpy(saved, people, n * 12);
+      for (size_t i = 0; i < n; ++i) {
+        uint8_t* p = people + i * 12;
+        const auto put = [&](int at, float v) {
+          const int16_t t = int16_t(std::lround(v * 10.0f));
+          p[at] = uint8_t(uint16_t(t) >> 8), p[at + 1] = uint8_t(t & 0xFF);
+        };
+        put(4, row.starts[i].x), put(6, row.starts[i].y), put(8, row.starts[i].z), put(10, row.starts[i].facing);
+      }
+      static int logged = -1;
+      if (logged != svr2011::g_active_row) {
+        logged = svr2011::g_active_row;
+        REXLOG_INFO("match types: '{}' starts at ({:.0f}, {:.0f})...", row.label, row.starts[0].x, row.starts[0].z);
+      }
+      __imp__sub_822AD738(ctx, base);
+      std::memcpy(people, saved, n * 12);
+      return;
+    }
+  }
   if (ctx.r4.u32 != kLumberjack || !placer || Rd32(base + kStoryContext)) {
     __imp__sub_822AD738(ctx, base);
     return;
@@ -1525,6 +2035,7 @@ void LumberjackController(uint8_t* base) {
 namespace svr2011 {
 
 bool SlobberKnockerMatch() { return g_slobber; }
+bool GauntletEliminatorMatch() { return g_ge; }
 
 // A lumberjack (a manager, team 3) who hits a wrestler gets the lost byte
 // (+447) 7 - disqualified for interference - and the judge then ends the
@@ -1543,9 +2054,176 @@ void LumberjackBeforeJudge(uint8_t* base) {
   }
 }
 
+// ONLINE: FIRST BLOOD in Player Match. The online MATCH TYPE screen's
+// categories (the image's data at 0x82028A60: per online type a record {id,
+// list, count}, its list {rule, 0, 0} entries, 12 bytes) leave First Blood
+// out; the one on one EXTREME RULES type (3) and the triple threat one (0xB)
+// get it (0x29 / 0x2A, before EXTREME RULES, the last), in port memory. The
+// session carries the rule (property 0x1000000C): the joiner plays it as any.
+namespace {
+void OnlineFirstBlood(uint8_t* base) {
+  static bool done = false;
+  if (done || !g_memory || !svr2011::MatchTypeSwitchOn("online_first_blood")) return;  // (the host's offer: its own switch)
+  done = true;
+  struct Add {
+    uint32_t record, rule;
+  };
+  for (const Add& a : {Add{0x82028A70, 0x29}, Add{0x82028AD0, 0x2A}}) {
+    const uint32_t list = Rd32(base + a.record + 4), n = Rd32(base + a.record + 8);
+    if (!list || n == 0 || n > 16) continue;
+    bool has = false;
+    for (uint32_t i = 0; i < n; ++i) has = has || Rd32(base + list + i * 12) == a.rule;
+    if (has) continue;
+    const uint32_t copy = g_memory->SystemHeapAlloc((n + 1) * 12);
+    if (!copy) continue;
+    std::memcpy(base + copy, base + list, (n - 1) * 12);   // (all but the last: EXTREME RULES)
+    Wr32(base + copy + (n - 1) * 12, a.rule);
+    Wr32(base + copy + (n - 1) * 12 + 4, 0);
+    Wr32(base + copy + (n - 1) * 12 + 8, 0);
+    std::memcpy(base + copy + n * 12, base + list + (n - 1) * 12, 12);
+    // (the image is read-only: writable for the record's two words)
+    auto* heap = g_memory->LookupHeap(a.record);
+    uint32_t old = 0;
+    if (!heap || !heap->QueryProtect(a.record, &old) ||
+        !heap->Protect(a.record + 4, 8, rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite)) {
+      REXLOG_WARN("match types: online - the type record {:08X} can't be made writable", a.record);
+      continue;
+    }
+    Wr32(base + a.record + 4, copy);
+    Wr32(base + a.record + 8, n + 1);
+    heap->Protect(a.record + 4, 8, old);
+    REXLOG_INFO("match types: online - FIRST BLOOD (rule {:02X}) in the online type {:X}", a.rule, Rd32(base + a.record));
+  }
+}
+}  // namespace
+
 void MatchTypesUpdate(PPCContext& ctx, uint8_t* base) {
+  OnlineFirstBlood(base);
   constexpr uint32_t kChars = 0x82E3CC50;
   MatchHudTick(base);  // (match_hud.h: the HUD shows while the match's clock runs)
+  // Research aid (stuck wrestlers, B11/B12): SVR2011_TEST_STUCK_CHARS=1 - each
+  // second, people 0-5 whose place and motion (+212) haven't changed for 10 s
+  // while the match clock runs are logged (once each time), with the motion.
+  if (static const bool stuck_log = std::getenv("SVR2011_TEST_STUCK_CHARS") != nullptr; stuck_log) {
+    struct Seen { uint32_t x = 0, z = 0, motion = 0, since = 0; bool told = false; };
+    static Seen seen[6];
+    const uint32_t frames = Rd32(base + 0x82E3CD0C);
+    static uint32_t last = 0;
+    if (frames < last) for (Seen& s : seen) s = Seen{};
+    // (SVR2011_TEST_PUT_P1=<x>,<z>[,<frame>]: at that match frame (240) person 0 is put there on the floor, once a match)
+    static bool put = false;
+    if (frames < last) put = false;
+    static const char* put_at = std::getenv("SVR2011_TEST_PUT_P1");
+    static const uint32_t put_frame = [] {
+      float x, z;
+      int f = 240;
+      if (put_at) std::sscanf(put_at, "%f,%f,%d", &x, &z, &f);
+      return uint32_t(f);
+    }();
+    if (const char* at = put_at; at && !put && frames >= put_frame)
+      if (const uint32_t c = Rd32(base + kChars)) {
+        put = true;
+        float x = 0, z = 0;
+        std::sscanf(at, "%f,%f", &x, &z);
+        WrF(base + c + 288, x), WrF(base + c + 292, 0.0f), WrF(base + c + 296, z);
+        REXLOG_INFO("match types: person 0 put at ({}, {})", x, z);
+      }
+    if (frames / 60 != last / 60)
+      for (uint32_t i = 0; i < 6; ++i) {
+        const uint32_t c = Rd32(base + kChars + i * 4);
+        if (!c) continue;
+        Seen& s = seen[i];
+        const uint32_t x = Rd32(base + c + 288), z = Rd32(base + c + 296), m = Rd32(base + c + 212);
+        if (x != s.x || z != s.z || m != s.motion) s = Seen{x, z, m, frames};
+        else if (!s.told && frames - s.since >= 600) {
+          s.told = true;
+          const uint32_t target = svr2011::AiTargetOf(c);
+          REXLOG_INFO("match types: person {} stuck since match frame {} at ({:.1f}, {:.1f}), motion {}, state {} lost {}; "
+                      "AI target {:08X}{}", i, s.since, RdF(base + c + 288), RdF(base + c + 296), m, base[c + 446], base[c + 447],
+                      target, target ? fmt::format(" (state {} lost {} at {:.1f}, {:.1f}, motion {})", base[target + 446],
+                                                   base[target + 447], RdF(base + target + 288), RdF(base + target + 296),
+                                                   Rd32(base + target + 212)) : std::string());
+        }
+      }
+    last = frames;
+  }
+  // START ON THE ROOF: from the bell for 1.5 s everyone in it (people 0-3,
+  // not the referee or the commentators) is held on the roof - a corner
+  // spot each, off the breakable middle panels (|x| < 13): the real
+  // position vector, its copy and the area.
+  if (g_roof && base[0x82E3DE00] >= kCellFirst && base[0x82E3DE00] <= kCellLast) {
+    const uint32_t frames = Rd32(base + 0x82E3CD0C);
+    static uint32_t placed_frames = ~0u;
+    if (frames < 90) {
+      constexpr float kSpot[4][2] = {{-30.0f, 30.0f}, {30.0f, -30.0f}, {30.0f, 30.0f}, {-30.0f, -30.0f}};
+      constexpr float kRoofY = -60.5f;
+      // (test aid: SVR2011_TEST_ROOF_SKIP=<person> - that one starts in the ring, e.g. the idle player 0)
+      static const int skip = [] { const char* v = std::getenv("SVR2011_TEST_ROOF_SKIP"); return v ? std::atoi(v) : -1; }();
+      for (uint32_t i = 0, k = 0; i < 6 && k < 4; ++i) {
+        const uint32_t c = Rd32(base + kChars + i * 4);
+        if (!c || Rd32(base + c + 1800) >= 30 || int(i) == skip) continue;
+        const float x = kSpot[k][0], z = kSpot[k][1];
+        ++k;
+        if (const uint32_t v = Rd32(base + c + 304)) WrF(base + v, x), WrF(base + v + 4, kRoofY), WrF(base + v + 8, z);
+        WrF(base + c + 288, x), WrF(base + c + 292, kRoofY), WrF(base + c + 296, z);
+        base[c + 444] = 10;
+      }
+      if (placed_frames == ~0u) REXLOG_INFO("match types: START ON THE ROOF - everyone on the roof (frame {})", frames);
+      placed_frames = frames;
+    } else {
+      placed_frames = ~0u;
+    }
+  }
+  // CPUs alone on the roof: since when (the climb-down: sub_82292D50's hook)
+  {
+    const uint32_t frames = Rd32(base + 0x82E3CD0C);
+    uint32_t on_roof[6] = {}, n = 0;
+    for (uint32_t i = 0; i < 6; ++i) {
+      const uint32_t c = Rd32(base + kChars + i * 4);
+      on_roof[i] = c && base[c + 444] == kRoofArea;
+      n += on_roof[i];
+    }
+    for (uint32_t i = 0; i < 6; ++i) {
+      if (on_roof[i] && n == 1) {
+        if (!g_roof_alone_since[i] || frames + 1 < g_roof_alone_since[i]) g_roof_alone_since[i] = frames + 1;
+      } else {
+        g_roof_alone_since[i] = 0;
+      }
+    }
+  }
+  // Research aid (Hell in a Cell roof): SVR2011_TEST_CELL=1 - each second of a
+  // match the first two people's position, area bytes (+441, +444) and motion;
+  // SVR2011_TEST_CELL_ROOF=<y> - from match frame 180 to 240 both are put at
+  // that height (y is down: the roof -60.5), x -30 / +30, z 30 - the real
+  // position vector (*(+304)) and its copy (+288), area +444 10 (the roof).
+  if (static const bool cell_log = std::getenv("SVR2011_TEST_CELL") != nullptr; cell_log) {
+    const uint32_t frames = Rd32(base + 0x82E3CD0C);
+    static uint32_t last = 0;
+    static bool moved = false;
+    if (frames < last) moved = false;
+    if (static const char* roof = std::getenv("SVR2011_TEST_CELL_ROOF"); roof && frames >= 180 && frames < 240) {
+      const float y = float(std::atof(roof));
+      for (uint32_t i = 0; i < 2; ++i)
+        if (const uint32_t c = Rd32(base + kChars + i * 4)) {
+          const float x = i ? 30.0f : -30.0f, z = 30.0f;
+          if (const uint32_t v = Rd32(base + c + 304)) WrF(base + v, x), WrF(base + v + 4, y), WrF(base + v + 8, z);
+          WrF(base + c + 288, x), WrF(base + c + 292, y), WrF(base + c + 296, z);
+          base[c + 444] = 10;
+          if (!moved) REXLOG_INFO("match types: cell test - person {} put on the roof ({}, {}, {})", i, x, y, z);
+        }
+      moved = true;
+    }
+    if (frames / 60 != last / 60 || frames < last) {
+      std::string s;
+      for (uint32_t i = 0; i < 2; ++i)
+        if (const uint32_t c = Rd32(base + kChars + i * 4))
+          s += fmt::format(" {}:({:.1f},{:.1f},{:.1f}) a{} b{} m{} f{:X}", i, RdF(base + c + 288), RdF(base + c + 292),
+                           RdF(base + c + 296), base[c + 441], base[c + 444], Rd32(base + c + 212) & 0x7FFF,
+                           Rd32(base + c + 516));
+      REXLOG_INFO("match types: cell test frame {} rule {:02X}{}", frames, base[0x82E3DE00], s);
+    }
+    last = frames;
+  }
   // Research aid: SVR2011_TEST_ITEM_DUMP=<file> - every 30 updates of a match,
   // the object table (0x82DE0220, 72 slots: people and weapons) appended:
   // u32 match frames, then per slot u32 object and its first 0xC00 bytes.
@@ -1559,6 +2237,23 @@ void MatchTypesUpdate(PPCContext& ctx, uint8_t* base) {
           const uint32_t o = Rd32(base + 0x82DE0220 + i * 4);
           std::fwrite(&o, 4, 1, f);
           if (o) std::fwrite(base + o, 1, 0xC00, f);
+        }
+        std::fclose(f);
+      }
+  }
+  // Research aid: SVR2011_TEST_CHAR_DUMP=<file> - every 6 updates of a match,
+  // the first two people (0x82E3CC50): u32 match frames, then per person u32
+  // its address and its first 0x3000 bytes.
+  if (static const char* dump = std::getenv("SVR2011_TEST_CHAR_DUMP"); dump && Rd32(base + 0x82E3CD0C) > 0) {
+    static uint32_t n = 0;
+    if (++n % 6 == 0)
+      if (FILE* f = std::fopen(dump, "ab")) {
+        const uint32_t frames = Rd32(base + 0x82E3CD0C);
+        std::fwrite(&frames, 4, 1, f);
+        for (uint32_t i = 0; i < 2; ++i) {
+          const uint32_t c = Rd32(base + kChars + i * 4);
+          std::fwrite(&c, 4, 1, f);
+          if (c) std::fwrite(base + c, 1, 0x3000, f);
         }
         std::fclose(f);
       }
@@ -1652,6 +2347,7 @@ void MatchTypesUpdate(PPCContext& ctx, uint8_t* base) {
     }
   }
   if (g_slobber && base[0x82E3DE00] == kGauntlet) SlobberKnockerUpdate(ctx, base);
+  if (g_ge && base[0x82E3DE00] == kGauntlet) svr2011::GauntletEliminatorUpdate(ctx, base);
   if (ThreeStagesMatch()) ThreeStagesUpdate(base);
   if (base[0x82E3DE00] != kLumberjack || Rd32(base + kStoryContext) || !MatchTypeOn("lumberjack")) return;
   LumberjackController(base);
@@ -1707,15 +2403,18 @@ struct Placed {
   float x, y, z, yaw;
 };
 // In the ring y = -12, on the floor 0 (a table stands at y -6.7 by the
-// apron); the ring is about +-30, the announce tables at z -76.
+// apron); the ring is about +-30 (its apron to about 34), the announce
+// tables at z -76. On the camera's side (+z) the barrier is close: weapons
+// at z 54-55 lay against it, and a wrestler picking one up there froze for
+// the rest of the match (B11, a player's video) - they lie at z 45.
 constexpr Placed kPlaced[] = {
     {4, 0, 10.f, -12.f, 12.f, 30.f},      // chairs in the ring
     {4, 0, -12.f, -12.f, -8.f, 200.f},
-    {5, 1, 0.f, -6.7f, 54.f, 0.f},        // tables by the apron
+    {5, 1, 0.f, -6.7f, 45.f, 0.f},        // tables by the apron
     {5, 1, -52.f, 0.f, 0.f, 90.f},
     {11, 1, 52.f, 0.f, 0.f, 90.f},        // a ladder
-    {63, 1, 40.f, 0.f, 55.f, 0.f},        // trash can
-    {89, 1, -40.f, 0.f, 55.f, 30.f},      // guitar
+    {63, 1, 40.f, 0.f, 45.f, 0.f},        // trash can
+    {89, 1, -40.f, 0.f, 45.f, 30.f},      // guitar
     {4, 1, 45.f, 0.f, -45.f, 60.f},       // a chair on the floor
 };
 // 6-MAN: no Extreme Rules weapons - the extreme rules option (+56, which
@@ -1727,15 +2426,35 @@ constexpr Placed kPlaced[] = {
 constexpr Placed kPlacedSix[] = {
     {4, 0, 10.f, -12.f, 12.f, 30.f},      // chairs in the ring
     {4, 0, -12.f, -12.f, -8.f, 200.f},
-    {102, 1, 0.f, 0.f, 54.f, 0.f},        // by the apron
+    {102, 1, 0.f, 0.f, 45.f, 0.f},        // by the apron
     {72, 1, -52.f, 0.f, 0.f, 90.f},
     {28, 1, 52.f, 0.f, 0.f, 90.f},
-    {4, 1, 40.f, 0.f, 55.f, 0.f},         // chairs on the floor
-    {4, 1, -40.f, 0.f, 55.f, 30.f},
+    {4, 1, 40.f, 0.f, 45.f, 0.f},         // chairs on the floor
+    {4, 1, -40.f, 0.f, 45.f, 30.f},
     {4, 1, 45.f, 0.f, -45.f, 60.f},
 };
+// HELL IN A CELL: inside its walls (about +-55; the ring +-30, its apron to
+// about 34): tables and ladders on the floor around the ring, chairs.
+constexpr Placed kPlacedCell[] = {
+    {4, 0, 10.f, -12.f, 12.f, 30.f},      // chairs in the ring
+    {4, 0, -12.f, -12.f, -8.f, 200.f},
+    {5, 1, 0.f, 0.f, 42.f, 0.f},          // tables
+    {5, 1, -42.f, 0.f, -12.f, 90.f},
+    {11, 1, 40.f, 0.f, 10.f, 90.f},       // ladders
+    {11, 1, -10.f, 0.f, -40.f, 0.f},
+    {4, 1, 40.f, 0.f, -38.f, 60.f},       // a chair on the floor
+};
 constexpr uint32_t kSixManRule = 0x08;  // (6-MAN's WEAPONS EVERYWHERE rule)
-uint32_t g_weapon_records = 0, g_weapon_records_six = 0;  // guest: our records
+// STEEL CAGE / INFERNO: in the ring (y -12, inside the ropes at about +-28).
+constexpr Placed kPlacedRing[] = {
+    {4, 0, -15.f, -12.f, 12.f, 30.f},     // chairs
+    {4, 0, 14.f, -12.f, -14.f, 200.f},
+    {4, 0, 0.f, -12.f, -19.f, 90.f},
+    {102, 0, 0.f, -12.f, 19.f, 0.f},      // hand weapons (a normal match's stock under the ring)
+    {72, 0, 17.f, -12.f, 13.f, 0.f},
+    {28, 0, -17.f, -12.f, -12.f, 30.f},
+};
+uint32_t g_weapon_records = 0, g_weapon_records_six = 0, g_weapon_records_cell = 0, g_weapon_records_ring = 0;  // guest: our records
 struct Swapped {
   uint32_t entry = 0, count = 0, records = 0;  // the game's, while ours are in
   uint32_t head = 0, head_rule = 0;            // Extreme Rules' head lent to a rule without a list
@@ -1774,9 +2493,44 @@ uint32_t WeaponHead(uint8_t* base, uint32_t rule) {
 }
 
 // Our list in (a WEAPONS EVERYWHERE match), or the game's back.
+uint32_t g_row_records = 0, g_row_records_row = ~0u, g_row_records_n = 0;  // guest: a backstage row's list
+
+// A backstage mod's own area with weapons=: its list for the area's rule.
+bool ApplyRowWeapons(uint8_t* base, uint32_t rule) {
+  if (svr2011::g_active_row < 0 || size_t(svr2011::g_active_row) >= svr2011::BackstageRows().size() || !g_memory ||
+      Rd32(base + kStoryContext))
+    return false;
+  const auto& row = svr2011::BackstageRows()[size_t(svr2011::g_active_row)];
+  if ((row.weapons.empty() && !row.no_weapons) || rule != kBackstage1v1FirstRule + uint32_t(row.area)) return false;
+  const uint32_t entry = WeaponEntry(base, rule);
+  if (!entry) return false;
+  const uint32_t n = uint32_t(std::min<size_t>(row.weapons.size(), 32));
+  if (g_row_records_row != uint32_t(svr2011::g_active_row)) {
+    if (!g_row_records) g_row_records = g_memory->SystemHeapAlloc(32 * 28);
+    if (!g_row_records) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint8_t* r = base + g_row_records + i * 28;
+      const auto& w = row.weapons[i];
+      WrF(r, w.x), WrF(r + 4, w.y), WrF(r + 8, w.z);
+      WrF(r + 12, 0.f), WrF(r + 16, w.yaw), WrF(r + 20, 0.f);
+      r[24] = uint8_t(15010 >> 8), r[25] = uint8_t(15010 & 0xFF);  // (motion: lying)
+      r[26] = 1;                                                    // (on the floor)
+      r[27] = uint8_t(w.model);
+    }
+    g_row_records_row = uint32_t(svr2011::g_active_row);
+    g_row_records_n = n;
+    REXLOG_INFO("match types: '{}' brings {} weapons", row.label, n);
+  }
+  g_swapped = {entry, Rd32(base + entry), Rd32(base + entry + 4)};
+  Wr32(base + entry, g_row_records_n);
+  Wr32(base + entry + 4, g_row_records);
+  return true;
+}
+
 void ApplyWeapons(uint8_t* base) {
   RestoreWeapons(base);
   const uint32_t rule = base[0x82E3DE00];
+  if (ApplyRowWeapons(base, rule)) return;
   if (!g_weapons || !WeaponsRule(rule) || !g_memory) return;
   uint32_t entry = WeaponEntry(base, rule);
   uint32_t lent = 0;
@@ -1789,10 +2543,12 @@ void ApplyWeapons(uint8_t* base) {
     REXLOG_WARN("match types: no weapon list for rule {:02X}", rule);
     return;
   }
-  const bool six = rule == kSixManRule;
-  const Placed* list = six ? kPlacedSix : kPlaced;
-  const uint32_t n = six ? uint32_t(std::size(kPlacedSix)) : uint32_t(std::size(kPlaced));
-  uint32_t& records = six ? g_weapon_records_six : g_weapon_records;
+  const bool six = rule == kSixManRule || rule == kGauntlet, cell = rule >= kCellFirst && rule <= kCellLast;
+  const bool ring = StructureOf(rule) && !cell;  // (cage, inferno)
+  const Placed* list = six ? kPlacedSix : cell ? kPlacedCell : ring ? kPlacedRing : kPlaced;
+  const uint32_t n = six ? uint32_t(std::size(kPlacedSix)) : cell ? uint32_t(std::size(kPlacedCell))
+                     : ring ? uint32_t(std::size(kPlacedRing)) : uint32_t(std::size(kPlaced));
+  uint32_t& records = six ? g_weapon_records_six : cell ? g_weapon_records_cell : ring ? g_weapon_records_ring : g_weapon_records;
   if (!records) {
     records = g_memory->SystemHeapAlloc(n * 28);
     if (!records) return;
@@ -1969,16 +2725,94 @@ REX_HOOK_RAW(sub_82837C30) {
   }
 }
 
+// The weapon models a match loads: sub_82301148(list) fills the wanted-model
+// list {s32 count; s32 ids[72]} with a hard-coded set per area (parking: 65,
+// 63, 17); 45010 (weapons=) only places them. A backstage mod row's weapon
+// models and load_weapons= join the list (sub_823010F0(list, id) appends, no
+// duplicates) - weapons the room makes later (sub_821D2070) need theirs loaded.
+REX_EXTERN(__imp__sub_82301148);
+REX_HOOK_RAW(sub_82301148) {
+  const uint32_t list = ctx.r3.u32;
+  __imp__sub_82301148(ctx, base);
+  const int r = svr2011::g_active_row;
+  if (!list || r < 0 || size_t(r) >= svr2011::BackstageRows().size() || Rd32(base + kStoryContext)) return;
+  const auto& row = svr2011::BackstageRows()[size_t(r)];
+  std::vector<int> models = row.load_weapons;
+  for (const auto& w : row.weapons) models.push_back(w.model);
+  if (models.empty()) return;
+  const auto saved = ctx;
+  for (int m : models) {
+    if (int32_t(Rd32(base + list)) >= 47) break;  // (48 loaded-model slots)
+    ctx.r3.u64 = list;
+    ctx.r4.u64 = uint32_t(m);
+    sub_823010F0(ctx, base);
+  }
+  ctx = saved;
+  REXLOG_INFO("match types: '{}' loads weapon models ({} wanted now)", row.label, int32_t(Rd32(base + list)));
+}
+
 namespace svr2011 {
+
+uint32_t FighterInput(uint32_t fighter) {
+  for (const Control& c : g_controls)
+    if (c.fighter == fighter) return c.input;
+  return 0;
+}
 
 // Menu text of the rows added here (menu_hooks.cpp's string lookup), else 0.
 uint32_t MatchTypeString(uint32_t id) {
   if (const uint32_t t = MysteryOpponentString(id, g_memory)) return t;
+  if ((id == kRoofLabel || id == kRoofText) && g_memory) {
+    static uint32_t text[2] = {};
+    const uint32_t k = id == kRoofText;
+    const char* s = k ? "The match starts on top of the cell. No pins count up there: shove your opponent off, break "
+                        "through the roof or climb down to finish it."
+                      : "START ON THE ROOF";
+    if (!text[k]) {
+      const uint32_t n = uint32_t(std::strlen(s) + 1);
+      text[k] = g_memory->SystemHeapAlloc(n);
+      std::memcpy(g_memory->TranslateVirtual<char*>(text[k]), s, n);
+    }
+    return text[k];
+  }
+  for (size_t s = 0; s < std::size(kStructures) && g_memory; ++s) {
+    const StructureWeapons& st = kStructures[s];
+    if (id != st.label && id != st.text) continue;
+    const uint32_t k = id == st.text;
+    const char* text = k ? st.about : st.name;
+    if (!g_structure_text[s][k]) {
+      const uint32_t n = uint32_t(std::strlen(text) + 1);
+      g_structure_text[s][k] = g_memory->SystemHeapAlloc(n);
+      std::memcpy(g_memory->TranslateVirtual<char*>(g_structure_text[s][k]), text, n);
+    }
+    return g_structure_text[s][k];
+  }
+  if (id >= kStagesSetLabel && id < kStagesSetLabel + 2 * svr2011::kThreeStagesSets && g_memory) {
+    static const char* const kText[] = {
+        "NORMAL / FCA / LMS",
+        "A normal fall, then Falls Count Anywhere, then Last Man Standing.",
+        "NORMAL / BLOOD / FINISHER",
+        "A normal fall, then First Blood, then Finishers: a pin or submission counts only right after a finisher.",
+        "NORMAL / LMS / SUBMISSION",
+        "A normal fall, then Last Man Standing, then Submission.",
+        "TABLE / TLC / LADDER",
+        "Through a table, then a TLC fall for the prize, then a Ladder fall for it.",
+        "CELL: BLOOD / LMS / SUB",
+        "Inside Hell in a Cell: First Blood, then Last Man Standing, then Submission.",
+        "TABLE / LADDER / TABLE",
+        "Through a table, then a Ladder fall for the prize, then through a table again."};
+    const uint32_t k = id - kStagesSetLabel;
+    if (!g_stages_set_text[k]) {
+      const uint32_t n = uint32_t(std::strlen(kText[k]) + 1);
+      g_stages_set_text[k] = g_memory->SystemHeapAlloc(n);
+      std::memcpy(g_memory->TranslateVirtual<char*>(g_stages_set_text[k]), kText[k], n);
+    }
+    return g_stages_set_text[k];
+  }
   if ((id == kStagesLabel || id == kStagesText) && g_memory) {
     static const char* const kText[] = {
         "THREE STAGES OF HELL",
-        "The first to win two falls: a normal fall, then Falls Count Anywhere, then Last Man Standing - "
-        "the damage carries over."};
+        "The first to win two falls, each under another stipulation - the damage carries over. Pick the three."};
     const uint32_t k = id - kStagesLabel;
     if (!g_stages_text[k]) {
       const uint32_t n = uint32_t(std::strlen(kText[k]) + 1);
@@ -1998,6 +2832,21 @@ uint32_t MatchTypeString(uint32_t id) {
       std::memcpy(g_memory->TranslateVirtual<char*>(g_elim_text[k]), kText[k], n);
     }
     return g_elim_text[k];
+  }
+  if (id >= kGeLabel && id <= kGeErText && g_memory) {
+    static const char* const kText[] = {
+        "GAUNTLET ELIMINATOR",
+        "Six superstars, each on his own: two start, the other four come in one a minute. A pin or a submission "
+        "eliminates - the last one left wins.",
+        "G. ELIMINATOR: EXTREME RULES",
+        "The Gauntlet Eliminator with weapons lying about and no disqualifications."};
+    const uint32_t k = id - kGeLabel;
+    if (!g_ge_text[k]) {
+      const uint32_t n = uint32_t(std::strlen(kText[k]) + 1);
+      g_ge_text[k] = g_memory->SystemHeapAlloc(n);
+      std::memcpy(g_memory->TranslateVirtual<char*>(g_ge_text[k]), kText[k], n);
+    }
+    return g_ge_text[k];
   }
   if ((id == kSlobberLabel || id == kSlobberText) && g_memory) {
     static const char* const kText[] = {
@@ -2199,6 +3048,14 @@ REX_HOOK_RAW(sub_82490558) {
 REX_EXTERN(__imp__sub_828C48E8);
 REX_HOOK_RAW(sub_828C48E8) {
   constexpr uint32_t kSavedElimination = 18;
+  if (g_online_from != ~0u && ctx.r3.u32 == g_online_from) {
+    REXLOG_INFO("match types: online - the live rules of rule {:02X} built as {:02X} (port rules)", g_online_from, g_online_to);
+    ctx.r3.u64 = g_online_to;
+    // GAUNTLET ELIMINATOR: each his own team (the lobby's are the 6-man's 3 on 3)
+    if (g_online_to == kGauntlet && g_ge)
+      if (const uint32_t match = Rd32(base + 0x82EDEB48))
+        for (uint32_t i = 0; i < uint32_t(kGePeople); ++i) base[match + kSlots + i * kSlotSize + 5] = uint8_t(i);
+  }
   const uint32_t rule = ctx.r3.u32, live = ctx.r4.u32, saved = ctx.r5.u32;
   const bool elim = g_elimination && (rule == kTripleThreat || rule == kFatal4Way) && saved;
   const bool extreme_bytes = g_weapons && WeaponsRule(rule) && (rule < kExtremeFirst || rule > kExtremeLast);
@@ -2246,15 +3103,50 @@ REX_HOOK_RAW(sub_828C48E8) {
   if (elim) base[saved + kSavedElimination] = was;
   // WEAPONS EVERYWHERE in 6-MAN / HANDICAP: the bytes Extreme Rules sets in
   // every mode's option record (Extreme Rules 0x4D-0x50 against the normal
-  // rules): +3 rope breaks off, +10 0, +27 locked off (0x80), +56 extreme
+  // rules): +3 rope breaks off, +10 0, +27 DISQUALIFICATION off (the record's locked 0x80 is 0 live), +56 extreme
   // rules (its weapons' models are loaded). (Not +32 0x80 and +47 1, set only
   // by the 2 on 2 and fatal-4-way ones: a 6-man match crashed in its match
   // screen, sub_824186E8.)
   if (extreme_bytes && live) {
     uint8_t* l = base + live;
-    l[3] = 0, l[10] = 0, l[27] = 0x80;
-    if (rule != kSixManRule) l[56] = 1;  // (6-MAN: not - see kPlacedSix)
+    l[3] = 0, l[10] = 0, l[27] = 0;  // (+27 DISQUALIFICATION: 0 off - the game has masked the lock bit 0x80 off by now)
+    const bool ring = StructureOf(rule) && (rule < kCellFirst || rule > kCellLast);  // (cage, inferno)
+    if (rule != kSixManRule && rule != kGauntlet && !ring) l[56] = 1;  // (6-MAN / the six-person gauntlet / cage / inferno: not - see kPlacedSix, kPlacedRing)
+    if (rule == kGauntlet || ring) l[4] = 1;                            // (RING OUT: no exiting)
+    if (rule == kSixManRule) l[5] = 0;                                   // (6-MAN: no count-outs; out of the ring is fine, as in Extreme Rules)
     REXLOG_INFO("match types: WEAPONS EVERYWHERE - rule {:02X} with the Extreme Rules options", rule);
   }
   svr2011::MysteryOpponentLive(base, live);  // (entrances on: mystery_opponent.h)
 }
+
+// Research aid (online match types): SVR2011_TEST_ONLINE_TRACE=1 - the
+// match families (sub_82490918 rule -> family, sub_82490980 rule -> its
+// flag) and the online lists' getters (sub_82470A60 count, sub_82470AA0
+// list, sub_82470AE0 label) logged with their callers (the first 40 calls of
+// each caller).
+namespace {
+bool OnlineTrace() {
+  static const bool on = std::getenv("SVR2011_TEST_ONLINE_TRACE") != nullptr;
+  return on;
+}
+void TraceCall(const char* fn, uint32_t lr, uint32_t a, uint32_t b, uint32_t result) {
+  static std::map<std::pair<std::string, uint32_t>, int> seen;
+  if (++seen[{fn, lr}] > 40) return;
+  REXLOG_INFO("online trace: {}({:X}, {:X}) = {:X} from {:08X}", fn, a, b, result, lr);
+}
+}  // namespace
+
+#define SVR2011_ONLINE_TRACE(fn)                                              \
+  REX_EXTERN(__imp__##fn);                                                    \
+  REX_HOOK_RAW(fn) {                                                          \
+    if (!OnlineTrace()) return __imp__##fn(ctx, base);                        \
+    const uint32_t lr = uint32_t(ctx.lr), a = ctx.r3.u32, b = ctx.r4.u32;     \
+    __imp__##fn(ctx, base);                                                   \
+    TraceCall(#fn, lr, a, b, ctx.r3.u32);                                     \
+  }
+SVR2011_ONLINE_TRACE(sub_82490918)
+SVR2011_ONLINE_TRACE(sub_82490980)
+SVR2011_ONLINE_TRACE(sub_82470A60)
+SVR2011_ONLINE_TRACE(sub_82470AA0)
+SVR2011_ONLINE_TRACE(sub_82470AE0)
+SVR2011_ONLINE_TRACE(sub_828B4A48)
