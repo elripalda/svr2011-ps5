@@ -143,6 +143,11 @@ class CommandProcessor {
   virtual void ShutdownContext() = 0;
 
   virtual void WriteRegister(uint32_t index, uint32_t value);
+  // [svr2011] Type-0 packets' runs of float shader constants (0x4000-0x47FF)
+  // stored in one go (true), then FloatConstantsWritten notes what
+  // WriteRegister would have for them.
+  virtual bool FastFloatConstants() const { return false; }
+  virtual void FloatConstantsWritten(uint32_t first_index, uint32_t count) {}
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,

@@ -406,11 +406,13 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
           "interlock path for D3D12 parity");
       path_ = Path::kPixelShaderInterlock;
     } else {
-      REXGPU_ERROR(
-          "VulkanRenderTargetCache: Bit-exact host render target ownership "
-          "transfers require UINT transfer formats and integer sampled-image "
-          "MSAA support, and fragment shader interlock fallback is unavailable");
-      return false;
+      // [svr2011] (old Mali drivers: no integer MSAA sampling) The game draws
+      // with the native renderer - this cache only follows the command stream,
+      // so transfers that aren't bit-exact don't show.
+      REXGPU_WARN(
+          "VulkanRenderTargetCache: host render target ownership transfers "
+          "can't be bit-exact on this device (no UINT transfer formats / integer "
+          "sampled-image MSAA, no fragment shader interlock) - continuing");
     }
   }
 

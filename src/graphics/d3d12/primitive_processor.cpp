@@ -37,6 +37,7 @@ bool D3D12PrimitiveProcessor::Initialize() {
       command_processor_.GetD3D12Provider(),
       std::max(size_t(kMinRequiredConvertedIndexBufferSize),
                ui::GraphicsUploadBufferPool::kDefaultPageSize));
+  REXLOG_INFO("[svr2011] upload pool {} = converted indices", static_cast<const void*>(frame_index_buffer_pool_.get()));
   return true;
 }
 

@@ -469,6 +469,36 @@ X_STATUS XThread::Create() {
   if (thread_name_.empty()) {
     set_name(fmt::format("XThread{:04X}", thread_->system_id()));
   }
+  // [svr2011] Which game thread this is (profiles): its start function and a
+  // name string the game keeps in the thread's start object, if any (the
+  // game's thread names are in the image at 0x82000A00-0x82000D00).
+  {
+    std::string found;
+    auto valid = [&](uint32_t a) {
+      if (a < 0x40000000u || a >= 0xA0000000u || (a & 3)) return false;
+      // (readable: a committed page of a heap - and the whole 0x80 bytes)
+      memory::BaseHeap* heap = memory()->LookupHeap(a);
+      uint32_t protect = 0, protect_end = 0;
+      return heap && heap->QueryProtect(a, &protect) && (protect & memory::kMemoryProtectRead) &&
+             heap->QueryProtect(a + 0x7C, &protect_end) && (protect_end & memory::kMemoryProtectRead);
+    };
+    auto look = [&](uint32_t obj, auto& self, int depth) -> void {
+      if (!valid(obj) || !found.empty()) return;
+      for (uint32_t off = 0; off < 0x80 && found.empty(); off += 4) {
+        const uint32_t w = memory::load_and_swap<uint32_t>(memory()->TranslateVirtual(obj + off));
+        if (w >= 0x82000A00u && w < 0x82000D00u) {
+          const char* str = memory()->TranslateVirtual<const char*>(w);
+          found = std::string(str, strnlen(str, 32));
+        } else if (depth > 0 && valid(w) && w != obj) {
+          self(w, self, depth - 1);
+        }
+      }
+    };
+    look(creation_params_.start_context, look, 1);
+    REXSYS_INFO("thread {} (host {}): start {:08X} context {:08X}{}", thread_name_, thread_->system_id(),
+                creation_params_.start_address, creation_params_.start_context,
+                found.empty() ? std::string() : " - " + found);
+  }
 
   if (creation_params_.creation_flags & 0x60) {
     thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
@@ -899,7 +929,10 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+    // [svr2011] once: the game sets a thread's CPU about twice a frame, and
+    // logging it each time filled low-end players' logs (98% of the lines).
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) REXSYS_WARN("Too few processor cores - scheduling will be wonky");
   }
 }
 

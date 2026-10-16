@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 
 #include <rex/dbg.h>
@@ -79,6 +81,21 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
 }
 
 void InputSystem::RefreshDevices() {
+  // [svr2011] At most every 8 ms: each GetState / GetCapabilities asks for it,
+  // and a game polling 8 users a frame enumerated every driver (XInput
+  // capability calls, SDL, keyboard) 8+ times a frame. Plugging a pad in or
+  // out still shows within a frame.
+  {
+    static std::atomic<int64_t> last_ns{0};
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    const int64_t prev = last_ns.load(std::memory_order_relaxed);
+    if (prev && now - prev < 8000000 && !devices_.empty()) {
+      return;
+    }
+    last_ns.store(now, std::memory_order_relaxed);
+  }
   std::vector<DeviceInfo> seen;
   std::vector<InputDriver*> owners;
   std::vector<DeviceInfo> enumerated;
@@ -245,10 +262,30 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   if (!any) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
+  if (guest_input_hold_ && guest_input_hold_()) {  // [svr2011] a host menu has the pad
+    if (user_index < kMaxGuestUsers) {
+      std::lock_guard lock(held_mutex_);
+      held_state_[user_index] = merged;
+      held_valid_[user_index] = true;
+    }
+    merged.gamepad = {};
+  }
   if (out_state) {
     *out_state = merged;
   }
   return X_ERROR_SUCCESS;
+}
+
+void InputSystem::SetGuestInputHold(std::function<bool()> hold) {
+  guest_input_hold_ = std::move(hold);
+}
+
+bool InputSystem::HeldState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  if (user_index >= kMaxGuestUsers) return false;
+  std::lock_guard lock(held_mutex_);
+  if (!held_valid_[user_index]) return false;
+  *out_state = held_state_[user_index];
+  return true;
 }
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
@@ -310,6 +347,9 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
       continue;
     }
     X_RESULT result = driver->GetDeviceKeystroke(id, flags, out_keystroke);
+    if (result == X_ERROR_SUCCESS && guest_input_hold_ && guest_input_hold_()) {
+      return X_ERROR_EMPTY;  // [svr2011] a host menu has the pad: dropped
+    }
     if (result == X_ERROR_SUCCESS) {
       out_keystroke->user_index = static_cast<uint8_t>(user_index);
       return result;

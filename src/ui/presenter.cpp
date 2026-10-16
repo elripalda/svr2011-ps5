@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cctype>
 #include <utility>
 
@@ -277,6 +279,17 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 namespace rex {
 namespace ui {
 
+// [svr2011] Frames presented to the screen (all presenters), and how many of
+// them showed a guest frame not shown before (g_guest_frames: guest frames
+// published to the mailbox).
+std::atomic<uint64_t> g_host_presents{0}, g_host_new_guest_presents{0}, g_guest_frames{0};
+uint64_t g_last_presented_guest_frame = 0;
+uint64_t HostPresentCount() { return g_host_presents.load(std::memory_order_relaxed); }
+uint64_t HostNewGuestFramePresentCount() {
+  return g_host_new_guest_presents.load(std::memory_order_relaxed);
+}
+
+
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
   rex::FatalError("Graphics device lost (probably due to an internal error)");
@@ -446,8 +459,30 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   // Reset ui_thread_paint_requested_ unconditionally also, regardless of
   // whether the UI needs to be drawn - the flag may be set to try reconnecting,
   // for example.
-  if (ui_thread_paint_requested_.exchange(false, std::memory_order_relaxed)) {
+  const bool paint_requested = ui_thread_paint_requested_.exchange(false, std::memory_order_relaxed);
+  if (paint_requested) {
     do_paint = true;
+  }
+  // [svr2011] (ThrottleUIOnlyPaints) A paint with no new guest frame - only
+  // for the UI - waits for the next display tick and is skipped if no guest
+  // frame came meanwhile (at most for 100 ms), then looked at again. (Without
+  // the wait, SDL's own events spun the UI thread.)
+  bool throttled = false;
+  if (do_paint && !force_paint && ThrottleUIOnlyPaints() &&
+      surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+    static std::chrono::steady_clock::time_point last_paint;
+    if (g_guest_frames.load(std::memory_order_acquire) == g_last_presented_guest_frame) {
+      // (about a display tick - WaitForUITickFromUIThread only waits on Windows -
+      // ending as soon as a guest frame comes)
+      for (int i = 0; i < 4 && g_guest_frames.load(std::memory_order_acquire) == g_last_presented_guest_frame; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+      if (g_guest_frames.load(std::memory_order_acquire) == g_last_presented_guest_frame &&
+          std::chrono::steady_clock::now() - last_paint < std::chrono::milliseconds(100)) {
+        do_paint = false;
+        throttled = true;
+      }
+    }
+    if (do_paint) last_paint = std::chrono::steady_clock::now();
   }
   PaintResult paint_result = PaintResult::kNotPresented;
   bool request_repaint_at_tick = false;
@@ -541,6 +576,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       request_repaint_at_tick = true;
     }
   }
+  if (throttled) request_repaint_at_tick = true;  // (after a tick's wait above: no spinning)
   if (request_repaint_at_tick || request_repaint_immediately) {
     RequestPaintOrConnectionRecoveryViaWindow(request_repaint_immediately);
   }
@@ -592,6 +628,7 @@ bool Presenter::RefreshGuestOutput(
       last_acquired_and_ready,
       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
       std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+  g_guest_frames.fetch_add(1, std::memory_order_release);  // [svr2011]
   // Now, it's known that `ready == writable` on the host presentation side.
   // Take the next `writable` with this assumption about its current value in
   // mind.
@@ -1497,7 +1534,15 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+  const uint64_t guest_frame = g_guest_frames.load(std::memory_order_acquire);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    g_host_presents.fetch_add(1, std::memory_order_relaxed);
+    if (guest_frame != g_last_presented_guest_frame) {
+      g_last_presented_guest_frame = guest_frame;
+      g_host_new_guest_presents.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;

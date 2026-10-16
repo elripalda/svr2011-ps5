@@ -249,6 +249,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   void ShutdownContext() override;
 
   void WriteRegister(uint32_t index, uint32_t value) override;
+  bool FastFloatConstants() const override { return true; }
+  void FloatConstantsWritten(uint32_t first_index, uint32_t count) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;

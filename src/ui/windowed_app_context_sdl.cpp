@@ -97,6 +97,28 @@ int SDLWindowedAppContext::RunMainMessageLoop() {
 }
 
 void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+#if REX_PLATFORM_ANDROID
+  // [svr2011] the drawing surface after a return from the background
+  for (auto& [id, w] : windows_) w->SyncAndroidSurface();
+  if (event.type == SDL_EVENT_WILL_ENTER_BACKGROUND || event.type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+    const bool background = event.type == SDL_EVENT_WILL_ENTER_BACKGROUND;
+    for (auto& [id, w] : windows_) w->SetAndroidBackground(background);
+    if (!background) {
+      // The new native window can come a little after: check again a few
+      // times (a wakeup event runs the check above).
+      static uint32_t type = 0;
+      type = wakeup_event_type_;
+      for (int k = 1; k <= 10; ++k) {
+        SDL_AddTimer(Uint32(150 * k), [](void*, SDL_TimerID, Uint32) -> Uint32 {
+          SDL_Event e{};
+          e.type = type;
+          SDL_PushEvent(&e);
+          return 0;
+        }, nullptr);
+      }
+    }
+  }
+#endif
   if (event.type == wakeup_event_type_) {
     ExecutePendingFunctionsFromUIThread();
     return;
@@ -166,6 +188,27 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
     case SDL_EVENT_MOUSE_WHEEL: {
       if (WindowSDL* window = GetWindow(event.wheel.windowID)) {
         window->HandleMouseEvent(event);
+      }
+      break;
+    }
+    // [svr2011] Touch screens: each finger as a touch pointer (listeners
+    // such as the port's on-screen controller need every finger; the
+    // single-finger mouse emulation is ignored in HandleMouseEvent).
+    case SDL_EVENT_FINGER_DOWN:
+    case SDL_EVENT_FINGER_UP:
+    case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_CANCELED: {
+      // (Android may leave windowID 0 on finger events: the app's only window)
+      WindowSDL* window = GetWindow(event.tfinger.windowID);
+      if (!window && !windows_.empty()) window = windows_.begin()->second;
+      static int logged = 0;
+      if (logged < 6) {
+        ++logged;
+        REXLOG_INFO("[svr2011] finger event {:X} window {} ({}) at {:.3f},{:.3f}", uint32_t(event.type),
+                    uint32_t(event.tfinger.windowID), window ? "found" : "none", event.tfinger.x, event.tfinger.y);
+      }
+      if (window) {
+        window->HandleTouchEvent(event);
       }
       break;
     }

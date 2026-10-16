@@ -35,6 +35,11 @@ class DynamicLibrary {
   explicit operator bool() const { return handle_ != nullptr; }
 
   void* GetRawSymbol(const char* name) const;
+  // [svr2011] Takes a library opened elsewhere (dlopen / LoadLibrary handle).
+  void Adopt(void* handle) {
+    Close();
+    handle_ = handle;
+  }
 
   template <typename T>
   T GetSymbol(const char* name) const {

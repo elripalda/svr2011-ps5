@@ -12,6 +12,7 @@
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
+#include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
@@ -27,6 +28,8 @@
 
 #include <fmt/format.h>
 #include <fmt/xchar.h>
+
+REXCVAR_DECLARE(uint32_t, user_language);
 
 namespace rex {
 namespace kernel {
@@ -183,6 +186,14 @@ u32 XGetGameRegion_entry() {
 }
 
 u32 XGetLanguage_entry() {
+  // [svr2011] The user_language setting (the port's language selector), as
+  // the console's language would be.
+  {
+    const uint32_t language = REXCVAR_GET(user_language);
+    if (language >= uint32_t(XLanguage::kEnglish) && language < uint32_t(XLanguage::kMaxLanguages)) {
+      return language;
+    }
+  }
   auto desired_language = XLanguage::kEnglish;
 
   // Switch the language based on game region.
@@ -206,6 +217,12 @@ u32 XamGetCurrentTitleId_entry() {
     return module->title_id();
   }
   return 0;
+}
+
+// [svr2011] (was unimplemented: the game got garbage and waited at boot
+// when signed in online)
+u32 XNetLogonGetTitleID_entry(u32 caller) {
+  return XamGetCurrentTitleId_entry();
 }
 
 u32 XamGetExecutionId_entry(mapped_u32 info_ptr) {
@@ -334,6 +351,7 @@ u32 XamSwapDisc_entry(u32 disc_number) {
 }  // namespace rex
 
 REX_EXPORT(__imp__XamFeatureEnabled, rex::kernel::xam::XamFeatureEnabled_entry)
+REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
 REX_EXPORT(__imp__XamGetOnlineSchema, rex::kernel::xam::XamGetOnlineSchema_entry)
 REX_EXPORT(__imp__XamFormatDateString, rex::kernel::xam::XamFormatDateString_entry)
 REX_EXPORT(__imp__XamFormatTimeString, rex::kernel::xam::XamFormatTimeString_entry)

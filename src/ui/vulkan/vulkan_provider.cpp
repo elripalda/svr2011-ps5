@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/external_frame.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/immediate_drawer.h>
 #include <rex/ui/vulkan/presenter.h>
@@ -144,6 +145,29 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
           "Vulkan logical device");
       return nullptr;
     }
+  }
+
+  // [svr2011] app renderers draw on this device (rex/external_frame.h)
+  if (with_gpu_emulation) {
+    const VulkanDevice& d = *provider->vulkan_device_;
+    const uint32_t family = d.queue_family_graphics_compute();
+    VulkanDevice::Queue& queue = *d.queue_families()[family].queues[0];
+    rex::external_frame::VulkanDevice info;
+    info.instance = provider->vulkan_instance_->instance();
+    info.get_instance_proc_addr =
+        reinterpret_cast<void*>(provider->vulkan_instance_->functions().vkGetInstanceProcAddr);
+    info.api_version = d.properties().apiVersion;
+    info.physical_device = d.physical_device();
+    info.device = d.device();
+    info.queue_family = family;
+    info.queue = queue.queue;
+    info.queue_mutex = &queue.mutex;
+    info.app_renderer_features = d.properties().appRendererFeatures;
+    info.scalar_block_layout = d.properties().scalarBlockLayout;
+    info.null_descriptor = d.properties().nullDescriptor;
+    info.sampler_mirror_clamp_to_edge = d.properties().samplerMirrorClampToEdge;
+    info.geometry_shader = d.properties().geometryShader;
+    rex::external_frame::SetVulkanDevice(&info);
   }
 
   if (with_presentation) {

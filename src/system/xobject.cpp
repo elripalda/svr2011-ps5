@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <unordered_map>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -53,6 +54,10 @@ XObject::~XObject() {
   // assert_zero(pointer_ref_count_);
 
   if (allocated_guest_object_) {
+    {
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      CreatedNativeObjects().erase(guest_object_ptr_);
+    }
     uint32_t ptr = guest_object_ptr_ - sizeof(X_OBJECT_HEADER);
     auto header = memory()->TranslateVirtual<X_OBJECT_HEADER*>(ptr);
 
@@ -333,6 +338,7 @@ uint8_t* XObject::CreateNative(uint32_t size) {
   allocated_guest_object_ = true;
   memory()->Zero(mem, total_size);
   SetNativePointer(mem + sizeof(X_OBJECT_HEADER), true);
+  CreatedNativeObjects()[mem + sizeof(X_OBJECT_HEADER)] = this;
 
   auto header = memory()->TranslateVirtual<X_OBJECT_HEADER*>(mem);
 
@@ -367,6 +373,27 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
   guest_object_ptr_ = native_ptr;
 }
 
+// [svr2011] Guest structs made by CreateNative, by address: not all of them
+// start with a dispatch header (an enumerator starts with X_KENUMERATOR), so
+// GetNativeObject can't find them from the struct - it took an enumerator for
+// an event, made a stray XEvent on its memory and never released the
+// enumerator; once the heap reused that memory, the stray event answered for
+// the new struct there (SvR 2011 lost all its audio after previewing a USER
+// PLAYLIST song, whose lookup does XamGetPrivateEnumStructureFromHandle +
+// ObDereferenceObject).
+std::unordered_map<uint32_t, XObject*>& XObject::CreatedNativeObjects() {
+  static std::unordered_map<uint32_t, XObject*> objects;
+  return objects;
+}
+
+object_ref<XObject> XObject::GetCreatedNativeObject(uint32_t guest_ptr) {
+  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  auto& objects = CreatedNativeObjects();
+  auto it = objects.find(guest_ptr);
+  if (it == objects.end()) return nullptr;
+  return retain_object(it->second);
+}
+
 object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,
                                              int32_t as_type) {
   assert_not_null(native_ptr);
@@ -394,9 +421,19 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     uint32_t handle = header->wait_list_blink;
     auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
 
-    // TODO(benvanik): assert nothing has been changed in the struct.
-    return object;
-  } else {
+    // [svr2011] A stale stash: the struct (often on the guest stack) outlived
+    // its object and the handle now belongs to something else, or to nothing.
+    // Callers cast the result to the type they expect (XEvent::Set on a
+    // non-event crashed at boot), so make a new object instead.
+    const Type expected = (as_type == 0 || as_type == 1) ? Type::Event
+                          : as_type == 2                 ? Type::Mutant
+                          : as_type == 5                 ? Type::Semaphore
+                                                         : Type::Undefined;
+    if (object && (expected == Type::Undefined || object->type() == expected)) {
+      return object;
+    }
+  }
+  {
     // First use, create new.
     // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
     XObject* object = nullptr;

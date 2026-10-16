@@ -12,6 +12,7 @@
 #include <cstdlib>
 
 #include <rex/cvar.h>
+#include <rex/external_frame.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
@@ -20,7 +21,12 @@
 
 #include <malloc.h>
 
+#include <dxgi1_6.h>
+
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(d3d12_dred, false, "UI/D3D12",
+                    "Enable DRED (breadcrumbs, page faults) without the debug layer, to diagnose GPU hangs")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
@@ -57,8 +63,8 @@ std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
         "Ensure that you have the latest drivers for your GPU and it supports "
         "Direct3D 12 with the feature level of at least 11_0.\n"
         "\n"
-        "See https://xenia.jp/faq/ for more information and a list of "
-        "supported GPUs.");
+        "Older GPUs: choose Direct3D 11 as the graphics API (the launcher's "
+        "Settings, or gpu_backend = \"d3d11\" in svr2011.toml).");  // [svr2011]
     return nullptr;
   }
   return provider;
@@ -228,18 +234,17 @@ bool D3D12Provider::Initialize() {
       debug = false;
     }
 
-    // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes.
-    {
-      Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
-      if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
-        dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
-      } else {
-        REXLOG_WARN(
-            "Failed to enable DRED - device removal diagnostics will be "
-            "limited");
-      }
+  }
+  // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes
+  // (with the debug layer, or alone with d3d12_dred).
+  if (debug || REXCVAR_GET(d3d12_dred)) {
+    Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
+    if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
+      dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
+    } else {
+      REXLOG_WARN("Failed to enable DRED - device removal diagnostics will be limited");
     }
   }
   // Create the DXGI factory.
@@ -253,7 +258,27 @@ bool D3D12Provider::Initialize() {
   // Choose the adapter.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  // [svr2011] By default the high-performance GPU: on laptops with a
+  // discrete GPU, adapter 0 is usually the integrated one.
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    IDXGIFactory6* factory6 = nullptr;
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&factory6)))) {
+      for (UINT i = 0; factory6->EnumAdapterByGpuPreference(
+                           i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)) == S_OK;
+           ++i) {
+        DXGI_ADAPTER_DESC1 desc;
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
+                                               _uuidof(ID3D12Device), nullptr))) {
+          break;
+        }
+        adapter->Release();
+        adapter = nullptr;
+      }
+      factory6->Release();
+    }
+  }
+  while (!adapter && dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
@@ -395,6 +420,7 @@ bool D3D12Provider::Initialize() {
 
   dxgi_factory_ = dxgi_factory;
   device_ = device;
+  rex::external_frame::SetDevice(device);  // [svr2011] app renderers use this GPU
   direct_queue_ = direct_queue;
 
   // Get descriptor sizes for each type.

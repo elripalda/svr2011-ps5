@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -20,6 +21,10 @@
 #include <rex/platform.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
+
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 
 using namespace rex::arch;
 
@@ -417,8 +422,26 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
     if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+      const bool handled = access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                                      fault_host_address, is_write);
+#if REX_ARCH_ARM64 && !defined(_WIN32)
+      // [svr2011] where the guest code was (the first few unhandled faults)
+      static std::atomic<int> reported{0};
+      if (!handled && reported.fetch_add(1) < 3) {
+        auto where = [](uint64_t a) {
+          Dl_info info{};
+          if (a && dladdr(reinterpret_cast<void*>(a), &info) && info.dli_fname)
+            return fmt::format("{}+0x{:X}", std::strrchr(info.dli_fname, '/') ? std::strrchr(info.dli_fname, '/') + 1
+                                                                              : info.dli_fname,
+                               a - reinterpret_cast<uint64_t>(info.dli_fbase));
+          return fmt::format("0x{:X}", a);
+        };
+        const arch::HostThreadContext& c = *ex->thread_context();
+        REXLOG_ERROR("Unhandled guest access at host pc {} (lr {}), x0 {:X} x1 {:X} x2 {:X}", where(ex->pc()),
+                     where(c.x[30]), c.x[0], c.x[1], c.x[2]);
+      }
+#endif
+      return handled;
     }
     return false;
   }

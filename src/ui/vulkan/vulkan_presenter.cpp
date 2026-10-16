@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -1528,6 +1529,24 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   return true;
 }
 
+// [svr2011] Mali (vendor 0x13B5): the 4x A53 tablets - the paint at the display's
+// rate cost a fifth of a core.
+REXCVAR_DEFINE_STRING(vulkan_throttle_ui_paints, "auto", "GPU",
+                      "Paint only for new game frames, not at the display's rate for the overlay: auto (Mali "
+                      "GPUs), on, off");
+
+bool VulkanPresenter::ThrottleUIOnlyPaints() const {
+  static const int mode = [] {
+    const std::string v = REXCVAR_GET(vulkan_throttle_ui_paints);
+    return v == "on" ? 1 : v == "off" ? 0 : -1;
+  }();
+  return mode >= 0 ? mode == 1 : vulkan_device_->properties().vendorID == 0x13B5;
+}
+
+// [svr2011] paint timing (phones: where the presenter's time goes)
+static double g_svr_paint_ms[5];
+static uint32_t g_svr_paints;
+
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
@@ -1569,9 +1588,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
+  const auto svr_t0 = std::chrono::steady_clock::now();  // [svr2011] paint timing
   VkResult acquire_result =
       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
                                 VK_NULL_HANDLE, &swapchain_image_index);
+  g_svr_paint_ms[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - svr_t0).count();
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -1643,6 +1664,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // the consumer critical section now as everything here either will be using
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
+  }
+
+  // [svr2011] How many paints had a game picture (none: the window shows only
+  // the clear colour and the UI), now and then.
+  {
+    static uint64_t paints = 0, paints_with_output = 0;
+    ++paints;
+    if (guest_output_image) ++paints_with_output;
+    if (paints == 1 || paints % 1800 == 0) {
+      REXLOG_INFO("[svr2011] presenter: {} paints, {} with the game's picture; swapchain {}x{}", paints,
+                  paints_with_output, paint_context_.swapchain_extent.width,
+                  paint_context_.swapchain_extent.height);
+    }
   }
 
   if (guest_output_image) {
@@ -1840,6 +1874,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 swapchain_effect, paint_context_.swapchain_render_pass);
             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
               guest_output_flow.effect_count = 0;
+            } else {
+              // [svr2011] The format it was made for: left unset, the check
+              // above destroyed and rebuilt the pipeline (after waiting for the
+              // GPU) on every paint - a shader compile per frame on phones.
+              swapchain_effect_pipeline.swapchain_format = paint_context_.swapchain_render_pass_format;
             }
           }
         }
@@ -2196,8 +2235,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     }
     VkResult submit_result;
     {
+      const auto svr_t1 = std::chrono::steady_clock::now();
       const VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+      g_svr_paint_ms[1] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - svr_t1).count();
       submit_result =
           dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
       if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
@@ -2238,9 +2279,33 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pResults = nullptr;
   VkResult present_result;
   {
+    // [svr2011] Mali drivers (r20) block in vkQueuePresentKHR until the GPU
+    // has finished everything queued - holding the only queue's lock, so the
+    // game's and the renderer's submissions waited for the GPU and CPU and GPU
+    // never overlapped. Wait for this paint here instead, without the lock.
+    static const bool wait_before_present = vulkan_device_->properties().vendorID == 0x13B5;
+    if (wait_before_present) {
+      const auto svr_tw = std::chrono::steady_clock::now();
+      paint_context_.submission_tracker.AwaitSubmissionCompletion(
+          paint_context_.submission_tracker.GetCurrentSubmission() - 1);
+      g_svr_paint_ms[4] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - svr_tw).count();
+    }
+    const auto svr_t2 = std::chrono::steady_clock::now();
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+    const auto svr_t3 = std::chrono::steady_clock::now();
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+    const auto svr_t4 = std::chrono::steady_clock::now();
+    g_svr_paint_ms[2] += std::chrono::duration<double, std::milli>(svr_t3 - svr_t2).count();
+    g_svr_paint_ms[3] += std::chrono::duration<double, std::milli>(svr_t4 - svr_t3).count();
+    if (++g_svr_paints == 600) {
+      REXLOG_INFO("VulkanPresenter: per paint: acquire {:.2f} ms, queue wait {:.2f} ms (submit) + {:.2f} ms "
+                  "(present), GPU wait before present {:.2f} ms, present {:.2f} ms",
+                  g_svr_paint_ms[0] / 600, g_svr_paint_ms[1] / 600, g_svr_paint_ms[2] / 600, g_svr_paint_ms[4] / 600,
+                  g_svr_paint_ms[3] / 600);
+      g_svr_paints = 0;
+      for (double& v : g_svr_paint_ms) v = 0;
+    }
   }
   switch (present_result) {
     case VK_SUCCESS:

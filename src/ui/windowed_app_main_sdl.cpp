@@ -22,6 +22,12 @@
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
+#if REX_PLATFORM_ANDROID
+// [svr2011] main becomes SDL_main, which SDL's Java activity calls.
+#include <SDL3/SDL_main.h>
+#include <rex/main_android.h>
+#endif
+
 #if REX_PLATFORM_WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -37,6 +43,9 @@
 namespace {
 
 int RunWindowedApp(int argc, char** argv) {
+#if REX_PLATFORM_ANDROID
+  rex::InitializeAndroid();  // [svr2011]
+#endif
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 
@@ -28,6 +29,11 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/sdl_virtual_key.h>
 
+// [svr2011] Fullscreen: false - borderless (a window covering the display),
+// true - exclusive (the display's own mode, at the desktop's resolution).
+REXCVAR_DEFINE_BOOL(fullscreen_exclusive, false, "UI/Window",
+                    "Fullscreen takes the display (exclusive) instead of a borderless window");
+
 #if REX_PLATFORM_WIN32
 #include <rex/ui/surface_win.h>
 #elif REX_PLATFORM_MAC
@@ -35,6 +41,8 @@
 #include <SDL3/SDL_metal.h>
 
 #include <rex/ui/surface_mac.h>
+#elif REX_PLATFORM_ANDROID
+#include <rex/ui/surface_android.h>  // [svr2011]
 #else
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
@@ -171,7 +179,9 @@ bool WindowSDL::OpenImpl() {
   }
 
   if (IsFullscreen()) {
-    // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
+    // Borderless desktop fullscreen (a NULL display mode is SDL3's default),
+    // or exclusive ([svr2011] fullscreen_exclusive).
+    ApplyFullscreenMode();
     SDL_SetWindowFullscreen(sdl_window_, true);
   }
 #if REX_PLATFORM_MAC
@@ -183,6 +193,16 @@ bool WindowSDL::OpenImpl() {
   // desired state so a reopened window comes back with the state it had.
   ApplyTextInputActiveNow();
   ApplyCursorVisibilityNow();
+#if REX_PLATFORM_WIN32
+  // [svr2011] Tests (SVR2011_WINDOW_BEHIND=1): behind every other window
+  // before it is ever shown, so a test game never covers what the player is
+  // watching, not even for a frame.
+  if (const char* behind = std::getenv("SVR2011_WINDOW_BEHIND"); behind && *behind == '1') {
+    if (HWND hwnd = static_cast<HWND>(GetNativeWindowHandle())) {
+      ::SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+  }
+#endif
   SDL_ShowWindow(sdl_window_);
 
   // Actualize state for the common Window code. Listener dispatch is handled
@@ -291,9 +311,26 @@ uint32_t WindowSDL::GetLatestDpiImpl() const {
   return uint32_t(scale * float(GetMediumDpi()) + 0.5f);
 }
 
+// [svr2011] Exclusive fullscreen: the display's desktop mode as the window's
+// fullscreen mode; borderless: none (SDL3's desktop fullscreen).
+void WindowSDL::ApplyFullscreenMode() {
+  const SDL_DisplayMode* mode = nullptr;
+  if (REXCVAR_GET(fullscreen_exclusive)) {
+    SDL_DisplayID display = SDL_GetDisplayForWindow(sdl_window_);
+    if (!display) display = SDL_GetPrimaryDisplay();
+    mode = SDL_GetDesktopDisplayMode(display);
+  }
+  if (!SDL_SetWindowFullscreenMode(sdl_window_, mode)) {
+    REXLOG_WARN("SDL_SetWindowFullscreenMode failed: {}", SDL_GetError());
+  }
+}
+
 void WindowSDL::ApplyNewFullscreen() {
   if (!sdl_window_) {
     return;
+  }
+  if (IsFullscreen()) {
+    ApplyFullscreenMode();
   }
   SDL_SetWindowFullscreen(sdl_window_, IsFullscreen());
 }
@@ -396,6 +433,17 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
         return std::make_unique<CAMetalLayerSurface>(sdl_window_, metal_view, layer);
       }
       SDL_Metal_DestroyView(metal_view);
+    }
+  }
+#elif REX_PLATFORM_ANDROID
+  // [svr2011] the activity's ANativeWindow
+  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
+    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+    auto* window = static_cast<ANativeWindow*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+    if (window) {
+      android_window_ = window;
+      return std::make_unique<AndroidNativeWindowSurface>(window);
     }
   }
 #else
@@ -549,6 +597,14 @@ void WindowSDL::HandleTextInputEvent(SDL_Event& event) {
 }
 
 void WindowSDL::HandleMouseEvent(SDL_Event& event) {
+  // [svr2011] Mouse events SDL makes from touches: the fingers themselves
+  // arrive as touch events (HandleTouchEvent; ImGui maps one to its mouse).
+  if ((event.type == SDL_EVENT_MOUSE_MOTION && event.motion.which == SDL_TOUCH_MOUSEID) ||
+      ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+       event.button.which == SDL_TOUCH_MOUSEID) ||
+      (event.type == SDL_EVENT_MOUSE_WHEEL && event.wheel.which == SDL_TOUCH_MOUSEID)) {
+    return;
+  }
   // SDL3 reports float window coordinates; listeners expect physical pixels.
   float density = GetPixelDensity();
   WindowDestructionReceiver destruction_receiver(this);
@@ -586,6 +642,61 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
     default:
       break;
   }
+}
+
+// [svr2011] Android surface lifecycle (see window_sdl.h).
+void WindowSDL::SetAndroidBackground(bool background) {
+#if REX_PLATFORM_ANDROID
+  android_background_ = background;
+  if (background && HasSurface()) {
+    REXLOG_INFO("[svr2011] background: presenter detached from the surface");
+    OnSurfaceChanged(false);
+    android_window_ = nullptr;
+  }
+  SyncAndroidSurface();
+#else
+  (void)background;
+#endif
+}
+
+void WindowSDL::SyncAndroidSurface() {
+#if REX_PLATFORM_ANDROID
+  if (android_background_ || !sdl_window_) return;
+  void* current = SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
+                                         SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
+  if (current == android_window_ && (HasSurface() || !current)) return;
+  REXLOG_INFO("[svr2011] native window {} -> {}: {} the surface", android_window_, current,
+              current ? "recreating" : "dropping");
+  OnSurfaceChanged(current != nullptr);
+  if (!current) android_window_ = nullptr;
+  if (HasSurface()) RequestPaint();
+#endif
+}
+
+// [svr2011] A finger (SDL: normalized 0..1 window coordinates) as a touch
+// event in physical pixels, like the mouse events.
+void WindowSDL::HandleTouchEvent(SDL_Event& event) {
+  int w = 0, h = 0;
+  SDL_GetWindowSizeInPixels(sdl_window_, &w, &h);
+  TouchEvent::Action action;
+  switch (event.type) {
+    case SDL_EVENT_FINGER_DOWN:
+      action = TouchEvent::Action::kDown;
+      break;
+    case SDL_EVENT_FINGER_UP:
+      action = TouchEvent::Action::kUp;
+      break;
+    case SDL_EVENT_FINGER_CANCELED:
+      action = TouchEvent::Action::kCancel;
+      break;
+    default:
+      action = TouchEvent::Action::kMove;
+      break;
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  TouchEvent e(this, uint32_t(event.tfinger.fingerID), action, event.tfinger.x * float(w),
+               event.tfinger.y * float(h));
+  OnTouchEvent(e, destruction_receiver);
 }
 
 }  // namespace rex::ui

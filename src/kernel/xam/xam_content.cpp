@@ -1,4 +1,4 @@
-/**
+﻿/**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
@@ -17,6 +17,7 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/util/string_utils.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xtypes.h>
@@ -34,6 +35,7 @@ u32 XamContentGetLicenseMask_entry(mapped_u32 mask_ptr, mapped_void overlapped_p
   // seems to vary from game to game, but most appear to use bit 0 to indicate
   // if the game is purchased or not.
   *mask_ptr = REXCVAR_GET(license_mask);
+  REXLOG_INFO("[svr2011] XamContentGetLicenseMask -> {:08X}", REXCVAR_GET(license_mask));
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
@@ -141,7 +143,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     *disposition_ptr = 0;
   }
 
-  auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
+  // [svr2011] ANSI root names (this game uses "p0ú0") as UTF-8, as paths are.
+  auto run = [content_manager, xuid, root_name = util::AnsiToUtf8(root_name.value()), flags,
+              content_data,
               disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
@@ -280,7 +284,8 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
-  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  auto result =
+      REX_KERNEL_STATE()->content_manager()->CloseContent(util::AnsiToUtf8(root_name.value()));
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);

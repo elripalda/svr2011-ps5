@@ -79,6 +79,8 @@ bool D3D12SharedMemory::Initialize() {
     }
   }
   buffer_gpu_address_ = buffer_->GetGPUVirtualAddress();
+  REXGPU_INFO("[svr2011] shared memory buffer GPU VA {:016X}-{:016X}", buffer_gpu_address_,
+              buffer_gpu_address_ + kBufferSize);
   buffer_uav_writes_commit_needed_ = false;
 
   D3D12_DESCRIPTOR_HEAP_DESC buffer_descriptor_heap_desc;
@@ -137,6 +139,7 @@ bool D3D12SharedMemory::Initialize() {
   upload_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
       provider, rex::align(ui::d3d12::D3D12UploadBufferPool::kDefaultPageSize,
                            size_t(1) << page_size_log2()));
+  REXLOG_INFO("[svr2011] upload pool {} = shared memory uploads", static_cast<const void*>(upload_buffer_pool_.get()));
 
   return true;
 }

@@ -10,7 +10,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -47,6 +49,15 @@ class InputSystem : public system::IInputSystem {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
+  /// [svr2011] While `hold` returns true the guest sees its pads connected but
+  /// idle (no buttons, centred sticks, no keystrokes) - for a host menu that
+  /// takes the controller. The real state the guest would have seen is kept
+  /// and returned by HeldState.
+  void SetGuestInputHold(std::function<bool()> hold);
+  /// [svr2011] The last real state polled for `user_index` while held
+  /// (false if none yet).
+  bool HeldState(uint32_t user_index, X_INPUT_STATE* out_state);
+
  private:
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
@@ -65,6 +76,11 @@ class InputSystem : public system::IInputSystem {
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
+
+  std::function<bool()> guest_input_hold_;  // [svr2011]
+  std::mutex held_mutex_;
+  X_INPUT_STATE held_state_[kMaxGuestUsers] = {};
+  bool held_valid_[kMaxGuestUsers] = {};
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

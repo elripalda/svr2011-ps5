@@ -46,6 +46,11 @@
 #include <filesystem>
 #include <string_view>
 
+// [svr2011] which of the plugin's backends to use
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "GPU plugin backend: any (the first compiled in: D3D12 on Windows), d3d12, vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
@@ -314,7 +319,7 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =

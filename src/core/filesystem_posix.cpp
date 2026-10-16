@@ -100,6 +100,13 @@ std::filesystem::path GetExecutablePath() {
 }
 
 std::filesystem::path GetExecutableFolder() {
+#if defined(__ANDROID__)
+  // [svr2011] The executable is the system's app_process; the app's folder
+  // (the game files) is passed by its Java activity.
+  if (auto dir = rex::platform::env::get("REX_APP_FOLDER")) {
+    return std::filesystem::path(*dir);
+  }
+#endif
   return GetExecutablePath().parent_path();
 }
 

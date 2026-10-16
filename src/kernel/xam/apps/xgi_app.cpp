@@ -10,6 +10,11 @@
  */
 
 #include <rex/kernel/xam/apps/xgi_app.h>
+
+#include <chrono>
+#include <cstring>
+
+#include <rex/kernel/xam/online_hooks.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -28,6 +33,10 @@ XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
 X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
+  // [svr2011] sessions the title handles itself (peer-to-peer play)
+  if (const auto& hooks = online_hooks(); hooks.xgi) {
+    if (auto result = hooks.xgi(message, buffer_ptr, buffer_length)) return *result;
+  }
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
   switch (message) {
     case 0x000B0006: {
@@ -113,6 +122,19 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           "{:08X})",
           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
           nonce_ptr);
+      // [svr2011] a session id (XNKID, 8 bytes; the rest of XSESSION_INFO, the
+      // host address and key, left zero) and a nonce
+      static uint64_t next_session = 0x0000000000000001;
+      const uint64_t id = (uint64_t(0x02) << 56) | (uint64_t(std::chrono::system_clock::now().time_since_epoch().count()) & 0x00FFFFFFFFFFFF00ull) |
+                          (next_session++ & 0xFF);
+      if (session_info_ptr) {
+        auto info = memory_->TranslateVirtual<uint8_t*>(session_info_ptr);
+        std::memset(info, 0, 60);
+        memory::store_and_swap<uint64_t>(info, id);
+      }
+      if (nonce_ptr) {
+        memory::store_and_swap<uint64_t>(memory_->TranslateVirtual<uint8_t*>(nonce_ptr), id ^ 0x5A5A5A5A5A5A5A5Aull);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
@@ -439,6 +461,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           non_weighted_search_properties_ptr, non_weighted_search_contexts_ptr, results_buffer_size,
           search_results_ptr, num_users, weighted_search);
 
+      return X_E_SUCCESS;
+    }
+    case 0x000B0013: {
+      // [svr2011] XSessionLeaveLocal / Remote (same arguments as join)
+      REXKRNL_DEBUG("XGISessionLeave({:08X}, {:08X})", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
     case 0x000B0071: {

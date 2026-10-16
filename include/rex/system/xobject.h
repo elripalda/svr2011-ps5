@@ -15,6 +15,7 @@
 #include <concepts>
 #include <cstddef>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -197,6 +198,10 @@ class XObject {
                                uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout);
 
+  // [svr2011] The object whose guest struct CreateNative allocated at
+  // guest_ptr (enumerators and others without a dispatch header), or null.
+  static object_ref<XObject> GetCreatedNativeObject(uint32_t guest_ptr);
+
   static object_ref<XObject> GetNativeObject(KernelState* kernel_state, void* native_ptr,
                                              int32_t as_type = -1);
   template <typename T>
@@ -213,6 +218,7 @@ class XObject {
 
   // Creates the kernel object for guest code to use. Typically not needed.
   uint8_t* CreateNative(uint32_t size);
+  static std::unordered_map<uint32_t, XObject*>& CreatedNativeObjects();
   void SetNativePointer(uint32_t native_ptr, bool uninitialized = false);
 
   template <typename T>

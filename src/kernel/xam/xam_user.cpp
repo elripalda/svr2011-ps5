@@ -12,7 +12,9 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
@@ -29,6 +31,44 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+REXCVAR_DECLARE(bool, online_enabled);  // (xam_net.cpp)
+REXCVAR_DEFINE_STRING(online_name, "", "Online",
+                      "The profile's name (gamertag, up to 15 characters); empty: User");
+REXCVAR_DEFINE_STRING(online_xuid, "", "Online",
+                      "The profile's online id (16 hex digits, 0009...); empty: one made for this PC");
+
+namespace {
+// [svr2011] The profile's name: online_name when set.
+std::string ProfileName() {
+  std::string name = REXCVAR_GET(online_name);
+  if (name.empty()) return REX_KERNEL_STATE()->user_profile()->name();
+  return name.substr(0, 15);
+}
+
+// [svr2011] Online: the profile's online XUID (what online services know the
+// player by; online XUIDs start 0009). The offline one (saves) is unchanged.
+uint64_t OnlineXuid() {
+  const std::string text = REXCVAR_GET(online_xuid);
+  if (!text.empty()) {
+    return std::strtoull(text.c_str(), nullptr, 16);
+  }
+  // one per PC and user: a hash of their names
+  uint64_t h = 0xCBF29CE484222325ull;
+  for (const char* name : {"COMPUTERNAME", "USERNAME", "HOSTNAME", "USER"}) {
+    if (const char* v = std::getenv(name)) {
+      for (const char* c = v; *c; ++c) h = (h ^ uint8_t(*c)) * 0x100000001B3ull;
+    }
+  }
+  return 0x0009000000000000ull | (h & 0x0000FFFFFFFFFFFFull);
+}
+
+// [svr2011] Online: the profile is signed in to Xbox LIVE (2), not only
+// locally (1).
+uint32_t SigninState(uint32_t local_state) {
+  return local_state && REXCVAR_GET(online_enabled) ? 2 : local_state;
+}
+}  // namespace
+
 
 namespace rex {
 namespace kernel {
@@ -51,10 +91,14 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
       if (type & (2 | 4)) {
         // maybe online profile?
         xuid = user_profile->xuid();
+        // [svr2011] online: the player's own XUID (the offline one is the
+        // same for everyone - online services tell players apart by it)
+        if (REXCVAR_GET(online_enabled)) xuid = OnlineXuid();
         result = X_E_SUCCESS;
       } else if (type & 1) {
         // maybe offline profile?
         xuid = user_profile->xuid();
+        if (REXCVAR_GET(online_enabled)) xuid = OnlineXuid();
         result = X_E_SUCCESS;
       }
     }
@@ -70,7 +114,7 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
   if (user_index < 4) {
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
+      signin_state = SigninState(user_profile->signin_state());
     }
   }
   return signin_state;
@@ -97,9 +141,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  info->xuid = user_profile->xuid();
-  info->signin_state = user_profile->signin_state();
-  rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+  info->xuid = REXCVAR_GET(online_enabled) ? OnlineXuid() : user_profile->xuid();
+  info->signin_state = SigninState(user_profile->signin_state());
+  rex::string::copy_truncating(info->name, ProfileName(), rex::countof(info->name));
   return X_E_SUCCESS;
 }
 
@@ -113,7 +157,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  const auto& user_name = user_profile->name();
+  const auto user_name = ProfileName();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
@@ -132,7 +176,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  auto user_name = rex::string::to_utf16(user_profile->name());
+  auto user_name = rex::string::to_utf16(ProfileName());
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
@@ -383,7 +427,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
   }
 
   // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // [svr2011] Online: everything allowed (multiplayer, user-created content ...).
+  const uint32_t allowed = REXCVAR_GET(online_enabled) ? 1 : 0;
+  *out_value = allowed;
+  REXKRNL_DEBUG("[svr2011] online: privilege {} -> {}", uint32_t(mask), allowed);
   return X_ERROR_SUCCESS;
 }
 
@@ -712,16 +759,43 @@ u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u3
   return X_ERROR_SUCCESS;
 }
 
+// [svr2011] A session (XSessionCreate): a kernel object of its own, so the
+// game's sessions (a lobby and a match at once) can be told apart by their
+// object pointers in the XGI session messages (online_hooks.h). (After
+// PR #3, "Add groundwork for P2P online sessions", by gitSothib.)
+namespace {
+class XSessionObject final : public XObject {
+ public:
+  static constexpr Type kObjectType = Type::Session;
+  explicit XSessionObject(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
+  bool Initialize() {
+    auto* native = CreateNative<rex::be<uint32_t>>();
+    if (!native) return false;
+    *native = handle();
+    return true;
+  }
+};
+}  // namespace
+
 u32 XamSessionCreateHandle_entry(mapped_u32 handle_ptr) {
-  *handle_ptr = 0xCAFEDEAD;
+  if (!handle_ptr) return X_ERROR_INVALID_PARAMETER;
+  auto session = make_object<XSessionObject>(REX_KERNEL_STATE());
+  if (!session->Initialize()) {
+    session->ReleaseHandle();
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  *handle_ptr = session->handle();
   return X_ERROR_SUCCESS;
 }
 
 u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
-  assert_true(handle == 0xCAFEDEAD);
-  // TODO(PermaNull): Implement this properly,
-  // For the time being returning 0xDEADF00D will prevent crashing.
-  *obj_ptr = 0xDEADF00D;
+  if (!obj_ptr) return X_ERROR_INVALID_PARAMETER;
+  auto session = REX_KERNEL_OBJECTS()->LookupObject<XSessionObject>(handle);
+  if (!session) return X_ERROR_INVALID_HANDLE;
+  // (ObDereferenceObject releases this reference, as for enumerators: the
+  // object outlives the game's CloseHandle of the handle)
+  session->RetainHandle();
+  *obj_ptr = session->guest_object();
   return X_ERROR_SUCCESS;
 }
 

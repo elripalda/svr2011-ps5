@@ -18,6 +18,8 @@ add_library(rexcore OBJECT
     ring_buffer.cpp
     string_buffer.cpp
     threading.cpp
+    timeline.cpp
+    external_frame.cpp
     timer_queue.cpp
     utf8.cpp
     vec128.cpp
@@ -74,6 +76,9 @@ elseif(UNIX)
         system_posix.cpp
         threading_posix.cpp
     )
+    if(ANDROID)  # [svr2011]
+        target_sources(rexcore PRIVATE main_android.cpp)
+    endif()
 endif()
 
 # Xenos data-format layer (stateless; headers under include/rex/graphics/).
@@ -100,6 +105,8 @@ target_include_directories(rexcore PRIVATE
 
 if(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
+elseif(ANDROID)  # [svr2011] pthread and rt are part of bionic's libc
+    target_link_libraries(rexcore PRIVATE dl log android)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()
@@ -121,6 +128,9 @@ if(REXGLUE_USE_D3D12)
 endif()
 if(REXGLUE_USE_VULKAN)
     target_compile_definitions(rexcore PUBLIC REX_HAS_VULKAN=1)
+endif()
+if(REXGLUE_USE_D3D11)
+    target_compile_definitions(rexcore PUBLIC REX_HAS_D3D11=1)
 endif()
 
 if(REXGLUE_ENABLE_TRACY)

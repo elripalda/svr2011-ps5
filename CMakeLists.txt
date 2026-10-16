@@ -36,9 +36,13 @@ endif()
 # Vulkan: Cross-platform, ON by default on Linux, OFF by default on Windows.
 if(WIN32)
     option(REXGLUE_USE_D3D12  "Enable D3D12 graphics backend" ON)
+    # [svr2011] Direct3D 11: GPUs / drivers without D3D12 or Vulkan (the app
+    # draws its frames itself; the guest GPU runs without emulated drawing).
+    option(REXGLUE_USE_D3D11  "Enable the D3D11 graphics backend (no emulated drawing)" ON)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" OFF)
 else()
     set(REXGLUE_USE_D3D12 OFF)
+    set(REXGLUE_USE_D3D11 OFF)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
 endif()
 
@@ -188,7 +192,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_pch.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
 rex_resolve_version(REXGLUE_FULL_VERSION
     FLOOR_MAJOR ${PROJECT_VERSION_MAJOR}
-    FLOOR_MINOR ${PROJECT_VERSION_MINOR})
+    FLOOR_MINOR ${PROJECT_VERSION_MINOR}
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")  # [svr2011] (the SDK's tags, not the title's)
 
 # Strip the -id trailer (if any) for the numeric-only version.
 string(REGEX REPLACE "-.*$" "" REXGLUE_NUMERIC_VERSION "${REXGLUE_FULL_VERSION}")
@@ -259,8 +264,17 @@ add_subdirectory(src/audio)
 add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
-add_subdirectory(src/codegen)
-add_subdirectory(src/rexglue)
+# [svr2011] Cross builds (Android): the recompiler runs on the build host, so
+# rex::rexglue is a host build's tool (REXGLUE_HOST_TOOL) instead of one built
+# for the target.
+set(REXGLUE_HOST_TOOL "" CACHE FILEPATH "Host rexglue executable for cross builds")
+if(CMAKE_CROSSCOMPILING AND REXGLUE_HOST_TOOL)
+    add_executable(rex::rexglue IMPORTED GLOBAL)
+    set_target_properties(rex::rexglue PROPERTIES IMPORTED_LOCATION "${REXGLUE_HOST_TOOL}")
+else()
+    add_subdirectory(src/codegen)
+    add_subdirectory(src/rexglue)
+endif()
 
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)

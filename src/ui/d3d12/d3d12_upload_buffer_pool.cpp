@@ -72,13 +72,25 @@ uint8_t* D3D12UploadBufferPool::RequestPartial(uint64_t submission_index, size_t
 
 GraphicsUploadBufferPool::Page* D3D12UploadBufferPool::CreatePageImplementation() {
   D3D12_RESOURCE_DESC buffer_desc;
-  util::FillBufferResourceDesc(buffer_desc, page_size_, D3D12_RESOURCE_FLAG_NONE);
+  // [svr2011] A 64 KB tail past the page: constant buffers bound as root
+  // descriptors have no bounds checking, and shaders indexing constants
+  // (relative addressing) can read past the uploaded ones - off the end of the
+  // newest page a GPU page fault (device removed). 64 KB is the most a
+  // constant buffer view covers.
+  util::FillBufferResourceDesc(buffer_desc, page_size_ + D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16,
+                               D3D12_RESOURCE_FLAG_NONE);
   Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
   if (FAILED(provider_.GetDevice()->CreateCommittedResource(
           &util::kHeapPropertiesUpload, provider_.GetHeapFlagCreateNotZeroed(), &buffer_desc,
           D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer)))) {
     REXLOG_ERROR("Failed to create a D3D upload buffer with {} bytes", page_size_);
     return nullptr;
+  }
+  {  // [svr2011] addresses, to match GPU page faults
+    static uint32_t logged = 0;
+    if (logged++ < 256)
+      REXLOG_INFO("[svr2011] upload pool {} page GPU VA {:016X} size {:X}",
+                  static_cast<const void*>(this), buffer->GetGPUVirtualAddress(), page_size_);
   }
   D3D12_RANGE read_range;
   read_range.Begin = 0;

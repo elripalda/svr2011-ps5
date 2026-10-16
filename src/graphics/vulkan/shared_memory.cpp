@@ -61,7 +61,17 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) &&
+  // [svr2011] Not with Turnip on an Adreno 6xx (chip id 0x06...): its sparse
+  // binding is new there, and an Adreno 610 stopped at the first draws with it
+  // (moto g play 2024, Mesa 26.0). One plain allocation instead, as on the
+  // phones' own Qualcomm drivers (they have no sparse binding at all).
+  const ui::vulkan::VulkanDevice::Properties& sparse_props = vulkan_device->properties();
+  const bool turnip_a6xx = sparse_props.driverID == VK_DRIVER_ID_MESA_TURNIP &&
+                           (sparse_props.deviceID >> 24) == 0x06;
+  if (turnip_a6xx && REXCVAR_GET(vulkan_sparse_shared_memory) && sparse_props.sparseResidencyBuffer) {
+    REXGPU_INFO("Shared memory: no sparse binding on Turnip with an Adreno 6xx");
+  }
+  if (REXCVAR_GET(vulkan_sparse_shared_memory) && !turnip_a6xx &&
       vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;

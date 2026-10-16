@@ -24,7 +24,9 @@
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if REX_PLATFORM_ANDROID
+// [svr2011] Android runs one app through SDL's activity (SDL_main), like the
+// desktop builds, instead of Xenia's several apps in one library.
+#if REX_PLATFORM_ANDROID && defined(XE_UI_ANDROID_APPS_IN_LIBRARY)
 // Multiple apps in a single library instead of separate executables.
 #define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
 #endif

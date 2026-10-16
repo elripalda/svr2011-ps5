@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -26,10 +27,17 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
+REXCVAR_DEFINE_INT32(vulkan_debug_message_repeats, 5, "UI/Vulkan",
+                     "How many times the same Vulkan debug message is logged (0 = no limit); "
+                     "some drivers (Adreno) repeat a hint every frame");
 
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+static LoaderOpener g_loader_opener = nullptr;  // [svr2011]
+
+void SetLoaderOpener(LoaderOpener opener) { g_loader_opener = opener; }
 
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                                                        const bool try_enable_validation) {
@@ -75,7 +83,14 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     return nullptr;
   }
 #else
-  loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+  if (g_loader_opener) {
+    if (void* handle = g_loader_opener()) {
+      vulkan_instance->loader_.Adopt(handle);
+      loader_loaded = true;
+      REXLOG_INFO("Vulkan loader opened by the app (custom GPU driver)");
+    }
+  }
+  if (!loader_loaded) loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
   if (!loader_loaded) {
     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
     return nullptr;
@@ -615,6 +630,28 @@ VkBool32 VulkanInstance::DebugUtilsMessengerCallback(
   }
 
   auto msg = log_str.str();
+
+  // Some drivers repeat the same message every frame (the Adreno 6xx/7xx
+  // driver's VKDBGUTILWARN003 hint, ~180 lines a second) - log each distinct
+  // message a few times, then once more saying it's being dropped.
+  const int32_t max_repeats = REXCVAR_GET(vulkan_debug_message_repeats);
+  if (max_repeats > 0) {
+    static std::mutex repeats_mutex;
+    static std::unordered_map<std::string, uint32_t> repeats;
+    std::lock_guard<std::mutex> lock(repeats_mutex);
+    auto it = repeats.find(msg);
+    if (it == repeats.end()) {
+      if (repeats.size() < 4096) {
+        repeats.emplace(msg, 1);
+      }
+    } else if (++it->second > uint32_t(max_repeats)) {
+      if (it->second != uint32_t(max_repeats) + 1) {
+        return VK_FALSE;
+      }
+      msg += " (repeated - further copies of this message are not logged)";
+    }
+  }
+
   if (message_severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
     REXGPU_ERROR("{}", msg);
   } else if (message_severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {

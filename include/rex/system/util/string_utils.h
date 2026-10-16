@@ -33,9 +33,43 @@ inline std::string_view TranslateAnsiString(const memory::Memory* memory,
                           ansi_string->length);
 }
 
+// [svr2011] Guest strings are 8-bit ANSI; the runtime's string code expects
+// UTF-8 and throws on anything else. Valid UTF-8 (all ASCII included) is kept;
+// otherwise each byte is taken as Latin-1 (e.g. a content root "p0ú0",
+// 4D5307E6-style) so the same guest bytes always give the same host string.
+inline std::string AnsiToUtf8(std::string_view s) {
+  size_t i = 0;
+  bool valid = true;
+  while (i < s.size() && valid) {
+    const uint8_t c = uint8_t(s[i]);
+    size_t n = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+    if (!n || i + n > s.size()) {
+      valid = false;
+      break;
+    }
+    for (size_t k = 1; k < n; ++k) {
+      if ((uint8_t(s[i + k]) >> 6) != 0x2) valid = false;
+    }
+    i += n;
+  }
+  if (valid) return std::string(s);
+  std::string out;
+  out.reserve(s.size() * 2);
+  for (char ch : s) {
+    const uint8_t c = uint8_t(ch);
+    if (c < 0x80) {
+      out += ch;
+    } else {
+      out += char(0xC0 | (c >> 6));
+      out += char(0x80 | (c & 0x3F));
+    }
+  }
+  return out;
+}
+
 inline std::string TranslateAnsiPath(const memory::Memory* memory,
                                      const X_ANSI_STRING* ansi_string) {
-  return rex::string::trim_string(std::string(TranslateAnsiString(memory, ansi_string)));
+  return rex::string::trim_string(AnsiToUtf8(TranslateAnsiString(memory, ansi_string)));
 }
 
 inline std::string_view TranslateAnsiStringAddress(const memory::Memory* memory,

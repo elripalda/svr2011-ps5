@@ -14,6 +14,21 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
+#include <rex/cvar.h>
+#include <rex/string/utf8.h>
+
+#include <cstring>
+#include <mutex>
+
+
+// [svr2011] The delays below are workarounds for titles that poll XMP from a
+// busy thread (A-Train). Titles that poll it once or twice a frame from their
+// simulation thread (WWE SmackDown vs. Raw 2011) lose 10-20 ms a frame to
+// them, so they can be switched off.
+REXCVAR_DEFINE_BOOL(xmp_throttle, true, "Kernel",
+                    "Sleep in XMPGetStatus/XMPGetPlaybackController when called off the main "
+                    "thread (workaround for titles that poll XMP in a tight loop)");
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -21,6 +36,40 @@ using namespace rex::system;
 using namespace rex::system::xam;
 namespace apps {
 using namespace rex::system;
+
+namespace {
+XmpApp::HostMusic g_host_music;
+std::mutex g_host_music_mutex;
+
+XmpApp::HostMusic HostMusicCopy() {
+  std::lock_guard lock(g_host_music_mutex);
+  return g_host_music;
+}
+}  // namespace
+
+void XmpApp::SetHostMusic(HostMusic music) {
+  std::lock_guard lock(g_host_music_mutex);
+  g_host_music = std::move(music);
+}
+
+std::vector<std::vector<uint8_t>> XmpApp::UserPlaylistItems() {
+  std::vector<std::vector<uint8_t>> items;
+  const HostMusic music = HostMusicCopy();
+  if (!music.list_playlists) return items;
+  uint32_t id = 1;
+  for (const std::u16string& name : music.list_playlists()) {
+    std::vector<uint8_t> item(kUserPlaylistSize, 0);
+    memory::store_and_swap<uint32_t>(item.data(), id++);
+    const size_t max_chars = (kUserPlaylistSize - kUserPlaylistNameOffset) / 2 - 1;
+    const std::u16string n = name.substr(0, max_chars);
+    for (size_t i = 0; i < n.size(); ++i) {
+      memory::store_and_swap<uint16_t>(item.data() + kUserPlaylistNameOffset + i * 2,
+                                       uint16_t(n[i]));
+    }
+    items.push_back(std::move(item));
+  }
+  return items;
+}
 
 XmpApp::XmpApp(KernelState* kernel_state)
     : App(kernel_state, 0xFA),
@@ -36,7 +85,7 @@ XmpApp::XmpApp(KernelState* kernel_state)
       next_song_handle_(1) {}
 
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
-  if (!XThread::GetCurrentThread()->main_thread()) {
+  if (REXCVAR_GET(xmp_throttle) && !XThread::GetCurrentThread()->main_thread()) {
     // Some stupid games will hammer this on a thread - induce a delay
     // here to keep from starving real threads.
     rex::thread::Sleep(std::chrono::milliseconds(1));
@@ -146,6 +195,9 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
 
 X_HRESULT XmpApp::XMPContinue() {
   REXKRNL_DEBUG("XMPContinue()");
+  if (user_playlist_playing_ && state_ == State::kPaused) {
+    if (const HostMusic music = HostMusicCopy(); music.resume) music.resume();
+  }
   if (state_ == State::kPaused) {
     state_ = State::kPlaying;
   }
@@ -156,6 +208,10 @@ X_HRESULT XmpApp::XMPContinue() {
 X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   assert_zero(unk);
   REXKRNL_DEBUG("XMPStop({:08X})", unk);
+  if (user_playlist_playing_) {
+    if (const HostMusic music = HostMusicCopy(); music.stop) music.stop();
+    SetUserPlaylistPlaying(false);
+  }
   active_playlist_ = nullptr;  // ?
   active_song_index_ = 0;
   state_ = State::kIdle;
@@ -165,6 +221,9 @@ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
 
 X_HRESULT XmpApp::XMPPause() {
   REXKRNL_DEBUG("XMPPause()");
+  if (user_playlist_playing_ && state_ == State::kPlaying) {
+    if (const HostMusic music = HostMusicCopy(); music.pause) music.pause();
+  }
   if (state_ == State::kPlaying) {
     state_ = State::kPaused;
   }
@@ -196,6 +255,18 @@ X_HRESULT XmpApp::XMPPrevious() {
   }
   OnStateChanged();
   return X_E_SUCCESS;
+}
+
+// [svr2011] Playing a user playlist hands playback to the system and stopping
+// hands it back, each announced with XN_XMP_PLAYBACKCONTROLLERCHANGED: the
+// title mutes its audio while the system plays and waits for that
+// notification to unmute (SvR 2011 stayed silent after a USER PLAYLIST song).
+void XmpApp::SetUserPlaylistPlaying(bool playing) {
+  if (user_playlist_playing_ == playing) return;
+  user_playlist_playing_ = playing;
+  // The parameter is 1 when the title has playback again (SvR 2011's audio
+  // library unmutes on 1 and mutes its music voice on 0).
+  kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, playing ? 0 : 1);
 }
 
 void XmpApp::OnStateChanged() {
@@ -298,6 +369,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPSetVolume({:g})", float(args->value));
       volume_ = args->value;
+      if (const HostMusic music = HostMusicCopy(); music.set_volume) {
+        music.set_volume(volume_);
+      }
       return X_E_SUCCESS;
     }
     case 0x0007000D: {
@@ -343,8 +417,16 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       auto info = memory_->TranslateVirtual(args->info_ptr);
       assert_true(args->xmp_client == 0x00000002);
       assert_zero(args->unk_ptr);
-      REXKRNL_ERROR("XMPGetInfo?({:08X}, {:08X})", uint32_t(args->unk_ptr),
+      REXKRNL_DEBUG("XMPGetInfo?({:08X}, {:08X})", uint32_t(args->unk_ptr),
                     uint32_t(args->info_ptr));
+      if (user_playlist_playing_) {
+        // [svr2011] The user playlist's song: named after the playlist.
+        std::memset(info, 0, 4 + 572 + 212);
+        memory::store_and_swap<uint32_t>(info + 0, 1);
+        memory::store_and_swap<std::u16string>(info + 4 + 572 + 0, user_song_name_.substr(0, 19));
+        memory::store_and_swap<uint32_t>(info + 4 + 572 + 208, 1);  // mp3
+        return X_E_SUCCESS;
+      }
       if (!active_playlist_) {
         return X_E_FAIL;
       }
@@ -405,10 +487,13 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})", uint32_t(args->xmp_client),
                     uint32_t(args->controller_ptr), uint32_t(args->locked_ptr));
-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
+      // [svr2011] The system (the music player) has playback while it plays a
+      // user playlist, as on the console (see SetUserPlaylistPlaying).
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr),
+                                       user_playlist_playing_ ? 1 : 0);
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
 
-      if (!XThread::GetCurrentThread()->main_thread()) {
+      if (REXCVAR_GET(xmp_throttle) && !XThread::GetCurrentThread()->main_thread()) {
         // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
         rex::thread::Sleep(std::chrono::milliseconds(10));
       }
@@ -460,6 +545,36 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                        4 + uint32_t(args->song_count) * 128);
       return X_E_SUCCESS;
     }
+    case 0x0007003B: {
+      // [svr2011] XMPPlayUserPlaylist: the client, then a playlist item as
+      // enumerated (UserPlaylistItems).
+      if (buffer_length && buffer_length < 4 + kUserPlaylistSize) {
+        return X_E_INVALIDARG;
+      }
+      std::u16string name;
+      for (uint32_t i = 0; i < (kUserPlaylistSize - kUserPlaylistNameOffset) / 2; ++i) {
+        const char16_t c = char16_t(
+            memory::load_and_swap<uint16_t>(buffer + 4 + kUserPlaylistNameOffset + i * 2));
+        if (!c) break;
+        name.push_back(c);
+      }
+      const HostMusic music = HostMusicCopy();
+      if (!music.play || !music.play(name)) {
+        REXKRNL_WARN("XMPPlayUserPlaylist: no playlist '{}'", rex::string::to_utf8(name));
+        return X_E_NOTFOUND;
+      }
+      REXKRNL_INFO("XMPPlayUserPlaylist('{}')", rex::string::to_utf8(name));
+      SetUserPlaylistPlaying(true);
+      user_song_name_ = name;
+      active_playlist_ = nullptr;
+      state_ = State::kPlaying;
+      OnStateChanged();
+      return X_E_SUCCESS;
+    }
+    case 0x00070025:
+      // [svr2011] Starts a user playlist enumeration the title created with
+      // XamCreateEnumeratorHandle (xam_enum.cpp fills it).
+      return X_E_SUCCESS;
     case 0x0007003D: {
       // XMPCaptureOutput - not sure how this works :/
       REXKRNL_DEBUG("XMPCaptureOutput(...)");

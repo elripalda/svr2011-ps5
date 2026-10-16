@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/timeline.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -380,7 +381,9 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
     thread->DeliverAPCs();
   }
 
+  REX_TIMELINE(kDelayBegin, static_cast<uint32_t>(static_cast<uint64_t>(*interval_ptr)));
   X_STATUS result = thread->Delay(processor_mode, alertable, *interval_ptr);
+  REX_TIMELINE(kDelayEnd);
 
   if (alertable && result == X_STATUS_USER_APC) {
     thread->DeliverAPCs();
@@ -473,6 +476,7 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
 }
 
 u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+  REX_TIMELINE(kSignal, event_ptr.guest_address(), 1);
   return xeKeSetEvent(event_ptr, increment, wait);
 }
 
@@ -544,6 +548,7 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
 }
 
 u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+  REX_TIMELINE(kSignal, handle, 2);
   return xeNtSetEvent(handle, previous_state_ptr);
 }
 
@@ -613,6 +618,7 @@ uint32_t xeKeReleaseSemaphore(X_KSEMAPHORE* semaphore_ptr, uint32_t increment, u
 
 u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 increment, u32 adjustment,
                              u32 wait) {
+  REX_TIMELINE(kSignal, semaphore_ptr.guest_address(), 3);
   return xeKeReleaseSemaphore(semaphore_ptr, increment, adjustment, wait);
 }
 
@@ -655,6 +661,7 @@ u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_pt
 }
 
 u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previous_count_ptr) {
+  REX_TIMELINE(kSignal, sem_handle, 4);
   X_STATUS result = X_STATUS_SUCCESS;
   int32_t previous_count = 0;
 
@@ -844,8 +851,10 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
   // object_ptr.guest_address(), (uint32_t)wait_reason,
   //(uint32_t)processor_mode, (uint32_t)alertable,
   // timeout_ptr ? (int64_t)timeout : -1);
+  REX_TIMELINE(kWaitBegin, object_ptr.guest_address(), 1);
   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
                                         timeout_ptr ? &timeout : nullptr);
+  REX_TIMELINE(kWaitEnd, object_ptr.guest_address(), result);
   // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
   return result;
 }
@@ -857,7 +866,9 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    REX_TIMELINE(kWaitBegin, object_handle, 2);
     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+    REX_TIMELINE(kWaitEnd, object_handle, result);
     if (alertable && result == X_STATUS_USER_APC) {
       XThread::GetCurrentThread()->DeliverAPCs();
     }
@@ -885,9 +896,11 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
   }
 
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  REX_TIMELINE(kWaitBegin, objects_ptr[0], 3);
   X_STATUS result = XObject::WaitMultiple(
       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
       processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  REX_TIMELINE(kWaitEnd, objects_ptr[0], result);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }
@@ -909,8 +922,10 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
     objects.push_back(std::move(object));
   }
 
+  REX_TIMELINE(kWaitBegin, handles[0], 4);
   auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()), wait_type,
                                       6, wait_mode, alertable, timeout_ptr);
+  REX_TIMELINE(kWaitEnd, handles[0], result);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }

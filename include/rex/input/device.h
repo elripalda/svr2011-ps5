@@ -15,7 +15,7 @@
 
 namespace rex::input {
 
-constexpr uint32_t kMaxGuestUsers = 4;
+constexpr uint32_t kMaxGuestUsers = 8;  // [svr2011] 8 pads (the game has 8 pad objects; 6 local players)
 
 /// Driver-scoped device handle. Never reused within a process run, so a handle
 /// that outlives its device resolves to nothing rather than aliasing whichever

@@ -25,6 +25,7 @@
 #include <glslang/Public/ShaderLang.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/external_frame.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -930,10 +931,17 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
   if (!device_properties.vertexPipelineStoresAndAtomics) {
-    REXGPU_ERROR(
-        "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
-        "D3D12 parity, but unsupported by the selected device");
-    return false;
+    // [svr2011] (Mali: memory export from vertex shaders goes through compute)
+    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)) {
+      REXGPU_ERROR(
+          "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation "
+          "(vulkan_require_vertex_pipeline_stores_and_atomics=true), but unsupported by the "
+          "selected device");
+      return false;
+    }
+    REXGPU_WARN(
+        "Vulkan vertexPipelineStoresAndAtomics is not supported by the device; memory "
+        "export from vertex shaders uses compute shaders");
   }
   if (!device_properties.geometryShader) {
     if (REXCVAR_GET(vulkan_require_geometry_shader)) {
@@ -2160,6 +2168,19 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
+// [svr2011] (see CommandProcessor::ExecutePacketType0) As WriteRegister does
+// for each float constant: the vertex / pixel constant buffers are out of date.
+void VulkanCommandProcessor::FloatConstantsWritten(uint32_t first_index, uint32_t count) {
+  if (frame_open_) {
+    const uint32_t first = (first_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+    const uint32_t last = (first_index + count - 1 - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+    if (first < 256)
+      current_constant_buffers_up_to_date_ &= ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex);
+    if (last >= 256)
+      current_constant_buffers_up_to_date_ &= ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+  }
+}
+
 void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                                    uint32_t num_registers) {
   if (!num_registers) {
@@ -2272,6 +2293,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  // [svr2011] (the GPU thread got this far: a frame's commands all went through)
+  rex::external_frame::CountSwap();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2312,9 +2335,31 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
-  VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
-      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
-      &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+  VkImageView swap_texture_view = VK_NULL_HANDLE;
+  // [svr2011] A frame from the app's own renderer (rex/external_frame.h), drawn
+  // on this device by work submitted earlier on the same queue: shown like the
+  // front buffer, after a barrier making its writes visible.
+  rex::external_frame::Frame external_frame;
+  if (rex::external_frame::GetFrame(external_frame) && external_frame.vk_image_view) {
+    swap_texture_view = VkImageView(external_frame.vk_image_view);
+    frontbuffer_format = xenos::TextureFormat::k_8_8_8_8;
+    frontbuffer_width_scaled = frontbuffer_width_unscaled = external_frame.width;
+    frontbuffer_height_scaled = frontbuffer_height_unscaled = external_frame.height;
+    frontbuffer_width = external_frame.width;
+    frontbuffer_height = external_frame.height;
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    PushImageMemoryBarrier(
+        VkImage(external_frame.vk_image), range,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  } else {
+    swap_texture_view = texture_cache_->RequestSwapTexture(
+        frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+        &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+  }
   if (swap_texture_view == VK_NULL_HANDLE) {
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
@@ -2407,8 +2452,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+  // [svr2011] The app's own frames have the shape to show (16:9, or as wide
+  // as the window in the port's wide-screen matches): letterboxed to it.
+  if (external_frame.vk_image_view && external_frame.width && external_frame.height) {
+    display_width = external_frame.width;
+    display_height = external_frame.height;
+  }
 
-  presenter->RefreshGuestOutput(
+  // [svr2011] Where the shown frames came from, now and then (a phone showed
+  // only black while the native renderer drew: this tells which side stops).
+  static uint64_t swaps = 0, swaps_external = 0, swaps_failed = 0;
+  const bool external_swap = swap_texture_view == VkImageView(external_frame.vk_image_view) &&
+                             external_frame.vk_image_view;
+  const bool refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
        swap_post_effect,
@@ -2923,6 +2979,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         EndSubmission(true);
         return true;
       });
+  ++swaps;
+  if (external_swap) ++swaps_external;
+  if (!refreshed) ++swaps_failed;
+  if (swaps == 1 || swaps % 1800 == 0) {
+    REXLOG_INFO("[svr2011] swaps: {} ({} from the native renderer, {} not refreshed); output {}x{}", swaps,
+                swaps_external, swaps_failed, guest_output_width, guest_output_height);
+  }
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
@@ -3695,6 +3758,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  // [svr2011] The app's renderer draws the frames (rex/external_frame.h):
+  // only draws writing guest memory still run here.
+  if (!memexport_writes_possible && rex::external_frame::HostDrawingDisabled()) {
+    return true;
+  }
+  if (rex::external_frame::HostDrawingDisabled()) {  // [svr2011] (how often: the app skips the guest's draws)
+    static uint32_t memexport_draws = 0;
+    if (++memexport_draws <= 8 || (memexport_draws & 1023) == 0) {
+      REXGPU_INFO("[svr2011] memexport draw #{} (vs {:016X} ps {:016X})", memexport_draws,
+                  vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    }
+  }
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -4385,6 +4460,9 @@ bool VulkanCommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  if (rex::external_frame::HostDrawingDisabled()) {
+    return true;  // [svr2011] nothing drawn here to resolve (see IssueDraw)
+  }
 
   if (!BeginSubmission(true)) {
     return false;

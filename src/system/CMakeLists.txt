@@ -123,3 +123,7 @@ if(REXGLUE_USE_VULKAN)
     )
     target_compile_definitions(rexruntime PUBLIC REX_HAS_VULKAN=1)
 endif()
+if(REXGLUE_USE_D3D11)  # [svr2011]
+    target_link_libraries(rexruntime PUBLIC d3d11)
+    target_compile_definitions(rexruntime PUBLIC REX_HAS_D3D11=1)
+endif()

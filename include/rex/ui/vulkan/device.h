@@ -168,6 +168,10 @@ class VulkanDevice {
     // VK_EXT_robustness2
 
     bool nullDescriptor = false;
+
+    // [svr2011] What an app renderer drawing on this device needs (rex/external_frame.h):
+    // descriptor indexing with update after bind, buffer device address, shaderInt64.
+    bool appRendererFeatures = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.

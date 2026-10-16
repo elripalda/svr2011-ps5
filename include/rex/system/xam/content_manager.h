@@ -11,10 +11,13 @@
 
 #pragma once
 
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <rex/filesystem.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/string/key.h>
@@ -130,7 +133,12 @@ class ContentPackage {
 
   uint32_t GetPackageLicense() const { return license_; }
 
+  // [svr2011] Run after the package is unmounted (flat saves: see
+  // ContentManager::SetFlatSavesRoot).
+  void set_on_close(std::function<void()> on_close) { on_close_ = std::move(on_close); }
+
  private:
+  std::function<void()> on_close_;
   KernelState* kernel_state_;
   std::string root_name_;
   std::string device_path_;
@@ -182,7 +190,33 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
+  // [svr2011] Saved games as plain files: each package is one file,
+  // <root>/<file name> (the package's single file), instead of a folder
+  // holding it. While the game has one open it is mounted from
+  // <root>/.mount/<file name>/, where that file is a hard link to the save
+  // (so writes go straight to it); on close anything the game replaced is
+  // moved back. Headers live in <root>/.info. A package with more than one
+  // file stays a folder, <root>/<file name>/. Also finishes the moves of a
+  // session that ended without closing its packages.
+  void SetFlatSavesRoot(const std::filesystem::path& root);
+  const std::filesystem::path& flat_saves_root() const { return flat_root_; }
+
  private:
+  bool IsFlat(XContentType type) const {
+    return !flat_root_.empty() && type == XContentType::kSavedGame;
+  }
+  std::filesystem::path FlatPath(const std::string& name) const { return flat_root_ / rex::to_path(name); }
+  std::filesystem::path FlatMountPath(const std::string& name) const {
+    return flat_root_ / ".mount" / rex::to_path(name);
+  }
+  std::filesystem::path FlatInfoPath(const std::string& name, const char* ext) const {
+    return flat_root_ / ".info" / rex::to_path(name + ext);
+  }
+  void PrepareFlatMount(const std::string& name);
+  void CommitFlatMount(const std::string& name);
+  void DeleteFlat(const std::string& name);
+  std::filesystem::path flat_root_;
+
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
   std::filesystem::path ResolvePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);

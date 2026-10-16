@@ -161,6 +161,12 @@ u32 ObDereferenceObject_entry(u32 native_ptr) {
     return 0;
   }
 
+  // [svr2011] Structs made by CreateNative first (they may lack a dispatch
+  // header - see XObject::GetCreatedNativeObject).
+  if (auto created = XObject::GetCreatedNativeObject(native_ptr)) {
+    created->ReleaseHandle();
+    return 0;
+  }
   auto object = XObject::GetNativeObject<XObject>(
       REX_KERNEL_STATE(), REX_KERNEL_MEMORY()->TranslateVirtual(native_ptr));
   if (object) {

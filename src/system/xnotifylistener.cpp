@@ -76,10 +76,27 @@ bool XNotifyListener::DequeueNotification(XNotificationID id, uint32_t* out_data
     dequeued = true;
     *out_data = it->second;
     notifications_.erase(it);
-    if (!notifications_.size()) {
-      wait_handle_->Reset();
-    }
     break;
+  }
+  // [svr2011] A title that only ever asks for one id leaves the others queued;
+  // keeping the handle signaled for them makes a wait on it return at once
+  // forever. SvR 2011's Wwise audio thread waits on {listener, render events}
+  // and only takes XN_XMP_PLAYBACKCONTROLLERCHANGED, so a queued
+  // XN_XMP_STATECHANGED starved its rendering (all game audio went silent after
+  // a USER PLAYLIST song). Signal only while a notification of this id is left.
+  bool more = false;
+  for (auto& n : notifications_) {
+    if (n.first == id) {
+      more = true;
+      break;
+    }
+  }
+  if (!more) {
+    wait_handle_->Reset();
+  }
+  // Nothing takes the other ids from this listener: don't let them pile up.
+  while (notifications_.size() > 64) {
+    notifications_.erase(notifications_.begin());
   }
   return dequeued;
 }

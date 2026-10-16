@@ -55,8 +55,14 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
 }  // namespace
 
 std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
+#if defined(__ANDROID__)
+  // [svr2011] Packaged in the APK's native libraries: loaded by name.
+  std::filesystem::path path = PluginFileName(name);
+  if (false) {
+#else
   auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
   if (!std::filesystem::exists(path)) {
+#endif
     REXSYS_ERROR(
         "GPU plugin '{}' not found at {}. Stage it next to the executable "
         "(GPU_PLUGINS {} in rexglue_configure_target).",

@@ -20,7 +20,9 @@
 // before including <ucontext.h>.
 #define _XOPEN_SOURCE 700
 #endif
+#if !REX_PLATFORM_ANDROID  // [svr2011] bionic has no ucontext functions
 #include <ucontext.h>
+#endif
 #include <cstdint>
 #include <vector>
 #endif
@@ -57,7 +59,11 @@ struct Fiber {
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_ANDROID
+  void* sp_ = nullptr;  // saved stack pointer (fiber_posix.cpp: arm64 switch)
+#else
   ucontext_t context_{};
+#endif
   std::vector<uint8_t> stack_;
   void (*entry_)(void*) = nullptr;
   void* arg_ = nullptr;

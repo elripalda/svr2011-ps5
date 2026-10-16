@@ -575,6 +575,7 @@ bool D3D12RenderTargetCache::Initialize() {
         provider, std::max(ui::d3d12::D3D12UploadBufferPool::kDefaultPageSize,
                            sizeof(float) * 2 * 6 * Transfer::kMaxCutoutBorderRectangles *
                                xenos::kEdramTileCount));
+  REXLOG_INFO("[svr2011] upload pool {} = rt transfer vertices", static_cast<const void*>(transfer_vertex_buffer_pool_.get()));
 
     // Transfer root signatures.
     D3D12_DESCRIPTOR_RANGE transfer_root_color_srv_range;

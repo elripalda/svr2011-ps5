@@ -89,6 +89,12 @@ if(REXGLUE_USE_VULKAN)
     list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
 endif()
 
+if(REXGLUE_USE_D3D11)  # [svr2011]
+    list(APPEND REXGPU_XENOS_SOURCES
+        d3d11/command_processor.cpp
+        d3d11/graphics_system.cpp)
+endif()
+
 if(REXGLUE_USE_D3D12)
     list(APPEND REXGPU_XENOS_SOURCES
         ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
@@ -106,6 +112,7 @@ set_target_properties(rexgpu-xenos PROPERTIES
 )
 
 target_include_directories(rexgpu-xenos PRIVATE
+    ${REXGLUE_ROOT}/src  # [svr2011] ui/shaders/bytecode (D3D11 gamma pass)
     ${REXGLUE_ROOT}/thirdparty/renderdoc
     ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
 )

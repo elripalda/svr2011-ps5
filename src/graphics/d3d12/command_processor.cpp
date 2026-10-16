@@ -10,6 +10,9 @@
  */
 
 #include <algorithm>
+#include <atomic>
+
+#include <rex/external_frame.h>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -46,6 +49,28 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [svr2011] Debug: SVR2011_GPU_DRAWLOG=<file>: when <file>.go appears, one
+// frame's draws as the GPU sees them (shaders, constants, fetch constants) -
+// to compare with the app's own renderer (SVR2011_NATIVE_DUMP_*).
+static FILE* g_svr2011_gpu_drawlog = nullptr;
+static void Svr2011GpuDrawlogFrame() {
+  static const char* path = std::getenv("SVR2011_GPU_DRAWLOG");
+  if (!path) return;
+  if (g_svr2011_gpu_drawlog) {
+    std::fclose(g_svr2011_gpu_drawlog);
+    g_svr2011_gpu_drawlog = nullptr;
+    return;
+  }
+  static uint32_t frames = 0;
+  if (++frames % 15) return;
+  const std::string go = std::string(path) + ".go";
+  if (FILE* g = std::fopen(go.c_str(), "rb")) {
+    std::fclose(g);
+    std::remove(go.c_str());
+    g_svr2011_gpu_drawlog = std::fopen(path, "w");
+  }
+}
 
 namespace rex::graphics::d3d12 {
 
@@ -945,6 +970,7 @@ bool D3D12CommandProcessor::SetupContext() {
   constant_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
       provider, std::max(ui::d3d12::D3D12UploadBufferPool::kDefaultPageSize,
                          sizeof(float) * 4 * D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT));
+  REXLOG_INFO("[svr2011] upload pool {} = constants", static_cast<const void*>(constant_buffer_pool_.get()));
   if (bindless_resources_used_) {
     D3D12_DESCRIPTOR_HEAP_DESC view_bindless_heap_desc;
     view_bindless_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1893,7 +1919,10 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  Svr2011GpuDrawlogFrame();  // [svr2011] debug
   SCOPE_profile_cpu_f("gpu");
+  // [svr2011] (the GPU thread got this far: a frame's commands all went through)
+  rex::external_frame::CountSwap();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -1916,9 +1945,34 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
   xenos::TextureFormat frontbuffer_format;
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
-  ID3D12Resource* swap_texture_resource =
-      texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
-                                         &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
+  ID3D12Resource* swap_texture_resource = nullptr;
+  // [svr2011] A frame from the app's own renderer (rex/external_frame.h), on
+  // the same device: waited for on the GPU, then shown like the front buffer.
+  rex::external_frame::Frame external_frame;
+  if (rex::external_frame::GetFrame(external_frame) && external_frame.resource) {
+    swap_texture_resource = static_cast<ID3D12Resource*>(external_frame.resource);
+    swap_texture_srv_desc = {};
+    swap_texture_srv_desc.Format = DXGI_FORMAT(external_frame.srv_format);
+    swap_texture_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    swap_texture_srv_desc.Shader4ComponentMapping = external_frame.component_mapping;
+    swap_texture_srv_desc.Texture2D.MipLevels = 1;
+    frontbuffer_format = xenos::TextureFormat::k_8_8_8_8;
+    frontbuffer_width_unscaled = external_frame.width;
+    frontbuffer_height_unscaled = external_frame.height;
+    frontbuffer_width = external_frame.width;
+    frontbuffer_height = external_frame.height;
+    if (external_frame.fence) {
+      GetD3D12Provider().GetDirectQueue()->Wait(static_cast<ID3D12Fence*>(external_frame.fence),
+                                                external_frame.fence_value);
+    }
+    // Kept alive until this submission is done with it.
+    swap_texture_resource->AddRef();
+    resources_for_deletion_.emplace_back(submission_current_, swap_texture_resource);
+  } else {
+    swap_texture_resource = texture_cache_->RequestSwapTexture(
+        swap_texture_srv_desc, frontbuffer_format, &frontbuffer_width_unscaled,
+        &frontbuffer_height_unscaled);
+  }
   if (!swap_texture_resource) {
     // Dump texture fetch constant 0 for debugging
     const auto& regs = *register_file_;
@@ -1984,6 +2038,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+  // [svr2011] The app's own frames have the shape to show (16:9, or as wide
+  // as the window in the port's wide-screen matches): letterboxed to it.
+  if (external_frame.resource && external_frame.width && external_frame.height) {
+    display_width = external_frame.width;
+    display_height = external_frame.height;
+  }
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
@@ -2326,6 +2386,42 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+  if (g_svr2011_gpu_drawlog) {  // [svr2011] debug (see Svr2011GpuDrawlogFrame)
+    FILE* f = g_svr2011_gpu_drawlog;
+    std::fprintf(f, "=== draw prim %u count %u vs %016llX ps %016llX\n", uint32_t(primitive_type), index_count,
+                 (unsigned long long)vertex_shader->ucode_data_hash(),
+                 (unsigned long long)(pixel_shader ? pixel_shader->ucode_data_hash() : 0));
+    for (uint32_t i = 0; i < 512; ++i) {
+      float c[4];
+      for (uint32_t k = 0; k < 4; ++k) {
+        const uint32_t v = regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + k];
+        std::memcpy(&c[k], &v, 4);
+      }
+      std::fprintf(f, "  %s%u = %g %g %g %g\n", i < 256 ? "gc" : "pc", i & 255, c[0], c[1], c[2], c[3]);
+    }
+    for (uint32_t i = 0; i < 32; ++i) {
+      std::fprintf(f, "  fetch %u:", i);
+      for (uint32_t k = 0; k < 6; ++k) std::fprintf(f, " %08X", uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + i * 6 + k]));
+      std::fprintf(f, "\n");
+    }
+    std::fprintf(f, "  bools %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                 uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031]), uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 1]),
+                 uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 2]), uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 3]),
+                 uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 4]), uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 5]),
+                 uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 6]), uint32_t(regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 7]));
+  }
+  // [svr2011] The app's renderer draws the frames (rex/external_frame.h):
+  // only draws writing guest memory still run here.
+  if (!memexport_used && rex::external_frame::HostDrawingDisabled()) {
+    return true;
+  }
+  if (rex::external_frame::HostDrawingDisabled()) {  // [svr2011] (how often: the app skips the guest's draws)
+    static uint32_t memexport_draws = 0;
+    if (++memexport_draws <= 8 || (memexport_draws & 1023) == 0) {
+      REXGPU_INFO("[svr2011] memexport draw #{} (vs {:016X} ps {:016X})", memexport_draws,
+                  vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    }
+  }
 
   if (!BeginSubmission(true)) {
     return false;
@@ -2730,6 +2826,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   return true;
 }
 
+static bool LogReadbackBuffer(ID3D12Resource* buffer);  // [svr2011]
+
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
   if (!total_size || memexport_ranges_.empty()) {
     return true;
@@ -2797,7 +2895,8 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     ID3D12Resource* buffer = nullptr;
     if (FAILED(device->CreateCommittedResource(
             &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
-            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer))) ||
+        !LogReadbackBuffer(buffer)) {
       return false;
     }
 
@@ -2874,6 +2973,9 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  if (rex::external_frame::HostDrawingDisabled()) {
+    return true;  // [svr2011] nothing drawn here to resolve (see IssueDraw)
+  }
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -2917,7 +3019,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     ID3D12Resource* buffer = nullptr;
     if (FAILED(device->CreateCommittedResource(
             &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
-            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer))) ||
+        !LogReadbackBuffer(buffer)) {
       REXGPU_ERROR("Failed to create a {} MB readback buffer", size >> 20);
       return true;
     }
@@ -2926,7 +3029,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         rb.buffers[write_index]->Unmap(0, nullptr);
         rb.mapped_data[write_index] = nullptr;
       }
-      rb.buffers[write_index]->Release();
+      // [svr2011] A submission still in flight may copy into it.
+      resources_for_deletion_.emplace_back(submission_current_, rb.buffers[write_index]);
     }
     rb.buffers[write_index] = buffer;
     rb.sizes[write_index] = size;
@@ -3068,6 +3172,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     deferred_command_list_.D3DCopyBufferRegion(rb.buffers[write_index], 0, shared_memory_buffer,
                                                written_address, written_length);
   }
+  rb.submission_written[write_index] = submission_current_;  // [svr2011] see eviction
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   bool use_delayed_sync =
@@ -3229,11 +3334,13 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
           *node->pLastBreadcrumbValue == 0) {
         continue;
       }
-      REXGPU_ERROR("DRED breadcrumb: completed {} of {} ops", *node->pLastBreadcrumbValue,
-                   node->BreadcrumbCount);
+      REXGPU_ERROR("DRED breadcrumb: completed {} of {} ops (list '{}', queue '{}')",
+                   *node->pLastBreadcrumbValue, node->BreadcrumbCount,
+                   node->pCommandListDebugNameA ? node->pCommandListDebugNameA : "?",
+                   node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA : "?");
       uint32_t last = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
-      uint32_t start = last > 3 ? last - 3 : 0;
-      uint32_t end = std::min(last + 1, node->BreadcrumbCount);
+      uint32_t start = last > 8 ? last - 8 : 0;
+      uint32_t end = std::min(last + 8, node->BreadcrumbCount);
       for (uint32_t i = start; i < end; i++) {
         REXGPU_ERROR("  [{}] op type {}{}", i, static_cast<int>(node->pCommandHistory[i]),
                      i == last ? " <-- FAULT" : "");
@@ -4743,6 +4850,16 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   return true;
 }
 
+// [svr2011] Logs readback buffer addresses (to match GPU page faults).
+static bool LogReadbackBuffer(ID3D12Resource* buffer) {
+  static std::atomic<uint32_t> logged{0};
+  if (buffer && logged++ < 512) {
+    REXGPU_INFO("[svr2011] readback buffer GPU VA {:016X} size {:X}",
+                buffer->GetGPUVirtualAddress(), buffer->GetDesc().Width);
+  }
+  return true;
+}
+
 void D3D12CommandProcessor::EvictOldReadbackBuffers(
     std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map) {
   if (buffer_map.empty()) {
@@ -4755,6 +4872,14 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
     ReadbackBuffer& readback = it->second;
     bool evict =
         buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor;
+    // [svr2011] Never release a buffer a submission still in flight copies
+    // into (a GPU page fault / TDR otherwise - memexport ranges of varying
+    // sizes fill the map quickly and evict buffers used moments ago).
+    for (uint32_t i = 0; i < 2 && evict; ++i) {
+      if (readback.buffers[i] && readback.submission_written[i] > submission_completed_) {
+        evict = false;
+      }
+    }
     if (!evict) {
       ++it;
       continue;
@@ -4764,7 +4889,8 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
         if (readback.mapped_data[i]) {
           readback.buffers[i]->Unmap(0, nullptr);
         }
-        readback.buffers[i]->Release();
+        // [svr2011] Released once the current submission completes.
+        resources_for_deletion_.emplace_back(submission_current_, readback.buffers[i]);
       }
       readback.buffers[i] = nullptr;
       readback.mapped_data[i] = nullptr;
@@ -4789,7 +4915,8 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
     ID3D12Resource* buffer;
     if (FAILED(device->CreateCommittedResource(
             &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
-            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer))) ||
+        !LogReadbackBuffer(buffer)) {
       REXGPU_ERROR("Failed to create a {} MB readback buffer", size >> 20);
       return nullptr;
     }

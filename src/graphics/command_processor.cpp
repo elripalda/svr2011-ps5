@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <vector>
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -34,8 +35,13 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+#include <rex/timeline.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+// [svr2011] Diagnostics for command-processor stalls on PM4 WAIT_REG_MEM.
+REXCVAR_DEFINE_BOOL(gpu_log_waits, false, "GPU",
+                    "Log WAIT_REG_MEM statistics (count, time, polled address) every 5 s");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -328,6 +334,7 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
+  REX_TIMELINE(kWritePointer, value);
   write_ptr_index_ = value;
   write_ptr_index_event_->Set();
 }
@@ -355,7 +362,15 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  // [svr2011] Which registers are known, looked up once: GetRegisterInfo is a
+  // switch over every register, and this runs for each of the thousands of
+  // register writes a frame (only to log unknown ones).
+  static const std::vector<bool> known = [] {
+    std::vector<bool> k(RegisterFile::kRegisterCount);
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) k[i] = RegisterFile::GetRegisterInfo(i) != nullptr;
+    return k;
+  }();
+  if (!known[index]) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -702,6 +717,24 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  // [svr2011] Float shader constants (thousands a frame): stored in one go,
+  // then the backend notes them once (FloatConstantsWritten) - instead of a
+  // WriteRegister call each. (Phones: the GPU thread's biggest cost.)
+  if (!write_one_reg && base_index >= 0x4000 && base_index + count <= 0x4800 && FastFloatConstants()) {
+    RegisterFile& regs = *register_file_;
+    memory::RingBuffer::ReadRange range = reader->BeginRead(size_t(count) * sizeof(uint32_t));
+    uint32_t* out = &regs.values[base_index];
+    auto copy = [&](const uint8_t* src, size_t bytes) {
+      const uint32_t n = uint32_t(bytes / sizeof(uint32_t));
+      for (uint32_t i = 0; i < n; ++i) out[i] = memory::load_and_swap<uint32_t>(src + i * 4);
+      out += n;
+    };
+    if (range.first_length) copy(range.first, range.first_length);
+    if (range.second_length) copy(range.second, range.second_length);
+    reader->EndRead(range);
+    FloatConstantsWritten(base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -989,8 +1022,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // [svr2011] wait statistics (gpu_log_waits)
+  const bool log_waits = REXCVAR_GET(gpu_log_waits);
+  const uint64_t wait_start = log_waits ? rex::chrono::Clock::QueryHostTickCount() : 0;
+  uint32_t polls = 0;
+  const bool trace = rex::timeline::Enabled();
+
   bool matched = false;
   do {
+    ++polls;
     uint32_t value = 0;
     if (is_memory) {
       value =
@@ -1030,6 +1070,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (trace && polls == 1) rex::timeline::Record(rex::timeline::kGpuWaitBegin, poll_reg_addr, ref);
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1051,6 +1092,40 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (trace && polls > 1) rex::timeline::Record(rex::timeline::kGpuWaitEnd, poll_reg_addr, polls);
+
+  if (log_waits) {
+    struct WaitStats {
+      uint64_t window_start = 0, blocked_ticks = 0;
+      uint32_t waits = 0, blocked = 0, max_polls = 0;
+      uint32_t last_addr = 0, last_ref = 0, last_info = 0, last_wait = 0;
+    };
+    static WaitStats st;
+    const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    const uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+    if (!st.window_start) st.window_start = now;
+    ++st.waits;
+    if (polls > 1) {
+      ++st.blocked;
+      st.blocked_ticks += now - wait_start;
+      st.max_polls = std::max(st.max_polls, polls);
+      st.last_addr = poll_reg_addr;
+      st.last_ref = ref;
+      st.last_info = wait_info;
+      st.last_wait = wait;
+    }
+    if (now - st.window_start >= freq * 5) {
+      REXGPU_INFO(
+          "WAIT_REG_MEM: {} waits, {} blocked, {:.1f} ms blocked total ({:.2f} ms/s), max polls {}; "
+          "last blocked: {} 0x{:08X} ref 0x{:X} info 0x{:X} wait 0x{:X}",
+          st.waits, st.blocked, st.blocked_ticks * 1000.0 / freq,
+          st.blocked_ticks * 1000.0 / freq / 5.0, st.max_polls,
+          (st.last_info & 0x10) ? "mem" : "reg", st.last_addr, st.last_ref, st.last_info,
+          st.last_wait);
+      st = WaitStats{};
+      st.window_start = now;
+    }
+  }
 
   return true;
 }

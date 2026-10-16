@@ -53,6 +53,11 @@ namespace ui {
 class Presenter;
 class Window;
 
+// [svr2011] Presents to the screen so far, and those that showed a new guest
+// frame (the frames the player actually sees).
+uint64_t HostPresentCount();
+uint64_t HostNewGuestFramePresentCount();
+
 class UIDrawContext {
  public:
   UIDrawContext(const UIDrawContext& context) = delete;
@@ -715,6 +720,10 @@ class Presenter {
   //
   // Call via PaintAndPresent.
   virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
+  // [svr2011] Weak GPUs / CPUs (Mali): repaints only for the UI drawers (the
+  // overlay asking for its next frame) wait for a new guest frame - at most
+  // ~100 ms - instead of painting at the display's rate.
+  virtual bool ThrottleUIOnlyPaints() const { return false; }
 
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);

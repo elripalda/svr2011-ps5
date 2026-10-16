@@ -32,6 +32,9 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/utils.h>
+#if defined(__ANDROID__)
+#include <rex/main_android.h>
+#endif
 #include <rex/platform.h>
 #include <rex/string.h>
 
@@ -295,6 +298,16 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 #endif
 
   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
+#if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
+  // [svr2011] Kernels before 4.17 (Android 10 tablets: 4.14) don't know
+  // MAP_FIXED_NOREPLACE and take the address as a hint: over an existing
+  // reservation they map somewhere else. That is the EEXIST case.
+  if (result != MAP_FAILED && base_address && result != base_address) {
+    munmap(result, length);
+    result = MAP_FAILED;
+    errno = EEXIST;
+  }
+#endif
   if (result != MAP_FAILED) {
     return result;
   }

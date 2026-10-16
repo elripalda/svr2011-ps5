@@ -10,7 +10,12 @@
  */
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -44,7 +49,60 @@ bool SlotForDevice(rex::input::DeviceId id, uint32_t* out_slot) {
 constexpr uint64_t SKIP_INVALID_CONTROLLER_TIME = 1100;
 uint64_t last_invalid_time[kXinputSlotCount];
 
+// [svr2011] Which slots have a pad, probed off the game thread: an empty
+// slot's XInputGetCapabilities can block for hundreds of ms (seen as 300+ ms
+// stalls of the game thread in the pad reader), so once the probe runs, the
+// game's own calls never touch an empty slot - they read this mask. A pad
+// plugged in shows within half a second.
+std::atomic<uint32_t> g_present{0};
+std::atomic<bool> g_probing{false};
+std::mutex g_probe_mutex;
+std::condition_variable g_probe_cv;
+bool g_probe_stop = false;
+std::thread g_probe_thread;
+
+void ProbeSlots(decltype(&XInputGetCapabilities) xigc) {
+  uint32_t mask = 0;
+  for (uint32_t slot = 0; slot < kXinputSlotCount; slot++) {
+    XINPUT_CAPABILITIES caps;
+    if (xigc(slot, 0, &caps) == ERROR_SUCCESS) {
+      mask |= 1u << slot;
+    }
+  }
+  g_present.store(mask, std::memory_order_relaxed);
+}
+
+void StartProbe(decltype(&XInputGetCapabilities) xigc) {
+  ProbeSlots(xigc);  // (the first answer before the game asks)
+  g_probe_stop = false;
+  g_probe_thread = std::thread([xigc] {
+    std::unique_lock lock(g_probe_mutex);
+    while (!g_probe_cv.wait_for(lock, std::chrono::milliseconds(500), [] { return g_probe_stop; })) {
+      lock.unlock();
+      ProbeSlots(xigc);
+      lock.lock();
+    }
+  });
+  g_probing.store(true, std::memory_order_release);
+}
+
+void StopProbe() {
+  if (!g_probe_thread.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard lock(g_probe_mutex);
+    g_probe_stop = true;
+  }
+  g_probe_cv.notify_all();
+  g_probe_thread.join();
+  g_probing.store(false, std::memory_order_release);
+}
+
 DWORD should_skip(uint32_t user_index) {
+  if (g_probing.load(std::memory_order_acquire)) {
+    return (g_present.load(std::memory_order_relaxed) >> user_index) & 1 ? 0 : ERROR_DEVICE_NOT_CONNECTED;
+  }
   uint64_t time = last_invalid_time[user_index];
   if (time) {
     uint64_t deltatime = rex::chrono::Clock::QueryHostUptimeMillis() - time;
@@ -59,6 +117,7 @@ DWORD should_skip(uint32_t user_index) {
 
 void set_skip(uint32_t user_index) {
   last_invalid_time[user_index] = rex::chrono::Clock::QueryHostUptimeMillis();
+  g_present.fetch_and(~(1u << user_index), std::memory_order_relaxed);  // (until the probe sees it again)
 }
 
 }  // namespace
@@ -76,6 +135,7 @@ XinputInputDriver::XinputInputDriver(rex::ui::Window* window, size_t window_z_or
       XInputEnable_(nullptr) {}
 
 XinputInputDriver::~XinputInputDriver() {
+  StopProbe();  // (before the module goes)
   if (module_) {
     FreeLibrary((HMODULE)module_);
     module_ = nullptr;
@@ -130,16 +190,11 @@ void XinputInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   if (!xigc) {
     return;
   }
+  if (!g_probing.load(std::memory_order_acquire)) {
+    StartProbe(xigc);
+  }
   for (uint32_t slot = 0; slot < kXinputSlotCount; slot++) {
-    if (should_skip(slot)) {
-      continue;
-    }
-    XINPUT_CAPABILITIES native_caps;
-    DWORD result = xigc(slot, 0, &native_caps);
-    if (result) {
-      if (result == ERROR_DEVICE_NOT_CONNECTED) {
-        set_skip(slot);
-      }
+    if (should_skip(slot)) {  // (the probe's answer: no XInput call here)
       continue;
     }
     DeviceInfo info;

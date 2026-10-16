@@ -22,6 +22,12 @@ namespace rex {
 namespace ui {
 namespace vulkan {
 
+// [svr2011] The app opens the Vulkan loader itself (Android: a custom GPU
+// driver through libadrenotools): returns the library handle, or null to use
+// the system's. Set before the instance is created.
+using LoaderOpener = void* (*)();
+void SetLoaderOpener(LoaderOpener opener);
+
 class VulkanInstance {
  public:
   static std::unique_ptr<VulkanInstance> Create(bool with_surface, bool try_enable_validation);

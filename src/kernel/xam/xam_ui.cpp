@@ -204,6 +204,16 @@ X_RESULT xeXamDispatchHeadlessEx(std::function<X_RESULT(uint32_t&, uint32_t&)> r
   }
 }
 
+// [svr2011] Gamer cards: there are none on the PC (the game's button for
+// them is removed from its menus, online.cpp); nothing to show.
+u32 XamShowGamerCardUIForXUID_entry(u32 user_index, u64 xuid) {
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamShowGamerCardUI_entry(u32 user_index) {
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamIsUIActive_entry() {
   return xeXamIsUIActive();
 }
@@ -566,6 +576,8 @@ uint32_t XamShowMessageBoxUIEx_entry() {
 
 REX_EXPORT(__imp__XamIsUIActive, rex::kernel::xam::XamIsUIActive_entry)
 REX_EXPORT(__imp__XamShowMessageBoxUI, rex::kernel::xam::XamShowMessageBoxUI_entry)
+REX_EXPORT(__imp__XamShowGamerCardUIForXUID, rex::kernel::xam::XamShowGamerCardUIForXUID_entry)
+REX_EXPORT(__imp__XamShowGamerCardUI, rex::kernel::xam::XamShowGamerCardUI_entry)
 REX_EXPORT(__imp__XamShowKeyboardUI, rex::kernel::xam::XamShowKeyboardUI_entry)
 REX_EXPORT(__imp__XamShowDeviceSelectorUI, rex::kernel::xam::XamShowDeviceSelectorUI_entry)
 REX_EXPORT(__imp__XamShowDirtyDiscErrorUI, rex::kernel::xam::XamShowDirtyDiscErrorUI_entry)
@@ -613,8 +625,6 @@ REX_EXPORT_STUB(__imp__XamShowFriendsUI);
 REX_EXPORT_STUB(__imp__XamShowFriendsUIp);
 REX_EXPORT_STUB(__imp__XamShowGameInviteUI);
 REX_EXPORT_STUB(__imp__XamShowGameVoiceChannelUI);
-REX_EXPORT_STUB(__imp__XamShowGamerCardUI);
-REX_EXPORT_STUB(__imp__XamShowGamerCardUIForXUID);
 REX_EXPORT_STUB(__imp__XamShowGamerCardUIForXUIDp);
 REX_EXPORT_STUB(__imp__XamShowGamesUI);
 REX_EXPORT_STUB(__imp__XamShowGenericOnlineAppUI);

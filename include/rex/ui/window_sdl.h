@@ -40,6 +40,14 @@ class WindowSDL final : public Window {
   void HandleKeyEvent(SDL_Event& event);
   void HandleTextInputEvent(SDL_Event& event);
   void HandleMouseEvent(SDL_Event& event);
+  void HandleTouchEvent(SDL_Event& event);  // [svr2011]
+  // [svr2011] Android: the app went to the background (its ANativeWindow is
+  // destroyed) or came back (a new one, possibly a little later). The
+  // presenter follows: detached in the background, reattached to the
+  // current native window once there is one (SyncAndroidSurface, checked at
+  // every event).
+  void SetAndroidBackground(bool background);
+  void SyncAndroidSurface();
   void HandleDropEvent(SDL_Event& event);
   void HandlePaintEvent();
 
@@ -50,6 +58,7 @@ class WindowSDL final : public Window {
   void RequestCloseImpl() override;
 
   void ApplyNewFullscreen() override;
+  void ApplyFullscreenMode();  // [svr2011]
   void ApplyNewTitle() override;
   void ApplyNewMouseCapture() override;
   void ApplyNewMouseRelease() override;
@@ -81,6 +90,8 @@ class WindowSDL final : public Window {
 
   SDL_Window* sdl_window_ = nullptr;
   SDL_WindowID sdl_window_id_ = 0;
+  void* android_window_ = nullptr;  // [svr2011] the native window the surface was made from
+  bool android_background_ = false;
   std::atomic<bool> paint_pending_{false};
   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
   SDL_TimerID cursor_hide_timer_ = 0;

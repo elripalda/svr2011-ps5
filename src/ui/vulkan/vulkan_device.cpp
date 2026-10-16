@@ -26,9 +26,17 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// [svr2011] honoured again: Mali GPUs have no vertexPipelineStoresAndAtomics
+// (every driver), and memory export from vertex shaders has a compute path.
 REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
-                    "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
-                    "required for Vulkan GPU emulation")
+                    "Require vertexPipelineStoresAndAtomics for Vulkan GPU emulation (disable to "
+                    "allow the compute shader path for memory export from vertex shaders: Mali)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// [svr2011] Test aid: the device reports what an Arm Mali GPU's driver lacks
+// (vulkan.gpuinfo.org reports, Mali-G57 to G925), so the Mali paths run on
+// another GPU. Not the formats (BC: the app's own switch).
+REXCVAR_DEFINE_BOOL(vulkan_simulate_mali, false, "UI/Vulkan",
+                    "Test: hide the features and extensions an Arm Mali GPU lacks")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid;
 // default both to false on macOS so the device can still be selected.
@@ -91,6 +99,20 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   VkPhysicalDeviceFeatures supported_features = {};
   ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
+  if (REXCVAR_GET(vulkan_simulate_mali)) {
+    // (all Mali drivers: no wireframe, vertex stage stores, clip / cull
+    // distances, fp64, sparse resources or BC; G57 / G68 / G78: no multi draw indirect)
+    supported_features.fillModeNonSolid = VK_FALSE;
+    supported_features.vertexPipelineStoresAndAtomics = VK_FALSE;
+    supported_features.shaderClipDistance = VK_FALSE;
+    supported_features.shaderCullDistance = VK_FALSE;
+    supported_features.shaderFloat64 = VK_FALSE;
+    supported_features.sparseBinding = VK_FALSE;
+    supported_features.textureCompressionBC = VK_FALSE;
+    supported_features.multiDrawIndirect = VK_FALSE;
+    REXLOG_WARN("Vulkan device '{}': simulating an Arm Mali GPU (vulkan_simulate_mali)",
+                properties.deviceName);
+  }
 
   if (with_gpu_emulation) {
     if (!supported_features.independentBlend) {
@@ -116,10 +138,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
           properties.deviceName);
       return nullptr;
     }
-    if (!supported_features.vertexPipelineStoresAndAtomics) {
+    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics) &&
+        !supported_features.vertexPipelineStoresAndAtomics) {
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
-          "is required for Vulkan GPU emulation parity",
+          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, but "
+          "vulkan_require_vertex_pipeline_stores_and_atomics=true",
           properties.deviceName);
       return nullptr;
     }
@@ -205,6 +228,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
   bool ext_1_1_KHR_maintenance1 = false;
+  // [svr2011] the app renderer's bindless tables on Vulkan 1.0 / 1.1 devices
+  // (the phones' own Adreno 6xx / 7xx drivers, Turnip on an Adreno 610)
+  bool ext_1_2_EXT_descriptor_indexing = false;
+  bool ext_1_1_KHR_maintenance3 = false;
   bool ext_1_2_KHR_shader_float_controls = false;
   bool ext_EXT_fragment_shader_interlock = false;
   bool ext_1_3_EXT_shader_demote_to_helper_invocation = false;
@@ -236,6 +263,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_custom_border_color)
       // Required for true null descriptors in bindless texture bindings.
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_robustness2)
+      // [svr2011] #162 (needs #169).
+      XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(EXT_descriptor_indexing, 1, 2)
+      XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance3, 1, 1)
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       // #237.
@@ -271,6 +301,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         const auto requested_extension_it =
             requested_extensions.find(supported_extension.extensionName);
         if (requested_extension_it == requested_extensions.cend()) {
+          continue;
+        }
+        // (no Mali driver has these)
+        if (REXCVAR_GET(vulkan_simulate_mali) &&
+            (requested_extension_it->first == "VK_EXT_shader_stencil_export" ||
+             requested_extension_it->first == "VK_EXT_fragment_shader_interlock")) {
           continue;
         }
         assert_not_null(requested_extension_it->second);
@@ -335,10 +371,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDeviceDescriptorIndexingFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT>
+      features_1_2_EXT_descriptor_indexing;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
       features_1_2.Link(supported_features_2, device_create_info);
+    } else if (ext_1_2_EXT_descriptor_indexing && with_gpu_emulation) {
+      features_1_2_EXT_descriptor_indexing.Link(supported_features_2, device_create_info);
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
       features_1_3.Link(supported_features_2, device_create_info);
@@ -650,8 +691,48 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+      // [svr2011] for an app renderer on this device (rex/external_frame.h)
+      // (the native renderer's shaders read their constants from a storage
+      // buffer: no buffer device address or 64-bit integers needed)
+      const VkPhysicalDeviceVulkan12Features& s = features_1_2.supported;
+      VkPhysicalDeviceVulkan12Features& e = features_1_2.enabled;
+      const bool app_renderer = s.descriptorIndexing && s.runtimeDescriptorArray &&
+                                s.descriptorBindingPartiallyBound &&
+                                s.descriptorBindingVariableDescriptorCount &&
+                                s.descriptorBindingSampledImageUpdateAfterBind;
+      if (app_renderer) {
+        e.descriptorIndexing = VK_TRUE;
+        e.runtimeDescriptorArray = VK_TRUE;
+        e.descriptorBindingPartiallyBound = VK_TRUE;
+        e.descriptorBindingVariableDescriptorCount = VK_TRUE;
+        e.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        e.shaderSampledImageArrayNonUniformIndexing = s.shaderSampledImageArrayNonUniformIndexing;
+      }
+      device->properties_.appRendererFeatures = app_renderer;
+      REXLOG_INFO("* app renderer features: {}", app_renderer);
     }
   } else {
+    if (with_gpu_emulation) {
+      // [svr2011] Vulkan 1.0 / 1.1: the same through VK_EXT_descriptor_indexing.
+      const VkPhysicalDeviceDescriptorIndexingFeaturesEXT& s =
+          features_1_2_EXT_descriptor_indexing.supported;
+      VkPhysicalDeviceDescriptorIndexingFeaturesEXT& e = features_1_2_EXT_descriptor_indexing.enabled;
+      const bool app_renderer = ext_1_2_EXT_descriptor_indexing &&
+                                (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0) ||
+                                 ext_1_1_KHR_maintenance3) &&
+                                s.runtimeDescriptorArray && s.descriptorBindingPartiallyBound &&
+                                s.descriptorBindingVariableDescriptorCount &&
+                                s.descriptorBindingSampledImageUpdateAfterBind;
+      if (app_renderer) {
+        e.runtimeDescriptorArray = VK_TRUE;
+        e.descriptorBindingPartiallyBound = VK_TRUE;
+        e.descriptorBindingVariableDescriptorCount = VK_TRUE;
+        e.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        e.shaderSampledImageArrayNonUniformIndexing = s.shaderSampledImageArrayNonUniformIndexing;
+      }
+      device->properties_.appRendererFeatures = app_renderer;
+      REXLOG_INFO("* app renderer features: {} (VK_EXT_descriptor_indexing)", app_renderer);
+    }
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
     }

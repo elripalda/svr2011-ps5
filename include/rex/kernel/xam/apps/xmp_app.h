@@ -19,6 +19,10 @@
 #include <rex/system/xam/app_manager.h>
 #include <rex/thread/mutex.h>
 
+#include <functional>
+#include <string>
+#include <vector>
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -89,12 +93,32 @@ class XmpApp : public system::xam::App {
   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length) override;
 
+  // [svr2011] The user's music library, which the console kept on its hard
+  // drive: the host lists its playlists (by name) and plays them. Titles
+  // enumerate the playlists (XamCreateEnumeratorHandle with this app's
+  // messages 0x70026/0x70027, items kUserPlaylistSize bytes, the name at
+  // kUserPlaylistNameOffset) and play one with message 0x7003B; XMPStop,
+  // XMPPause and XMPContinue then control it.
+  struct HostMusic {
+    std::function<std::vector<std::u16string>()> list_playlists;
+    std::function<bool(const std::u16string& name)> play;  // loops until stopped
+    std::function<void()> stop, pause, resume;
+    std::function<void(float volume)> set_volume;  // 0..1 (XMPSetVolume)
+  };
+  static void SetHostMusic(HostMusic music);
+  static constexpr uint32_t kUserPlaylistSize = 820;
+  static constexpr uint32_t kUserPlaylistNameOffset = 572;
+  static constexpr uint32_t kUserPlaylistEnumerateMessage = 0x00070026;
+  // Writes the user playlists as enumeration items (kUserPlaylistSize each).
+  static std::vector<std::vector<uint8_t>> UserPlaylistItems();
+
  private:
   static const uint32_t kMsgStateChanged = 0x0A000001;
   static const uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;
   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
 
   void OnStateChanged();
+  void SetUserPlaylistPlaying(bool playing);
 
   State state_;
   PlaybackClient playback_client_;
@@ -109,6 +133,9 @@ class XmpApp : public system::xam::App {
   std::unordered_map<uint32_t, Playlist*> playlists_;
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
+
+  bool user_playlist_playing_ = false;
+  std::u16string user_song_name_;
 };
 
 }  // namespace apps
