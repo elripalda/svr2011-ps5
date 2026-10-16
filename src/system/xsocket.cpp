@@ -28,14 +28,56 @@
 #include <WS2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <vector>
 #endif
 
 namespace rex::system {
+
+#if !REX_PLATFORM_WIN32
+namespace {
+// [ps5 port] Non-blocking mode through fcntl first: the PS5 refuses
+// ioctl(FIONBIO) on a game's sockets (WSAEINVAL every time), so the game's
+// online socket setup gave up halfway - "communications unavailable" - and
+// its next try for the same port read a null pointer (the crash on joining a
+// match). Then Sony's SO_NBIO socket option, then ioctl.
+int SetNonBlocking(int fd, bool on) {
+  const int flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0) {
+    const int want = on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+    if (want == flags || fcntl(fd, F_SETFL, want) == 0) return 0;
+  }
+#if REX_PLATFORM_PS5
+  int nbio = on ? 1 : 0;
+  if (setsockopt(fd, SOL_SOCKET, 0x1200 /* SO_NBIO */, &nbio, sizeof(nbio)) == 0) return 0;
+#endif
+  int value = on ? 1 : 0;
+  return ioctl(fd, FIONBIO, &value);
+}
+
+// The bytes waiting to be read, when ioctl(FIONREAD) is refused (the PS5):
+// a peek - the next datagram's size, or what a stream has (up to 64 KB).
+int BytesWaiting(int fd, int* out) {
+  static thread_local std::vector<uint8_t> buffer(65536);
+  const ssize_t n = recv(fd, buffer.data(), buffer.size(), MSG_PEEK | MSG_DONTWAIT);
+  if (n >= 0) {
+    *out = int(n);
+    return 0;
+  }
+  if (errno == EWOULDBLOCK || errno == EAGAIN) {
+    *out = 0;
+    return 0;
+  }
+  return -1;
+}
+}  // namespace
+#endif
 
 XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
 
@@ -157,13 +199,19 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
     if (cmd == kFionbio && arg_ptr) {
       value = (uint32_t(arg_ptr[0]) << 24) | (uint32_t(arg_ptr[1]) << 16) | (uint32_t(arg_ptr[2]) << 8) | arg_ptr[3];
     }
-#if REX_PLATFORM_WIN32
-    const uint32_t native_cmd = cmd;
-#else
-    const uint32_t native_cmd = cmd == kFionbio ? uint32_t(FIONBIO) : uint32_t(FIONREAD);
-#endif
     int native_value = int(value);
-    int ret = rex::net::socket_ioctl(native_handle_, native_cmd, reinterpret_cast<uint8_t*>(&native_value));
+#if REX_PLATFORM_WIN32
+    int ret = rex::net::socket_ioctl(native_handle_, cmd, reinterpret_cast<uint8_t*>(&native_value));
+#else
+    const int fd = int(native_handle_);
+    int ret;
+    if (cmd == kFionbio) {
+      ret = SetNonBlocking(fd, value != 0);
+    } else {
+      ret = rex::net::socket_ioctl(native_handle_, uint32_t(FIONREAD), reinterpret_cast<uint8_t*>(&native_value));
+      if (ret < 0) ret = BytesWaiting(fd, &native_value);
+    }
+#endif
     if (ret < 0) {
       return X_STATUS_UNSUCCESSFUL;
     }

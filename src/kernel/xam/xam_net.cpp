@@ -936,7 +936,13 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
   X_STATUS status = socket->IOControl(cmd, arg_ptr);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+#if REX_PLATFORM_WIN32
     REXKRNL_WARN("[svr2011] net: ioctlsocket({:X}) failed: {}", uint32_t(cmd), HostSocketError());
+#else
+    const int host_errno = errno;
+    REXKRNL_WARN("[svr2011] net: ioctlsocket({:X}) failed: {} (errno {})", uint32_t(cmd), HostSocketError(),
+                 host_errno);
+#endif
     return -1;
   }
 
