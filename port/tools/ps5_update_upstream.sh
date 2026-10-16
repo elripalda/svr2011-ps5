@@ -48,6 +48,9 @@ old=$(g rev-parse --verify -q "upstream/tags/v$old_version^{commit}" || true)
 
 # README.md is the PS5 one: a merge keeps it, and README-PC.md gets theirs.
 g config merge.ours.driver true
+attrs=$(g rev-parse --git-common-dir)/info/attributes
+mkdir -p "$(dirname "$attrs")"
+grep -qx 'README.md merge=ours' "$attrs" 2>/dev/null || echo 'README.md merge=ours' >> "$attrs"
 if g merge-base --is-ancestor "$new" HEAD; then
     echo "==> the game code already has $tag"
 else
