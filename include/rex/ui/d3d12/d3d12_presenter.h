@@ -103,6 +103,7 @@ class D3D12Presenter final : public Presenter {
                               bool& is_8bpc_out) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  bool ThrottleUIOnlyPaints() const override;  // [svr2011] (d3d_throttle_ui_paints)
 
  private:
   struct GuestOutputPaintRectangleConstants {
@@ -251,6 +252,11 @@ class D3D12Presenter final : public Presenter {
     uint32_t swap_chain_width = 0;
     uint32_t swap_chain_height = 0;
     bool swap_chain_allows_tearing = false;
+    // [svr2011] The vsync setting when the swap chain was made (on: no tearing,
+    // a waitable swap chain with one frame of latency - each paint waits for a
+    // free back buffer first, as the D3D11 presenter does).
+    bool vsync = false;
+    HANDLE frame_latency_waitable = nullptr;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
   };

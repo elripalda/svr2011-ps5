@@ -28,6 +28,24 @@
 #include <ffx_api/ffx_upscale.h>
 #endif
 
+// [svr2011] Defined here (rexruntime) rather than in the GPU plugin: the
+// presenters wait for the refresh with it on (sync interval 1 / FIFO) too.
+REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+// [svr2011] The game's overlay pages (ImGui) live for the whole run, so the UI
+// thread painted at the display's rate (144 Hz: 2.4 presents per 60 fps game
+// frame, ~half a core at 75 Hz): D3D12 / D3D11 paint only for new game frames
+// (and at most every 100 ms for the overlay alone) - ThrottleUIOnlyPaints.
+// [svr2011] VSync on for variable refresh (G-Sync / FreeSync): one present per
+// game frame that waits for the refresh (D3D12 sync interval 1, Vulkan FIFO) -
+// a VRR monitor then refreshes when the game's frame comes. Off: the newest
+// frame at each refresh (D3D12 interval 0 without tearing, Vulkan mailbox) -
+// a little less latency, but the monitor stays at its fixed rate.
+REXCVAR_DEFINE_BOOL(vsync_vrr, true, "GPU",
+                    "VSync on: present each game frame for the next refresh (variable refresh follows the game); "
+                    "off: the newest frame at each refresh");
+REXCVAR_DEFINE_BOOL(d3d_throttle_ui_paints, true, "GPU",
+                    "D3D12/D3D11: paint only for new game frames, not at the display's rate for the overlay");
+
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 

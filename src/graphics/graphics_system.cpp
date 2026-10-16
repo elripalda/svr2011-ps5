@@ -34,6 +34,10 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -164,6 +168,14 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+#if defined(_WIN32)
+        // [svr2011] a high-resolution waitable timer (Windows 10 1803+): the
+        // wait for a vblank sleeps until 0.25 ms before it instead of
+        // yielding through its last 2 ms (~12% of a core at 60 Hz - a lot on a
+        // 2-core laptop). Without one: as before.
+        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                              TIMER_ALL_ACCESS);
+#endif
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           // [svr2011] guest_vblank_hz > 0: vblanks at that rate (read every
@@ -182,6 +194,23 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
               continue;
             }
             const uint64_t left = last_frame_time + interval - current_time;
+            const uint64_t tail = guest_tick_frequency / 4000;  // (0.25 ms: spun)
+#if defined(_WIN32)
+            if (timer && left > tail) {
+              LARGE_INTEGER due;
+              due.QuadPart = -int64_t(double(left - tail) * 1e7 / double(guest_tick_frequency));  // (100 ns, relative)
+              if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+                WaitForSingleObject(timer, 100);
+                continue;
+              }
+            }
+#else
+            if (left > tail) {
+              std::this_thread::sleep_for(std::chrono::nanoseconds(
+                  int64_t(double(left - tail) * 1e9 / double(guest_tick_frequency))));
+              continue;
+            }
+#endif
             if (left > guest_tick_frequency / 500) {  // > 2 ms
               rex::thread::Sleep(std::chrono::milliseconds(1));
             } else {
@@ -197,6 +226,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           }
           rex::thread::Sleep(std::chrono::milliseconds(1));
         }
+#if defined(_WIN32)
+        if (timer) CloseHandle(timer);
+#endif
         return 0;
       }));
   // TODO: set_can_debugger_suspend not yet ported

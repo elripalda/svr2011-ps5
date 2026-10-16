@@ -59,6 +59,9 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+REXCVAR_DECLARE(bool, vsync);      // (presenter.cpp; on: FIFO - mailbox with vsync_vrr off)
+REXCVAR_DECLARE(bool, vsync_vrr);  // (presenter.cpp)
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -1382,7 +1385,21 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  // [svr2011] VSync on (the vsync setting): never tearing - mailbox (the
+  // newest image at each refresh, presents don't wait) where the driver has
+  // it, else FIFO (every driver has it; each image waits for the refresh,
+  // which paced frames 16 / 33 ms where mailbox exists).
+  // [svr2011] vsync_vrr (default): FIFO - each image for the next refresh,
+  // which variable refresh monitors follow; off: mailbox where there is one.
+  const bool vsync = REXCVAR_GET(vsync);
+  if (vsync) {
+    swapchain_create_info.presentMode =
+        !REXCVAR_GET(vsync_vrr) &&
+                std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
+                    present_modes.cend()
+            ? VK_PRESENT_MODE_MAILBOX_KHR
+            : VK_PRESENT_MODE_FIFO_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
@@ -1411,12 +1428,22 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
     return VK_NULL_HANDLE;
   }
+  const VkPresentModeKHR mode = swapchain_create_info.presentMode;
   REXLOG_INFO(
       "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
-      "{}, presentation mode {}",
+      "{}, presentation mode {} ({}; vsync {})",
       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
-      uint32_t(swapchain_create_info.presentMode));
+      uint32_t(mode),
+      mode == VK_PRESENT_MODE_FIFO_KHR           ? "FIFO"
+      : mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "FIFO relaxed"
+      : mode == VK_PRESENT_MODE_MAILBOX_KHR      ? "mailbox"
+      : mode == VK_PRESENT_MODE_IMMEDIATE_KHR    ? "immediate"
+                                                 : "other",
+      vsync ? "on" : "off");
+  REXLOG_INFO("VulkanPresenter: swapchain images asked {} (surface min {}, max {})",  // [svr2011]
+              swapchain_create_info.minImageCount, surface_capabilities.minImageCount,
+              surface_capabilities.maxImageCount);
 
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;
@@ -1530,17 +1557,27 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 // [svr2011] Mali (vendor 0x13B5): the 4x A53 tablets - the paint at the display's
-// rate cost a fifth of a core.
+// rate cost a fifth of a core. Adreno (0x5143): the same on the Fold 7 (Oct 2026).
 REXCVAR_DEFINE_STRING(vulkan_throttle_ui_paints, "auto", "GPU",
-                      "Paint only for new game frames, not at the display's rate for the overlay: auto (Mali "
-                      "GPUs), on, off");
+                      "Paint only for new game frames, not at the display's rate for the overlay: auto (PCs, Mali "
+                      "and Adreno GPUs), on, off");
+REXCVAR_DEFINE_STRING(vulkan_present_wait, "auto", "GPU",
+                      "Wait for each paint's GPU work before presenting (outside the queue lock): auto (Mali drivers "
+                      "older than r30), on, off");
 
 bool VulkanPresenter::ThrottleUIOnlyPaints() const {
   static const int mode = [] {
     const std::string v = REXCVAR_GET(vulkan_throttle_ui_paints);
     return v == "on" ? 1 : v == "off" ? 0 : -1;
   }();
-  return mode >= 0 ? mode == 1 : vulkan_device_->properties().vendorID == 0x13B5;
+  // (auto: PCs - one present per game frame, so variable refresh monitors follow
+  // the game, as with D3D12 / D3D11 - Mali and Adreno (Fold 7: the same pacing, half
+  // the paints at 30 fps); other phone GPUs stay off until measured there)
+#if defined(__ANDROID__)
+  return mode >= 0 ? mode == 1 : (vulkan_device_->properties().vendorID == 0x13B5 || vulkan_device_->properties().vendorID == 0x5143);
+#else
+  return mode >= 0 ? mode == 1 : true;
+#endif
 }
 
 // [svr2011] paint timing (phones: where the presenter's time goes)
@@ -2283,7 +2320,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // has finished everything queued - holding the only queue's lock, so the
     // game's and the renderer's submissions waited for the GPU and CPU and GPU
     // never overlapped. Wait for this paint here instead, without the lock.
-    static const bool wait_before_present = vulkan_device_->properties().vendorID == 0x13B5;
+    // vulkan_present_wait auto: old Mali drivers only (below r30 - the tablet's
+    // r20 has the queue lock problem; the A51's r38p1 doesn't, and there the
+    // wait held presents to ~10 a second while the renderer made ~28). ARM
+    // puts rXpY in driverVersion as major X, minor Y.
+    static const bool wait_before_present = [this] {
+      const auto& props = vulkan_device_->properties();
+      const uint32_t r = VK_API_VERSION_MAJOR(props.driverVersion), p = VK_API_VERSION_MINOR(props.driverVersion);
+      const std::string v = REXCVAR_GET(vulkan_present_wait);
+      const bool wait = v == "on" || v == "true" ||
+                        ((v == "auto" || v.empty()) && props.vendorID == 0x13B5 && r < 30);
+      REXLOG_INFO("VulkanPresenter: driver version 0x{:08X} (r{}p{}), vendor 0x{:04X}: wait before present {} ({})",
+                  props.driverVersion, r, p, props.vendorID, wait ? "on" : "off", v);
+      return wait;
+    }();
     if (wait_before_present) {
       const auto svr_tw = std::chrono::steady_clock::now();
       paint_context_.submission_tracker.AwaitSubmissionCompletion(

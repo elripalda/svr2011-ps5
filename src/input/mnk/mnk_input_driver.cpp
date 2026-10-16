@@ -182,6 +182,8 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       std::lock_guard lock(state_mutex_);
       attached_window_ = window;
     }
+    // (focus events from before the attach were missed: the window's own state)
+    has_focus_ = window->HasFocus();
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
   }
@@ -467,7 +469,9 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
   if (should_capture == mouse_captured_) {
     return;
   }
-  if (!should_capture) {
+  // (only for a window that really has the OS focus now - a test or game
+  // window in the background must leave the user's cursor alone)
+  if (!should_capture || !window->HasFocus()) {
     ReleaseMouseCaptureFromUIThread(window);
     return;
   }
@@ -503,7 +507,7 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
   }
   int32_t width = int32_t(window->GetActualPhysicalWidth());
   int32_t height = int32_t(window->GetActualPhysicalHeight());
-  if (width <= 0 || height <= 0) {
+  if (width <= 0 || height <= 0 || !window->HasFocus()) {
     return;
   }
   // Only once the pointer has drifted well off the middle, to keep warps rare.

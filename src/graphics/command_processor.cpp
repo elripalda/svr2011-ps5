@@ -37,7 +37,7 @@
 #include <rex/system/user_module.h>
 #include <rex/timeline.h>
 
-REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DECLARE(bool, vsync);  // [svr2011] (ui/presenter.cpp: the presenters read it too)
 
 // [svr2011] Diagnostics for command-processor stalls on PM4 WAIT_REG_MEM.
 REXCVAR_DEFINE_BOOL(gpu_log_waits, false, "GPU",

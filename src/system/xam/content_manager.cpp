@@ -50,6 +50,9 @@ static const char* kGameContentHeaderDirName = "Headers";
 
 static int content_device_id_ = 0;
 
+static ContentMountHook g_mount_hook = nullptr;  // [svr2011]
+void SetContentMountHook(ContentMountHook hook) { g_mount_hook = hook; }
+
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
                                const std::filesystem::path& package_path)
@@ -63,10 +66,12 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+  if (g_mount_hook) g_mount_hook(root_name_, package_path_, true);  // [svr2011]
 }
 
 ContentPackage::~ContentPackage() {
   auto fs = kernel_state_->file_system();
+  if (g_mount_hook) g_mount_hook(root_name_, package_path_, false);  // [svr2011]
   fs->UnregisterSymbolicLink(root_name_ + ":");
   fs->UnregisterDevice(device_path_);
   if (on_close_) {
