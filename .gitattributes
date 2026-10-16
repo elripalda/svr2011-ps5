@@ -6,3 +6,4 @@
 *.patch -text
 port/BUILD_COMMIT.txt export-subst
 *.sh text eol=lf
+README.md merge=ours
