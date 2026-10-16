@@ -97,7 +97,9 @@ class MnkInputDriver final : public InputDriver,
   std::atomic<bool> mouse_capture_requested_{false};
   std::atomic<bool> mouse_capture_update_queued_{false};
 
-  std::atomic<bool> has_focus_{true};
+  // (the window's real focus: taken from it on attach, then its focus events -
+  // never assumed, or a window that never had focus grabbed the mouse)
+  std::atomic<bool> has_focus_{false};
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

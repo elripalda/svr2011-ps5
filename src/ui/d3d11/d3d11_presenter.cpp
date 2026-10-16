@@ -3,6 +3,7 @@
 #include <rex/ui/d3d11/d3d11_presenter.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include <dxgi1_5.h>
@@ -13,6 +14,8 @@
 
 REXCVAR_DEFINE_BOOL(d3d11_allow_tearing, true, "UI/D3D11",
                     "Allow variable refresh rate and tearing (flip model swap chains)");
+REXCVAR_DECLARE(bool, vsync);  // (presenter.cpp; on: no tearing)
+REXCVAR_DECLARE(bool, d3d_throttle_ui_paints);  // (presenter.cpp)
 
 namespace rex::ui::d3d11 {
 
@@ -131,7 +134,10 @@ bool D3D11Presenter::GetBackBufferRTV() {
 Presenter::SurfacePaintConnectResult D3D11Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
     Surface& new_surface, uint32_t new_surface_width, uint32_t new_surface_height,
     bool was_paintable, bool& is_vsync_implicit_out) {
-  is_vsync_implicit_out = false;
+  // VSync on: Present waits for the refresh, so the presenter paints from the
+  // UI thread (not the guest output's). A change applies at the next connect.
+  vsync_ = REXCVAR_GET(vsync);
+  is_vsync_implicit_out = vsync_;
   const uint32_t width =
       std::min(new_surface_width, uint32_t(D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION));
   const uint32_t height =
@@ -246,9 +252,10 @@ Presenter::SurfacePaintConnectResult D3D11Presenter::ConnectOrReconnectPaintingT
   static bool logged = false;
   if (!logged) {
     logged = true;
-    REXLOG_INFO("D3D11Presenter: {} swap chain{}",
+    REXLOG_INFO("D3D11Presenter: {} swap chain{}; present: {}",
                 swap_chain_flip_ ? "flip model" : "blt model (no DXGI 1.2 flip model)",
-                (swap_chain_flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? ", tearing allowed" : "");
+                (swap_chain_flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? ", tearing allowed" : "",
+                vsync_ ? "vsync (sync interval 1)" : "no vsync (sync interval 0)");
   }
   return SurfacePaintConnectResult::kSuccess;
 }
@@ -291,6 +298,8 @@ bool D3D11Presenter::RefreshGuestOutputImpl(
   return refresher(context);
 }
 
+bool D3D11Presenter::ThrottleUIOnlyPaints() const { return REXCVAR_GET(d3d_throttle_ui_paints); }
+
 Presenter::PaintResult D3D11Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   if (!swap_chain_ || !back_buffer_rtv_) {
     return PaintResult::kNotPresented;
@@ -308,9 +317,18 @@ Presenter::PaintResult D3D11Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     }
   }
 
-  // A free back buffer first, without the context lock.
-  if (frame_latency_waitable_) {
-    WaitForSingleObjectEx(frame_latency_waitable_, 100, TRUE);
+  // A free back buffer first, without the context lock. None within 100 ms
+  // (the compositor isn't taking frames: an occluded / off-screen window, a
+  // busy desktop): this paint is skipped - Present with a full queue would
+  // block holding the context lock, and the guest's frames (replayed under
+  // that lock) would stand still meanwhile.
+  if (frame_latency_waitable_ &&
+      WaitForSingleObjectEx(frame_latency_waitable_, 100, TRUE) == WAIT_TIMEOUT) {
+    static uint32_t skipped = 0;
+    if (++skipped <= 3 || skipped % 600 == 0) {
+      REXLOG_WARN("D3D11Presenter: no free back buffer in 100 ms - paint skipped ({} so far)", skipped);
+    }
+    return PaintResult::kNotPresented;
   }
   std::lock_guard lock(provider_.context_mutex());
   ID3D11DeviceContext* context = provider_.GetContext();
@@ -366,10 +384,23 @@ Presenter::PaintResult D3D11Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ExecuteUIDrawersFromUIThread(ui_draw_context);
   }
 
-  // Present as soon as possible (no vsync wait: the guest's own rate decides),
-  // tearing allowed for variable refresh rate where the swap chain has it.
+  // VSync on: wait for the refresh (no tearing). Off: present as soon as
+  // possible (the guest's own rate decides), tearing allowed for variable
+  // refresh rate where the swap chain has it.
+  const bool vsync = vsync_;
+  const auto present_start = std::chrono::steady_clock::now();
   HRESULT hr = swap_chain_->Present(
-      0, (swap_chain_flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+      vsync ? 1 : 0,
+      !vsync && (swap_chain_flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+  // (a slow Present holds the context lock: say so in the log)
+  const double present_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - present_start).count();
+  if (present_ms >= 250.0) {
+    static uint32_t slow = 0;
+    if (++slow <= 10) {
+      REXLOG_WARN("D3D11Presenter: Present took {:.0f} ms (result {:08X})", present_ms, uint32_t(hr));
+    }
+  }
   // (Flip model unbinds the back buffer after Present.)
   context->ClearState();
   switch (hr) {

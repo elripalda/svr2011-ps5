@@ -147,6 +147,12 @@ class ContentPackage {
   uint32_t license_ = 0;
 };
 
+// [svr2011] Told as a package is mounted (after its "<root>:" link) and unmounted (before it goes): the game
+// can link its own files under that root (move_packs.cpp: a DLC's pacs merged with move packs).
+using ContentMountHook = void (*)(const std::string& root_name, const std::filesystem::path& package_path,
+                                  bool mounted);
+void SetContentMountHook(ContentMountHook hook);
+
 class ContentManager {
  public:
   ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path);

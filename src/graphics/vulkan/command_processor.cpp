@@ -898,6 +898,21 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
+  // [svr2011] No vertexPipelineStoresAndAtomics: an Arm Mali (every driver), whose geometry shaders are slow -
+  // points, rectangles and quads expanded / converted without them, as the launcher's Mali alpha mode sets,
+  // whatever the settings say (a start without alpha mode closed at once - 2.1.2 report).
+  if (!device_properties.vertexPipelineStoresAndAtomics &&
+      !(REXCVAR_GET(vulkan_force_expand_point_sprites_in_vs) &&
+        REXCVAR_GET(vulkan_force_expand_rectangle_lists_in_vs) &&
+        REXCVAR_GET(vulkan_force_convert_quad_lists_to_triangle_lists))) {
+    REXGPU_WARN(
+        "Vulkan: no vertexPipelineStoresAndAtomics (Mali) - points, rectangles and quads expanded in the "
+        "vertex shader (vulkan_force_* turned on)");
+    REXCVAR_SET(vulkan_force_expand_point_sprites_in_vs, true);
+    REXCVAR_SET(vulkan_force_expand_rectangle_lists_in_vs, true);
+    REXCVAR_SET(vulkan_force_convert_quad_lists_to_triangle_lists, true);
+  }
+
   primitive_processor_ =
       std::make_unique<VulkanPrimitiveProcessor>(*register_file_, *memory_, *shared_memory_, *this);
   if (!primitive_processor_->Initialize()) {

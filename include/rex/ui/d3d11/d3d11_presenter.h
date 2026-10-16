@@ -71,6 +71,7 @@ class D3D11Presenter final : public Presenter {
                               std::function<bool(GuestOutputRefreshContext& context)> refresher,
                               bool& is_8bpc_out_ref) override;
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  bool ThrottleUIOnlyPaints() const override;  // [svr2011] (d3d_throttle_ui_paints)
 
  private:
   struct GuestOutput {
@@ -106,6 +107,7 @@ class D3D11Presenter final : public Presenter {
   uint32_t swap_chain_height_ = 0;
   UINT swap_chain_flags_ = 0;
   bool swap_chain_flip_ = false;
+  bool vsync_ = false;  // (the vsync setting when the surface was connected)
   // Flip model on Windows 8.1+: signaled when a back buffer is free, waited
   // for before the context lock - Present then doesn't block with the lock
   // held (the native renderer submits on the same context).

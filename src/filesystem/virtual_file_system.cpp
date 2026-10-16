@@ -72,10 +72,23 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
   return true;
 }
 
+// [svr2011] Of the links a path starts with, the longest: a link for one file
+// ("dlc1:\pac\m_dlc02.pac", move_packs.cpp) wins over its device's ("dlc1:") -
+// the map's order picked either.
+static auto LongestSymbolicLink(const std::unordered_map<std::string, std::string>& links,
+                                const std::string_view path) {
+  auto best = links.cend();
+  for (auto it = links.cbegin(); it != links.cend(); ++it) {
+    if (rex::string::utf8_starts_with_case(path, it->first) &&
+        (best == links.cend() || it->first.size() > best->first.size())) {
+      best = it;
+    }
+  }
+  return best;
+}
+
 bool VirtualFileSystem::FindSymbolicLink(const std::string_view path, std::string& target) {
-  auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
-    return rex::string::utf8_starts_with_case(path, s.first);
-  });
+  auto it = LongestSymbolicLink(symlinks_, path);
   if (it == symlinks_.cend()) {
     return false;
   }
@@ -86,10 +99,8 @@ bool VirtualFileSystem::FindSymbolicLink(const std::string_view path, std::strin
 bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::string& result) {
   result = path;
   bool was_resolved = false;
-  while (true) {
-    auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
-      return rex::string::utf8_starts_with_case(result, s.first);
-    });
+  for (int hops = 0; hops < 16; ++hops) {  // [svr2011] (a link into itself can't hang the game)
+    auto it = LongestSymbolicLink(symlinks_, result);
     if (it == symlinks_.cend()) {
       break;
     }
@@ -192,10 +203,23 @@ bool VirtualFileSystem::DeletePath(const std::string_view path) {
   return parent->Delete(entry);
 }
 
-X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view path,
+X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view requested_path,
                                      FileDisposition creation_disposition, uint32_t desired_access,
                                      bool is_directory, bool is_non_directory, File** out_file,
                                      FileAction* out_action) {
+  // [svr2011] A link for this very file ("dlc1:\pac\m_dlc02.pac", move_packs.cpp - longer than its
+  // folder's path): the folder's resolution below would never see it.
+  std::string redirected;
+  if (!root_entry) {
+    auto global_lock = global_critical_region_.Acquire();
+    const auto canonical = rex::string::utf8_canonicalize_guest_path(requested_path);
+    auto it = LongestSymbolicLink(symlinks_, canonical);
+    if (it != symlinks_.cend() &&
+        it->first.size() > rex::string::utf8_find_base_guest_path(canonical).size() + 1) {
+      ResolveSymbolicLink(canonical, redirected);
+    }
+  }
+  const std::string_view path = redirected.empty() ? requested_path : std::string_view(redirected);
   // TODO(gibbed): should 'is_directory' remain as a bool or should it be
   // flipped to a generic FileAttributeFlags?
 

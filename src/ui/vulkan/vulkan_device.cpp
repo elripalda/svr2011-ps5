@@ -138,27 +138,30 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
           properties.deviceName);
       return nullptr;
     }
+    // [svr2011] A device without these is used with the fallbacks instead of refused (the game issues no
+    // vertex shader stores; geometry shaders and line fill have their own paths): a Mali-G610 started without
+    // the launcher's Mali alpha mode (which turns these requirements off) closed at once - 2.1.2 report.
     if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics) &&
         !supported_features.vertexPipelineStoresAndAtomics) {
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, but "
-          "vulkan_require_vertex_pipeline_stores_and_atomics=true",
+          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics: "
+          "vulkan_require_vertex_pipeline_stores_and_atomics turned off (memory export goes through compute)",
           properties.deviceName);
-      return nullptr;
+      REXCVAR_SET(vulkan_require_vertex_pipeline_stores_and_atomics, false);
     }
     if (REXCVAR_GET(vulkan_require_geometry_shader) && !supported_features.geometryShader) {
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support geometryShader, but "
-          "vulkan_require_geometry_shader=true",
+          "Vulkan device '{}' doesn't support geometryShader: vulkan_require_geometry_shader turned off "
+          "(primitives converted / expanded without it)",
           properties.deviceName);
-      return nullptr;
+      REXCVAR_SET(vulkan_require_geometry_shader, false);
     }
     if (REXCVAR_GET(vulkan_require_fill_mode_non_solid) && !supported_features.fillModeNonSolid) {
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support fillModeNonSolid, but "
-          "vulkan_require_fill_mode_non_solid=true",
+          "Vulkan device '{}' doesn't support fillModeNonSolid: vulkan_require_fill_mode_non_solid turned off "
+          "(line / point fill drawn solid)",
           properties.deviceName);
-      return nullptr;
+      REXCVAR_SET(vulkan_require_fill_mode_non_solid, false);
     }
   }
 
