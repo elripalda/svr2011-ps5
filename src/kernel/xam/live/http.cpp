@@ -10,10 +10,22 @@
 
 #include <mutex>
 
+#include <rex/platform.h>
+#if !REX_PLATFORM_PS5
 #include <curl/curl.h>
+#endif
 
 #include <rex/logging.h>
 
+#if REX_PLATFORM_PS5
+// [ps5] No libcurl yet: every request fails, so online play stays offline.
+namespace rex::kernel::xam::live {
+HttpResponse HttpRequest(const std::string& method, const std::string& url, const std::string&) {
+  REXKRNL_WARN("online: {} {} - no HTTP client on the PS5 yet", method, url);
+  return {};
+}
+}  // namespace rex::kernel::xam::live
+#else
 namespace rex::kernel::xam::live {
 
 namespace {
@@ -68,3 +80,5 @@ HttpResponse HttpRequest(const std::string& method, const std::string& url,
 }
 
 }  // namespace rex::kernel::xam::live
+
+#endif  // REX_PLATFORM_PS5

@@ -15,8 +15,11 @@
 #include <string>
 #include <thread>
 
+#include <rex/platform.h>
+#if !REX_PLATFORM_PS5
 #include <miniupnpc.h>
 #include <upnpcommands.h>
+#endif
 
 #include <rex/kernel/xam/live/addressing.h>
 #include <rex/kernel/xam/live/relay_protocol.h>
@@ -26,6 +29,18 @@ REXCVAR_DEFINE_BOOL(wwe_online_upnp, false, "Kernel",
                     "Online play: map the game's peer ports on the router with UPnP, so "
                     "players elsewhere can reach this PC directly");
 
+#if REX_PLATFORM_PS5
+// [ps5] No miniupnpc yet: no port mapping.
+namespace rex::kernel::xam::live::upnp {
+bool Enabled() { return false; }
+PortMap MapPorts() { return {}; }
+void RemoveMappings() {}
+PeerPorts& Peers() {
+  static PeerPorts peers;
+  return peers;
+}
+}  // namespace rex::kernel::xam::live::upnp
+#else
 namespace rex::kernel::xam::live::upnp {
 
 namespace {
@@ -187,3 +202,5 @@ PeerPorts& Peers() {
 }
 
 }  // namespace rex::kernel::xam::live::upnp
+
+#endif  // REX_PLATFORM_PS5

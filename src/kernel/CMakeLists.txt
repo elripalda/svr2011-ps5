@@ -79,6 +79,10 @@ target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
 target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
 
+if(REX_PS5)
+    # [ps5] No libcurl or miniupnpc on the PS5 yet: online play's HTTP requests fail (offline) and
+    # UPnP is off (src/kernel/xam/live/http.cpp, upnp.cpp).
+else()
 # WWE All Stars recomp, online play: the client ported from the Xenia netplay fork talks
 # HTTP(S) to the game server with libcurl (Schannel) and reads its JSON with rapidjson, from
 # the source folders scripts/bootstrap.ps1 fetches at the fork's pinned commits.
@@ -121,3 +125,4 @@ set(UPNPC_NO_INSTALL ON CACHE BOOL "" FORCE)
 add_subdirectory(${REXGLUE_MINIUPNPC_SOURCE_DIR} ${CMAKE_BINARY_DIR}/thirdparty/miniupnpc
     EXCLUDE_FROM_ALL)
 target_link_libraries(rexruntime PRIVATE libminiupnpc-static)
+endif()
