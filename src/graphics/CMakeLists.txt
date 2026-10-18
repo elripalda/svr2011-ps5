@@ -17,6 +17,7 @@ set(REXGPU_XENOS_SOURCES
 
     # GPU system
     graphics_system.cpp
+    null/graphics_system.cpp
     command_processor.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp

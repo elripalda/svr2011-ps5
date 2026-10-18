@@ -53,6 +53,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
 
+  // Logs the removal reason and DRED breadcrumbs / page fault (public so the
+  // graphics system can report a loss first noticed by the presenter).
+  void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
+
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
@@ -329,7 +333,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     CheckSubmissionFence(submission_current_);
     return submission_completed_ + 1 >= submission_current_;
   }
-  void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
 
   void UpdateDebugMarkersEnabled();
   void PushDebugMarker(const char* format, ...);

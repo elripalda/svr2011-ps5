@@ -99,6 +99,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   virtual std::unique_ptr<CommandProcessor> CreateCommandProcessor() = 0;
 
+  // Backend-specific details of a host GPU loss, logged before the fatal error.
+  virtual void LogHostGpuLossDiagnostics() {}
+
   static uint32_t ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr);
   static void WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr,
                                  uint32_t value);

@@ -217,6 +217,9 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
   }
+  REXGPU_ERROR("Host GPU lost (is_responsible={})", is_responsible);
+  LogHostGpuLossDiagnostics();
+  rex::FlushLogging();  // FatalError aborts without flushing the log file.
   rex::FatalError("Graphics device lost (probably due to an internal error)");
 }
 

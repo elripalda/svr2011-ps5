@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdlib>
 
 #include <rex/cvar.h>
@@ -21,6 +22,10 @@
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(d3d12_gpu_validation, false, "UI/D3D12",
+                    "Enable D3D12 GPU-based validation (requires d3d12_debug; very slow)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
@@ -222,24 +227,34 @@ bool D3D12Provider::Initialize() {
     ID3D12Debug* debug_interface;
     if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&debug_interface)))) {
       debug_interface->EnableDebugLayer();
+      if (REXCVAR_GET(d3d12_gpu_validation)) {
+        ID3D12Debug1* debug_interface_1;
+        if (SUCCEEDED(debug_interface->QueryInterface(IID_PPV_ARGS(&debug_interface_1)))) {
+          debug_interface_1->SetEnableGPUBasedValidation(TRUE);
+          debug_interface_1->Release();
+          REXLOG_INFO("Direct3D 12 GPU-based validation enabled");
+        } else {
+          REXLOG_WARN("Failed to enable Direct3D 12 GPU-based validation");
+        }
+      }
       debug_interface->Release();
     } else {
       REXLOG_WARN("Failed to enable the Direct3D 12 debug layer");
       debug = false;
     }
-
-    // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes.
-    {
-      Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
-      if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
-        dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
-      } else {
-        REXLOG_WARN(
-            "Failed to enable DRED - device removal diagnostics will be "
-            "limited");
-      }
+  }
+  // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes. Always on, not only
+  // with the debug layer: a device loss in normal play is otherwise undiagnosable (WWE 2008 port).
+  {
+    Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
+    if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
+      dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
+    } else {
+      REXLOG_WARN(
+          "Failed to enable DRED - device removal diagnostics will be "
+          "limited");
     }
   }
   // Create the DXGI factory.
@@ -350,6 +365,34 @@ bool D3D12Provider::Initialize() {
     }
     if (REXCVAR_GET(d3d12_break_on_warning)) {
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
+    }
+    // Forward debug layer messages to the log (otherwise they only reach an attached debugger).
+    ID3D12InfoQueue1* d3d12_info_queue_1;
+    if (SUCCEEDED(d3d12_info_queue->QueryInterface(IID_PPV_ARGS(&d3d12_info_queue_1)))) {
+      DWORD callback_cookie = 0;
+      auto callback = [](D3D12_MESSAGE_CATEGORY category, D3D12_MESSAGE_SEVERITY severity,
+                         D3D12_MESSAGE_ID id, LPCSTR description, void*) {
+        static std::atomic<uint32_t> logged_count{0};
+        constexpr uint32_t kMaxLogged = 1000;
+        uint32_t index = logged_count.fetch_add(1, std::memory_order_relaxed);
+        if (index > kMaxLogged) {
+          return;
+        }
+        if (index == kMaxLogged) {
+          REXLOG_WARN("D3D12 debug: message limit reached, further messages are not logged");
+          return;
+        }
+        if (severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+          REXLOG_ERROR("D3D12 debug [cat {} id {}]: {}", int(category), int(id), description);
+        } else {
+          REXLOG_WARN("D3D12 debug [cat {} id {}]: {}", int(category), int(id), description);
+        }
+      };
+      if (SUCCEEDED(d3d12_info_queue_1->RegisterMessageCallback(
+              callback, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &callback_cookie))) {
+        REXLOG_INFO("D3D12 debug layer messages are forwarded to the log");
+      }
+      d3d12_info_queue_1->Release();
     }
     d3d12_info_queue->Release();
   }

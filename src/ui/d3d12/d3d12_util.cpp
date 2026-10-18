@@ -113,5 +113,18 @@ void CreateBufferTypedUAV(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE hand
   device->CreateUnorderedAccessView(buffer, nullptr, &desc, handle);
 }
 
+void LogShaderVisibleDescriptorHeap(ID3D12Device* device, ID3D12DescriptorHeap* heap,
+                                    const char* name) {
+  if (!device || !heap) {
+    return;
+  }
+  D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
+  uint64_t start = heap->GetGPUDescriptorHandleForHeapStart().ptr;
+  uint64_t end = start + uint64_t(desc.NumDescriptors) *
+                             device->GetDescriptorHandleIncrementSize(desc.Type);
+  REXLOG_INFO("Descriptor heap '{}': GPU 0x{:016X}-0x{:016X} ({} descriptors)", name, start, end,
+              desc.NumDescriptors);
+}
+
 }  // namespace util
 }  // namespace rex::ui::d3d12

@@ -959,6 +959,8 @@ bool D3D12CommandProcessor::SetupContext() {
     view_bindless_heap_cpu_start_ = view_bindless_heap_->GetCPUDescriptorHandleForHeapStart();
     view_bindless_heap_gpu_start_ = view_bindless_heap_->GetGPUDescriptorHandleForHeapStart();
     view_bindless_heap_allocated_ = uint32_t(SystemBindlessView::kCount);
+    ui::d3d12::util::LogShaderVisibleDescriptorHeap(device, view_bindless_heap_,
+                                                    "bindless view");
 
     D3D12_DESCRIPTOR_HEAP_DESC sampler_bindless_heap_desc;
     sampler_bindless_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
@@ -975,6 +977,8 @@ bool D3D12CommandProcessor::SetupContext() {
     sampler_bindless_heap_gpu_start_ =
         sampler_bindless_heap_current_->GetGPUDescriptorHandleForHeapStart();
     sampler_bindless_heap_allocated_ = 0;
+    ui::d3d12::util::LogShaderVisibleDescriptorHeap(device, sampler_bindless_heap_current_,
+                                                    "bindless sampler");
   } else {
     view_bindful_heap_pool_ = std::make_unique<ui::d3d12::D3D12DescriptorHeapPool>(
         device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViewBindfulHeapSize);
@@ -2398,9 +2402,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
     return false;
   }
-  if (REXCVAR_GET(async_shader_compilation) &&
-      pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+  if (REXCVAR_GET(async_shader_compilation)) {
+    if (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
+      return true;
+    }
+    // The pipeline may have finished compiling after ConfigurePipeline read its placeholder
+    // (vertex-shader-only) root signature; binding that with the final pipeline is undefined.
+    root_signature = pipeline_cache_->GetRootSignatureByHandle(pipeline_handle);
   }
 
   // Update the textures - this may bind pipelines.
@@ -3244,6 +3252,22 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
   if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) && page_fault.PageFaultVA != 0) {
     REXGPU_ERROR("DRED page fault at VA 0x{:016X}", page_fault.PageFaultVA);
+    // Allocations D3D12 matched to the faulting VA: live ones point at an out-of-bounds access,
+    // recently freed ones at a use-after-free.
+    auto log_allocations = [](const char* what, const D3D12_DRED_ALLOCATION_NODE* node) {
+      for (int i = 0; node && i < 16; node = node->pNext, ++i) {
+        std::string name = node->ObjectNameA ? node->ObjectNameA : "";
+        if (name.empty() && node->ObjectNameW) {
+          for (const wchar_t* c = node->ObjectNameW; *c; ++c) {
+            name.push_back(char(*c < 0x80 ? *c : '?'));
+          }
+        }
+        REXGPU_ERROR("  {} allocation: type {} '{}'", what, static_cast<int>(node->AllocationType),
+                     name);
+      }
+    };
+    log_allocations("existing", page_fault.pHeadExistingAllocationNode);
+    log_allocations("recently freed", page_fault.pHeadRecentFreedAllocationNode);
   }
 }
 
@@ -4326,6 +4350,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
           sampler_bindless_heap_gpu_start_ =
               sampler_bindless_heap_current_->GetGPUDescriptorHandleForHeapStart();
           sampler_bindless_heap_allocated_ = 0;
+          ui::d3d12::util::LogShaderVisibleDescriptorHeap(
+              device, sampler_bindless_heap_current_, "bindless sampler (after overflow)");
           // The only thing the heap is used for now is texture cache samplers -
           // invalidate all of them.
           texture_cache_bindless_sampler_map_.clear();

@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <cstdint>
+
 #include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
@@ -35,8 +38,27 @@ XmpApp::XmpApp(KernelState* kernel_state)
       next_playlist_handle_(1),
       next_song_handle_(1) {}
 
+namespace {
+
+// The status/controller queries below sleep on non-main threads, for games that poll them in a
+// tight loop. Games that poll a few times per frame (WWE SmackDown vs. Raw 2008 does, from its frame
+// thread) would then lose 1-10 ms every frame, so only throttle a thread that really hammers: more
+// than ~1000 calls per second.
+bool IsHammeringXmp() {
+  thread_local auto window_start = std::chrono::steady_clock::now();
+  thread_local uint32_t calls = 0;
+  auto now = std::chrono::steady_clock::now();
+  if (now - window_start > std::chrono::milliseconds(100)) {
+    window_start = now;
+    calls = 0;
+  }
+  return ++calls > 100;
+}
+
+}  // namespace
+
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
-  if (!XThread::GetCurrentThread()->main_thread()) {
+  if (!XThread::GetCurrentThread()->main_thread() && IsHammeringXmp()) {
     // Some stupid games will hammer this on a thread - induce a delay
     // here to keep from starving real threads.
     rex::thread::Sleep(std::chrono::milliseconds(1));
@@ -408,7 +430,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
 
-      if (!XThread::GetCurrentThread()->main_thread()) {
+      if (!XThread::GetCurrentThread()->main_thread() && IsHammeringXmp()) {
         // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
         rex::thread::Sleep(std::chrono::milliseconds(10));
       }

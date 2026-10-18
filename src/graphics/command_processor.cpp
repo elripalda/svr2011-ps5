@@ -37,6 +37,10 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(gpu_thread_above_normal_priority, true, "GPU",
+                    "Run the GPU command thread above normal priority, so other busy programs "
+                    "(a recorder encoding on the CPU, a browser) don't slow down rendering");
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -143,6 +147,11 @@ bool CommandProcessor::Initialize() {
       }));
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
+  // Every draw is translated on this thread; when it loses its core to another program the
+  // game drops frames, so let the OS prefer it over normal-priority work.
+  if (REXCVAR_GET(gpu_thread_above_normal_priority) && worker_thread_->thread()) {
+    worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kAboveNormal);
+  }
 
   return true;
 }
@@ -989,6 +998,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  constexpr auto kPollBeforeSleep = std::chrono::milliseconds(2);
+  bool spin_started = false;
+  std::chrono::steady_clock::time_point spin_start;
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1030,7 +1042,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
-      // Wait.
+      // Wait. The first couple of milliseconds poll (yielding) rather than sleep: games wait
+      // here for a value the CPU is about to write (SvR: a semaphore its D3D clears), and a
+      // 1 ms sleep can take several ms depending on the system timer, which leaves the command
+      // processor behind and the game then waits for it at its frame throttle.
+      if (!spin_started) {
+        spin_started = true;
+        spin_start = std::chrono::steady_clock::now();
+      }
+      if (wait >= 0x100 && std::chrono::steady_clock::now() - spin_start < kPollBeforeSleep) {
+        rex::thread::MaybeYield();
+        continue;
+      }
       if (wait >= 0x100) {
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {

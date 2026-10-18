@@ -23,6 +23,7 @@
 #include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/env.h>
@@ -219,7 +220,13 @@ void InitLogging(const LogConfig& config) {
   // File sink (rotating) with sequential naming fallback
   std::string resolved_path;
   if (config.log_file) {
-    resolved_path = config.log_file;
+    // A bare file name (the shipped toml's "game.log") goes next to the exe, not into whatever
+    // folder the game was started from. A relative path with folders in it (the codegen tool's
+    // logs\codegen.log) stays relative to the working directory.
+    std::filesystem::path path(config.log_file);
+    if (path.is_relative() && !path.has_parent_path())
+      path = rex::filesystem::GetExecutableFolder() / path;
+    resolved_path = path.string();
   } else if (!config.app_name.empty()) {
     auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
                                           : std::filesystem::path(config.log_dir);

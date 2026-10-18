@@ -96,6 +96,11 @@ class PipelineCache {
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
+  // Async creation publishes the final root signature before the state, so after seeing a
+  // non-null state this returns the root signature the pipeline was created with.
+  ID3D12RootSignature* GetRootSignatureByHandle(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)->root_signature.load(std::memory_order_acquire);
+  }
 
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {

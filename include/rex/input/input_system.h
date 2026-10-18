@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -55,6 +56,10 @@ class InputSystem : public system::IInputSystem {
   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
 
   rex::ui::Window* window_ = nullptr;
+
+  // Guest threads and the UI thread (overlay menus reading the pad) both query devices, and every
+  // query re-enumerates them.
+  std::recursive_mutex mutex_;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 

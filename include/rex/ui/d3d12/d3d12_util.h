@@ -84,5 +84,10 @@ void CreateBufferTypedUAV(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE hand
                           ID3D12Resource* buffer, DXGI_FORMAT format, uint32_t num_elements,
                           uint64_t first_element = 0);
 
+// Logs a shader-visible descriptor heap's GPU handle range. DRED does not track descriptor heaps,
+// so this is how a page-fault VA just past a heap's end can be recognized.
+void LogShaderVisibleDescriptorHeap(ID3D12Device* device, ID3D12DescriptorHeap* heap,
+                                    const char* name);
+
 }  // namespace util
 }  // namespace rex::ui::d3d12

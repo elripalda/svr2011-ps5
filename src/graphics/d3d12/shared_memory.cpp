@@ -79,6 +79,9 @@ bool D3D12SharedMemory::Initialize() {
     }
   }
   buffer_gpu_address_ = buffer_->GetGPUVirtualAddress();
+  // For matching DRED page-fault VAs against the shared memory buffer.
+  REXGPU_INFO("Shared memory: buffer at GPU VA 0x{:016X}-0x{:016X}", buffer_gpu_address_,
+              buffer_gpu_address_ + kBufferSize);
   buffer_uav_writes_commit_needed_ = false;
 
   D3D12_DESCRIPTOR_HEAP_DESC buffer_descriptor_heap_desc;

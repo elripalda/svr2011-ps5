@@ -302,6 +302,9 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
   }
   if (destroyed_any) {
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+    REXGPU_INFO("Texture cache: evicted down to {} MB, {} textures (limits {}/{} MB)",
+                (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20,
+                textures_.size(), limit_soft_mb, limit_hard_mb);
   }
 }
 

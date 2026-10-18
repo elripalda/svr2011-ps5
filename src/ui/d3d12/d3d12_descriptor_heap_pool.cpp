@@ -12,6 +12,7 @@
 #include <rex/assert.h>
 #include <rex/logging.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
+#include <rex/ui/d3d12/d3d12_util.h>
 
 namespace rex::ui::d3d12 {
 
@@ -128,6 +129,9 @@ uint64_t D3D12DescriptorHeapPool::Request(uint64_t submission_index, uint64_t pr
       REXLOG_ERROR("Failed to create a heap for {} shader-visible descriptors", page_size_);
       return kHeapIndexInvalid;
     }
+    util::LogShaderVisibleDescriptorHeap(
+        device_, new_heap.Get(),
+        type_ == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? "pool sampler page" : "pool view page");
     writable_first_ = new Page;
     writable_first_->heap = new_heap;
     writable_first_->cpu_start = new_heap->GetCPUDescriptorHandleForHeapStart();
