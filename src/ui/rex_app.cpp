@@ -223,7 +223,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
-  if (!std::filesystem::is_directory(paths.game_data_root)) {
+  // A folder of game files, or an Xbox 360 disc image file.
+  if (!std::filesystem::is_directory(paths.game_data_root) &&
+      !std::filesystem::is_regular_file(paths.game_data_root)) {
     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
@@ -278,8 +280,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   std::string xex_image = "game:\\default.xex";
   OnLoadXexImage(xex_image);
 
-  // Mirrors the game:\ / d:\ -> game_data_root mapping in Runtime::SetupVfs.
-  {
+  // Mirrors the game:\ / d:\ -> game_data_root mapping in Runtime::SetupVfs. A disc image is
+  // checked by LoadXexImage itself (the file is inside the image, not on the host).
+  if (std::filesystem::is_directory(paths.game_data_root)) {
     constexpr std::string_view kGameDevice = "game:\\";
     constexpr std::string_view kDDevice = "d:\\";
     std::string_view tail = xex_image;
@@ -386,9 +389,9 @@ bool ReXApp::SetupPresentation() {
       }
     }
     window_->SetPresenter(presenter);
-  } else if (!graphics_system) {
+  } else {
     // Detached mode: the app brings its own renderer and drives its own paint
-    // loop. ReXApp owns the returned drawer via immediate_drawer_.
+    // loop (no graphics system, or a presenter-less one such as the null GPU). ReXApp owns the returned drawer via immediate_drawer_.
     immediate_drawer_ = OnCreateImmediateDrawer();
     if (immediate_drawer_) {
       SetupOverlays(/*presenter=*/nullptr, immediate_drawer_.get());

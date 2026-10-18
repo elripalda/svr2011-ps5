@@ -44,6 +44,15 @@ REXCVAR_DECLARE(bool, vsync);  // [svr2011] (ui/presenter.cpp: the presenters re
 REXCVAR_DEFINE_BOOL(gpu_log_waits, false, "GPU",
                     "Log WAIT_REG_MEM statistics (count, time, polled address) every 5 s");
 
+// [svr2008] off by default here (the SvR 2008 port turns it on)
+REXCVAR_DEFINE_BOOL(gpu_thread_above_normal_priority, false, "GPU",
+                    "Run the GPU command thread above normal priority, so other busy programs "
+                    "(a recorder encoding on the CPU, a browser) don't slow down rendering");
+
+REXCVAR_DEFINE_INT32(gpu_wait_poll_us, 0, "GPU",
+                     "[svr2008] Microseconds a WAIT_REG_MEM polls (yielding) before it sleeps; 0 = "
+                     "sleep straight away");
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -150,6 +159,11 @@ bool CommandProcessor::Initialize() {
       }));
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
+  // Every draw is translated on this thread; when it loses its core to another program the
+  // game drops frames, so let the OS prefer it over normal-priority work.
+  if (REXCVAR_GET(gpu_thread_above_normal_priority) && worker_thread_->thread()) {
+    worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kAboveNormal);
+  }
 
   return true;
 }
@@ -1047,6 +1061,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t polls = 0;
   const bool trace = rex::timeline::Enabled();
 
+  // [svr2008] poll (yielding) for gpu_wait_poll_us before sleeping
+  const int64_t poll_us = REXCVAR_GET(gpu_wait_poll_us);
+  bool spin_started = false;
+  std::chrono::steady_clock::time_point spin_start;
   bool matched = false;
   do {
     ++polls;
@@ -1096,7 +1114,21 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
                     polls, is_memory ? "memory" : "register", poll_reg_addr,
                     wait_info & 0x7, ref, mask, value);
       if (trace && polls == 1) rex::timeline::Record(rex::timeline::kGpuWaitBegin, poll_reg_addr, ref);
-      // Wait.
+      // Wait. [svr2008] The first couple of milliseconds poll (yielding) rather than sleep:
+      // games wait here for a value the CPU is about to write (SvR: a semaphore its D3D
+      // clears), and a 1 ms sleep can take several ms, which leaves the command processor
+      // behind and the game then waits for it at its frame throttle. Off unless asked for.
+      if (poll_us > 0 && wait >= 0x100) {
+        if (!spin_started) {
+          spin_started = true;
+          spin_start = std::chrono::steady_clock::now();
+        }
+        if (std::chrono::steady_clock::now() - spin_start < std::chrono::microseconds(poll_us)) {
+          --polls;  // (not a wait yet)
+          rex::thread::MaybeYield();
+          continue;
+        }
+      }
       if (wait >= 0x100) {
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {

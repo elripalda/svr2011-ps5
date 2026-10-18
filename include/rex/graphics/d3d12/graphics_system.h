@@ -31,6 +31,7 @@ class D3D12GraphicsSystem : public GraphicsSystem {
  protected:
   void CreateProvider(bool with_presentation) override;
   std::unique_ptr<CommandProcessor> CreateCommandProcessor() override;
+  void LogHostGpuLossDiagnostics() override;
 };
 
 }  // namespace rex::graphics::d3d12

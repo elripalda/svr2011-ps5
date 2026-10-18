@@ -14,6 +14,7 @@
 #include <rex/logging.h>
 #include <rex/system/gpu_plugin.h>
 
+#include <rex/graphics/null/graphics_system.h>
 #if REX_HAS_D3D12
 #include <rex/graphics/d3d12/graphics_system.h>
 #endif
@@ -41,6 +42,10 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
   }
 
   std::string_view backend = info->backend ? info->backend : "any";
+  // Synchronization-only guest GPU for apps with their own renderer (never picked by "any").
+  if (backend == "null") {
+    return new rex::graphics::null_gpu::NullGraphicsSystem();
+  }
 #if REX_HAS_D3D11
   // [svr2011] Only when asked for ("any" never picks it here: the app chooses
   // it before loading the plugin when D3D12 and Vulkan can't run).

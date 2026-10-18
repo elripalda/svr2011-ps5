@@ -47,4 +47,14 @@ std::unique_ptr<CommandProcessor> D3D12GraphicsSystem::CreateCommandProcessor() 
   return std::unique_ptr<CommandProcessor>(new D3D12CommandProcessor(this, kernel_state_));
 }
 
+void D3D12GraphicsSystem::LogHostGpuLossDiagnostics() {
+  auto* command_processor = static_cast<D3D12CommandProcessor*>(this->command_processor());
+  auto* provider = static_cast<rex::ui::d3d12::D3D12Provider*>(provider_.get());
+  if (!command_processor || !provider || !provider->GetDevice()) {
+    return;
+  }
+  ID3D12Device* device = provider->GetDevice();
+  command_processor->LogDeviceRemovalDiagnostics(device, device->GetDeviceRemovedReason());
+}
+
 }  // namespace rex::graphics::d3d12

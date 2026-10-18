@@ -67,6 +67,10 @@ class InputSystem : public system::IInputSystem {
 
   rex::ui::Window* window_ = nullptr;
 
+  // Guest threads and the UI thread (overlay menus reading the pad) both query devices, and every
+  // query re-enumerates them.
+  std::recursive_mutex mutex_;
+
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 
   std::unique_ptr<DeviceAssignment> assignment_;

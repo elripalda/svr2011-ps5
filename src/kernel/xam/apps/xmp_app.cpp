@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <cstdint>
+
 #include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
@@ -28,6 +31,10 @@
 REXCVAR_DEFINE_BOOL(xmp_throttle, true, "Kernel",
                     "Sleep in XMPGetStatus/XMPGetPlaybackController when called off the main "
                     "thread (workaround for titles that poll XMP in a tight loop)");
+
+REXCVAR_DEFINE_BOOL(xmp_throttle_hammering_only, false, "Kernel",
+                    "[svr2008] With xmp_throttle, sleep only on a thread that polls XMP more than "
+                    "~1000 times a second");
 
 namespace rex {
 namespace kernel {
@@ -84,8 +91,28 @@ XmpApp::XmpApp(KernelState* kernel_state)
       next_playlist_handle_(1),
       next_song_handle_(1) {}
 
+namespace {
+
+// The status/controller queries below sleep on non-main threads, for games that poll them in a
+// tight loop. Games that poll a few times per frame (WWE SmackDown vs. Raw 2008 does, from its frame
+// thread) would then lose 1-10 ms every frame, so only throttle a thread that really hammers: more
+// than ~1000 calls per second.
+bool IsHammeringXmp() {
+  thread_local auto window_start = std::chrono::steady_clock::now();
+  thread_local uint32_t calls = 0;
+  auto now = std::chrono::steady_clock::now();
+  if (now - window_start > std::chrono::milliseconds(100)) {
+    window_start = now;
+    calls = 0;
+  }
+  return ++calls > 100;
+}
+
+}  // namespace
+
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
-  if (REXCVAR_GET(xmp_throttle) && !XThread::GetCurrentThread()->main_thread()) {
+  if (REXCVAR_GET(xmp_throttle) && !XThread::GetCurrentThread()->main_thread() &&
+      (!REXCVAR_GET(xmp_throttle_hammering_only) || IsHammeringXmp())) {
     // Some stupid games will hammer this on a thread - induce a delay
     // here to keep from starving real threads.
     rex::thread::Sleep(std::chrono::milliseconds(1));
@@ -493,7 +520,8 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                        user_playlist_playing_ ? 1 : 0);
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
 
-      if (REXCVAR_GET(xmp_throttle) && !XThread::GetCurrentThread()->main_thread()) {
+      if (REXCVAR_GET(xmp_throttle) && !XThread::GetCurrentThread()->main_thread() &&
+          (!REXCVAR_GET(xmp_throttle_hammering_only) || IsHammeringXmp())) {
         // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
         rex::thread::Sleep(std::chrono::milliseconds(10));
       }
