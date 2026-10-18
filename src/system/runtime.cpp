@@ -11,6 +11,7 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
 #include <rex/filesystem/vfs.h>
@@ -325,7 +326,21 @@ bool Runtime::SetupVfs() {
   // Mount update_data_root as update:\ if provided
   if (!update_data_root_.empty()) {
     auto abs_update_root = std::filesystem::absolute(update_data_root_);
-    if (std::filesystem::exists(abs_update_root)) {
+    std::error_code update_ec;
+    if (std::filesystem::is_regular_file(abs_update_root, update_ec)) {
+      // [ps5] A title update package as it comes off the console (an STFS file such as
+      // tu00000005_00000000), read in place: no unpacking needed.
+      auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
+      auto update_device =
+          std::make_unique<rex::filesystem::StfsContainerDevice>(update_mount, abs_update_root);
+      if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
+        file_system_->RegisterSymbolicLink("update:", update_mount);
+        REXSYS_INFO("  Mounted the title update package {} at update:", abs_update_root.string());
+      } else {
+        REXSYS_ERROR("  {} is not a title update package that can be read",
+                     abs_update_root.string());
+      }
+    } else if (std::filesystem::exists(abs_update_root)) {
       auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
       auto update_device =
           std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
