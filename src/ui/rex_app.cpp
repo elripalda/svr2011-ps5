@@ -35,6 +35,7 @@
 #include <rex/kernel/init.h>
 #include <rex/kernel/xam/live/upnp.h>
 #include <rex/string/numeric.h>
+#include <rex/string/utf8.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
 #include <rex/system/external_frame.h>
@@ -296,7 +297,30 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     std::string host_tail{tail};
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
-    if (!std::filesystem::is_regular_file(xex_host)) {
+    std::error_code xex_ec;
+    if (!std::filesystem::is_regular_file(xex_host, xex_ec)) {
+      // The VFS matches names in any letter case; so does this check on a case-sensitive
+      // host (a disc copied as Default.xex).
+      std::filesystem::path found = paths.game_data_root;
+      for (const auto& part : std::filesystem::path(host_tail)) {
+        std::filesystem::path next;
+        for (std::filesystem::directory_iterator it(found, xex_ec), end; !xex_ec && it != end;
+             it.increment(xex_ec)) {
+          if (rex::string::utf8_equal_case(rex::path_to_utf8(it->path().filename()),
+                                           rex::path_to_utf8(part))) {
+            next = it->path();
+            break;
+          }
+        }
+        if (next.empty()) {
+          found.clear();
+          break;
+        }
+        found = next;
+      }
+      if (!found.empty()) xex_host = found;
+    }
+    if (!std::filesystem::is_regular_file(xex_host, xex_ec)) {
       auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
