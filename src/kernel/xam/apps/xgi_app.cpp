@@ -15,6 +15,8 @@
 #include <cstring>
 
 #include <rex/kernel/xam/online_hooks.h>
+#include <rex/kernel/xam/live/live.h>
+#include <rex/kernel/xam/live/xsession.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -38,6 +40,35 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     if (auto result = hooks.xgi(message, buffer_ptr, buffer_length)) return *result;
   }
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
+  if (live::Enabled()) {
+    auto u32 = [&](uint32_t at) { return memory::load_and_swap<uint32_t>(buffer + at); };
+    auto u16 = [&](uint32_t at) { return uint32_t(memory::load_and_swap<uint16_t>(buffer + at)); };
+    switch (message) {
+      case 0x000B0010:  // XSessionCreate
+        return live::SessionCreate(u32(0), u32(4), u32(8), u32(12), u32(16), u32(20), u32(24));
+      case 0x000B0011:  // XSessionDelete
+        return live::SessionDelete(u32(0));
+      case 0x000B0012:  // XSessionJoinLocal / JoinRemote
+        return live::SessionJoin(u32(0), u32(4), u32(8), u32(12), u32(16));
+      case 0x000B0013:  // XSessionLeaveLocal / LeaveRemote
+        return live::SessionLeave(u32(0), u32(4), u32(8), u32(12));
+      case 0x000B0014:  // XSessionStart
+        return live::SessionStart(u32(0));
+      case 0x000B0015:  // XSessionEnd
+        return live::SessionEnd(u32(0));
+      case 0x000B0016:  // XSessionSearch
+        return live::SessionSearch(u32(0), u32(4), u32(8), u16(14), u32(20), u32(24), u32(28), 1);
+      case 0x000B0018:  // XSessionModify
+        return live::SessionModify(u32(0), u32(4), u32(8), u32(12));
+      case 0x000B001C:  // XSessionSearchEx
+        return live::SessionSearch(u32(0), u32(4), u32(8), u16(14), u32(20), u32(24), u32(28),
+                                   u32(32));
+      case 0x000B001D:  // XSessionGetDetails
+        return live::SessionDetails(u32(0), u32(4), u32(8));
+      default:
+        break;
+    }
+  }
   switch (message) {
     case 0x000B0006: {
       assert_true(!buffer_length || buffer_length == 24);
@@ -51,6 +82,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
       REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                     context_value);
+      live::SetUserContext(user_index, context_id, context_value);
       return X_E_SUCCESS;
     }
     case 0x000B0007: {
@@ -60,6 +92,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
       REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
                     value_size, value_ptr);
+      if (value_ptr && value_size) {
+        live::SetUserProperty(user_index, live::GuestProperty(
+                                              property_id, memory_->TranslateVirtual(value_ptr),
+                                              value_size));
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0008: {

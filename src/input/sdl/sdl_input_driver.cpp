@@ -226,10 +226,15 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 }
 
 X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) {
-  assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
+  // No window yet, or SDL already closed: nothing to rumble.
+  if (!sdl_events_initialized_ || !SDL_Gamepad_initialized_) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
 
-  QueueControllerUpdate();
-
+  // No QueueControllerUpdate here: rumble reads no pad state, and queuing work
+  // for the UI thread pushes an SDL event, which blocks while the window-X
+  // close runs inside SDL's event watch. InputSystem::StopVibration runs on a
+  // helper thread during that close; GetState keeps pumping in normal play.
   auto guard = DrainAndLock();
 
   auto controller = FindController(id);

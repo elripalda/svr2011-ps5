@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <rex/cvar.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -28,6 +29,9 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+REXCVAR_DEFINE_STRING(log_file_opens, "", "Kernel",
+                      "Log every guest file open whose path contains this text (e.g. .bik)");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -127,6 +131,11 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
       "NtCreateFile", "path={} access={:#x} attrs={:#x} share={:#x} disp={:#x} options={:#x}",
       target_path, (uint32_t)desired_access, (uint32_t)file_attributes, (uint32_t)share_access,
       (uint32_t)creation_disposition, (uint32_t)create_options);
+
+  if (const std::string& filter = REXCVAR_GET(log_file_opens);
+      !filter.empty() && target_path.find(filter) != std::string::npos) {
+    REXKRNL_INFO("File open: {}", target_path);
+  }
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <atomic>
 #include <mutex>
 
 #include <rex/chrono/clock.h>
@@ -30,6 +31,7 @@ double guest_time_scalar_ = 1.0;
 uint64_t guest_tick_frequency_ = Clock::host_tick_frequency_platform();
 // Base FILETIME of the guest system from app start.
 uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
+std::atomic<Clock::HostTickSource> host_tick_source_{nullptr};
 // Combined time and frequency ratio between host and guest.
 // Split in numerator (first) and denominator (second).
 // Computed by RecomputeGuestTickScalar.
@@ -64,7 +66,8 @@ void RecomputeGuestTickScalar() {
 // Update the guest timer for all threads.
 // Return a copy of the value so locking is reduced.
 uint64_t UpdateGuestClock() {
-  uint64_t host_tick_count = Clock::QueryHostTickCount();
+  const Clock::HostTickSource source = host_tick_source_.load(std::memory_order_acquire);
+  uint64_t host_tick_count = source ? source() : Clock::QueryHostTickCount();
 
   if (REXCVAR_GET(clock_no_scaling)) {
     // Nothing to update, calculate on the fly
@@ -172,6 +175,10 @@ uint64_t Clock::QueryGuestSystemTime() {
 uint32_t Clock::QueryGuestUptimeMillis() {
   return static_cast<uint32_t>(std::min<uint64_t>(QueryGuestSystemTimeOffset() / 10000,
                                                   std::numeric_limits<uint32_t>::max()));
+}
+
+void Clock::set_host_tick_source(HostTickSource source) {
+  host_tick_source_.store(source, std::memory_order_release);
 }
 
 void Clock::SetGuestSystemTime(uint64_t system_time) {

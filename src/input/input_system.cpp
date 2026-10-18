@@ -53,6 +53,7 @@ X_STATUS InputSystem::Setup() {
 }
 
 void InputSystem::Shutdown() {
+  StopVibration();
   // device_owners_ holds raw driver pointers.
   devices_.clear();
   device_owners_.clear();
@@ -60,6 +61,17 @@ void InputSystem::Shutdown() {
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  // The one place the vibration line's backend is set, so every factory names
+  // the driver that actually loaded rather than the one it asked for.
+  if (const std::string_view name = driver->vibration_backend(); !name.empty()) {
+    std::lock_guard lock(vibration_mutex_);
+    if (backend_name_ == "none") {
+      backend_name_ = name;
+    } else {
+      backend_name_ += '+';
+      backend_name_ += name;
+    }
+  }
   drivers_.push_back(std::move(driver));
 }
 
@@ -74,6 +86,30 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
   for (auto& driver : drivers_) {
     driver->set_is_active_callback(callback);
   }
+}
+
+void InputSystem::SetGuestInputHold(std::function<bool()> hold) {
+  std::lock_guard lock(hold_mutex_);
+  guest_input_hold_ = std::move(hold);
+}
+
+bool InputSystem::GuestInputHeld() {
+  std::function<bool()> hold;
+  {
+    std::lock_guard lock(hold_mutex_);
+    hold = guest_input_hold_;
+  }
+  // Called unlocked: the hold may read HeldState (a combo that opens a menu).
+  return hold && hold();
+}
+
+bool InputSystem::HeldState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  std::lock_guard lock(hold_mutex_);
+  if (user_index >= 4 || !has_real_state_[user_index]) {
+    return false;
+  }
+  *out_state = real_state_[user_index];
+  return true;
 }
 
 void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
@@ -263,15 +299,19 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   }
 
   if (!any) {
+    if (user_index < 4) {
+      std::lock_guard lock(hold_mutex_);
+      has_real_state_[user_index] = false;
+    }
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-  if (guest_input_hold_ && guest_input_hold_()) {  // [svr2011] a host menu has the pad
-    if (user_index < kMaxGuestUsers) {
-      std::lock_guard lock(held_mutex_);
-      held_state_[user_index] = merged;
-      held_valid_[user_index] = true;
-    }
-    merged.gamepad = {};
+  if (user_index < 4) {
+    std::lock_guard lock(hold_mutex_);
+    real_state_[user_index] = merged;
+    has_real_state_[user_index] = true;
+  }
+  if (GuestInputHeld()) {
+    merged.gamepad = {};  // the packet number still advances with the real pad
   }
   if (out_state) {
     *out_state = merged;
@@ -279,21 +319,20 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   return X_ERROR_SUCCESS;
 }
 
-void InputSystem::SetGuestInputHold(std::function<bool()> hold) {
-  guest_input_hold_ = std::move(hold);
-}
-
-bool InputSystem::HeldState(uint32_t user_index, X_INPUT_STATE* out_state) {
-  if (user_index >= kMaxGuestUsers) return false;
-  std::lock_guard lock(held_mutex_);
-  if (!held_valid_[user_index]) return false;
-  *out_state = held_state_[user_index];
-  return true;
-}
-
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+  return SetState(user_index, vibration, user_index);
+}
+
+X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration,
+                               uint32_t raw_user_index) {
   SCOPE_profile_cpu_f("hid");
+  if ((user_index & 0xFF) == 0xFF) {
+    // "Any user" rumbles player 1. XamInputSetState pins it too; repeated here
+    // for callers that bypass XAM, like the tests.
+    user_index = 0;
+  }
   if (!assignment_) {
+    RecordVibration(raw_user_index, user_index, *vibration, X_ERROR_DEVICE_NOT_CONNECTED);
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
@@ -308,28 +347,127 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   bool any_synthetic = false;
   bool pad_rumbled = false;
   X_RESULT pad_error = X_ERROR_DEVICE_NOT_CONNECTED;
-  for (DeviceId id : ids) {
-    auto* driver = DriverForDevice(id);
-    const DeviceInfo* info = DeviceInfoFor(id);
-    if (!driver || !info) {
-      continue;
+  {
+    std::lock_guard drive(vibration_drive_mutex_);
+    if (vibration_stopped_) {
+      return X_ERROR_DEVICE_NOT_CONNECTED;  // the pads were stopped for good
     }
-    X_RESULT result = driver->SetDeviceVibration(id, vibration);
-    if (info->synthetic) {
-      any_synthetic = true;
-      continue;
+    X_INPUT_VIBRATION output = *vibration;
+    if (vibration_output_) {
+      output = vibration_output_(user_index, *vibration);
     }
-    any_pad = true;
-    if (result == X_ERROR_SUCCESS) {
-      pad_rumbled = true;
-    } else {
-      pad_error = result;
+    X_INPUT_VIBRATION* sent = &output;
+    for (DeviceId id : ids) {
+      auto* driver = DriverForDevice(id);
+      const DeviceInfo* info = DeviceInfoFor(id);
+      if (!driver || !info) {
+        continue;
+      }
+      X_RESULT result = driver->SetDeviceVibration(id, sent);
+      if (info->synthetic) {
+        any_synthetic = true;
+        continue;
+      }
+      any_pad = true;
+      if (result == X_ERROR_SUCCESS) {
+        pad_rumbled = true;
+      } else {
+        pad_error = result;
+      }
     }
   }
+  std::optional<X_RESULT> pads;
   if (any_pad) {
-    return pad_rumbled ? X_ERROR_SUCCESS : pad_error;
+    pads = pad_rumbled ? X_ERROR_SUCCESS : pad_error;
+  }
+  RecordVibration(raw_user_index, user_index, *vibration, pads);
+  if (pads) {
+    return *pads;
   }
   return any_synthetic ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+void InputSystem::RecordVibration(uint32_t raw_user_index, uint32_t user_index,
+                                  const X_INPUT_VIBRATION& vibration,
+                                  std::optional<X_RESULT> pads) {
+  std::optional<std::string> trace;
+  std::optional<std::string> line;
+  {
+    std::lock_guard lock(vibration_mutex_);
+    const auto now = VibrationLog::Clock::now();
+    vibration_.Record(raw_user_index, user_index, vibration.left_motor_speed,
+                      vibration.right_motor_speed, pads);
+    trace = vibration_trace_.Take(raw_user_index, user_index, vibration.left_motor_speed,
+                                  vibration.right_motor_speed, pads, now);
+    if (vibration_log_.PeriodicDue(now)) {
+      line = vibration_log_.TakeIfChanged(vibration_, VibrationLineKind::kPeriodic, backend_name_);
+    }
+  }
+  if (trace) {
+    REXLOG_INFO("{}", *trace);
+  }
+  if (line) {
+    REXLOG_INFO("{}", *line);
+  }
+}
+
+VibrationLedger InputSystem::vibration_ledger() {
+  std::lock_guard lock(vibration_mutex_);
+  return vibration_;
+}
+
+std::string InputSystem::vibration_backend() {
+  std::lock_guard lock(vibration_mutex_);
+  return backend_name_;
+}
+
+std::string InputSystem::VibrationLine(VibrationLineKind kind) {
+  std::lock_guard lock(vibration_mutex_);
+  return vibration_.Line(kind, backend_name_);
+}
+
+void InputSystem::StopVibration() {
+  {
+    std::lock_guard drive(vibration_drive_mutex_);
+    if (vibration_stopped_) {
+      return;
+    }
+    vibration_stopped_ = true;
+    std::vector<DeviceInfo> devices;
+    for (auto& driver : drivers_) {
+      devices.clear();
+      driver->EnumerateDevices(devices);
+      for (const auto& device : devices) {
+        if (device.synthetic) {
+          continue;
+        }
+        X_INPUT_VIBRATION zero = {};
+        // A pad that went away answers "not connected"; the others still stop.
+        driver->SetDeviceVibration(device.id, &zero);
+      }
+    }
+  }
+  REXLOG_INFO("{}", VibrationLine(VibrationLineKind::kFinal));
+  // Written out now: the window-X path hard-exits soon after.
+  rex::FlushLogging();
+}
+
+void InputSystem::set_vibration_output(VibrationOutput output) {
+  std::lock_guard drive(vibration_drive_mutex_);
+  vibration_output_ = std::move(output);
+}
+
+bool InputSystem::LogVibration(VibrationLineKind kind) {
+  std::optional<std::string> line;
+  {
+    std::lock_guard lock(vibration_mutex_);
+    line = vibration_log_.TakeIfChanged(vibration_, kind, backend_name_);
+  }
+  if (!line) {
+    return false;
+  }
+  REXLOG_INFO("{}", *line);
+  return true;
 }
 
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
@@ -337,6 +475,10 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  if (GuestInputHeld()) {
+    return X_ERROR_EMPTY;
   }
 
   RefreshDevices();
@@ -350,9 +492,6 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
       continue;
     }
     X_RESULT result = driver->GetDeviceKeystroke(id, flags, out_keystroke);
-    if (result == X_ERROR_SUCCESS && guest_input_hold_ && guest_input_hold_()) {
-      return X_ERROR_EMPTY;  // [svr2011] a host menu has the pad: dropped
-    }
     if (result == X_ERROR_SUCCESS) {
       out_keystroke->user_index = static_cast<uint8_t>(user_index);
       return result;

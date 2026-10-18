@@ -12,7 +12,9 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+#include <rex/kernel/xam/live/live.h>
 #include <rex/kernel/xam/module.h>
+#include <rex/kernel/xam/net_trace.h>
 #include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -95,29 +97,40 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
 u32 XamCreateEnumeratorHandle_entry(u32 user_index, u32 app_id, u32 open_message,
                                     u32 close_message, u32 extra_size, u32 item_count, u32 flags,
                                     mapped_u32 out_handle) {
-  // [svr2011] The music player's user playlists (xmp_app.h); nothing else yet.
   using rex::kernel::xam::apps::XmpApp;
   if (!out_handle) {
     return X_ERROR_INVALID_PARAMETER;
   }
-  if (app_id == 0xFC && open_message == 0x00058039 && REXCVAR_GET(online_enabled)) {
-    // [svr2011] XTitleServerCreateEnumerator: the game's Xbox LIVE title
-    // servers (XLSP). Its GameSpy services go through "THQSVR11_GSGW": one
-    // server of that name at 127.11.0.1, which connect() sends on to
-    // online_server (xam_net.cpp). XTITLE_SERVER_INFO: inaServer, dwFlags,
-    // szServerInfo[200].
-    constexpr uint32_t kItemSize = 212;
-    auto e = make_object<XStaticUntypedEnumerator>(REX_KERNEL_STATE(), 1, kItemSize);
-    void* extra = nullptr;
-    if (XFAILED(e->Initialize(user_index, app_id, open_message, close_message, flags, extra_size, &extra))) {
-      return X_ERROR_FUNCTION_FAILED;
+  // Signed in to Live, XTitleServerCreateEnumerator (XLiveBase 0x58039, the Live list of LSP
+  // title servers) lists the game server's Rendez-Vous address (after the Xenia netplay
+  // fork's XLiveBaseApp, BSD license).
+  constexpr uint32_t kXLiveBase = 0xFC;
+  constexpr uint32_t kTitleServerEnumerate = 0x58039;
+  constexpr size_t kTitleServerInfoSize = 0xD0;  // XTITLE_SERVER_INFO
+  if (app_id == kXLiveBase && open_message == kTitleServerEnumerate) {
+    if (!live::SignedIn()) {
+      return X_ERROR_INVALID_PARAMETER;
     }
-    uint8_t* item = e->AppendItem();
-    std::memset(item, 0, kItemSize);
-    const uint8_t ina[4] = {127, 11, 0, 1};  // (network order)
-    std::memcpy(item, ina, 4);
-    std::strcpy(reinterpret_cast<char*>(item + 8), "THQSVR11_GSGW");
-    REXKRNL_INFO("XamCreateEnumeratorHandle: title servers: THQSVR11_GSGW");
+    auto e = make_object<XStaticUntypedEnumerator>(REX_KERNEL_STATE(), item_count,
+                                                   kTitleServerInfoSize);
+    void* extra = nullptr;
+    auto result =
+        e->Initialize(user_index, app_id, open_message, close_message, flags, extra_size, &extra);
+    if (XFAILED(result)) {
+      return result;
+    }
+    for (const auto& server : live::TitleServers()) {
+      if (e->item_count() >= item_count) {
+        break;
+      }
+      // inaServer (network order), dwFlags, szServerInfo[200].
+      uint8_t* item = e->AppendItem();
+      std::memset(item, 0, kTitleServerInfoSize);
+      memory::store_and_swap<uint32_t>(item, server.address);
+      memory::store_and_swap<uint32_t>(item + 4, server.flags);
+      std::memcpy(item + 8, server.description.data(),
+                  std::min<size_t>(server.description.size(), kTitleServerInfoSize - 9));
+    }
     *out_handle = e->handle();
     return X_ERROR_SUCCESS;
   }
@@ -171,7 +184,7 @@ u32 XamGetPrivateEnumStructureFromHandle_entry(u32 handle, mapped_u32 out_object
 }  // namespace kernel
 }  // namespace rex
 
-REX_EXPORT(__imp__XamEnumerate, rex::kernel::xam::XamEnumerate_entry)
-REX_EXPORT(__imp__XamCreateEnumeratorHandle, rex::kernel::xam::XamCreateEnumeratorHandle_entry)
+REX_TRACE_EXPORT(__imp__XamEnumerate, rex::kernel::xam::XamEnumerate_entry)
+REX_TRACE_EXPORT(__imp__XamCreateEnumeratorHandle, rex::kernel::xam::XamCreateEnumeratorHandle_entry)
 REX_EXPORT(__imp__XamGetPrivateEnumStructureFromHandle,
            rex::kernel::xam::XamGetPrivateEnumStructureFromHandle_entry)

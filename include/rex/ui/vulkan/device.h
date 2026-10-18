@@ -110,6 +110,19 @@ class VulkanDevice {
     bool shaderCullDistance = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;
+    bool shaderInt64 = false;
+
+    // Vulkan 1.2 features used by app-side native renderers (bindless
+    // descriptors and buffer device addresses).
+
+    bool bufferDeviceAddress = false;
+    bool descriptorIndexing = false;
+    bool runtimeDescriptorArray = false;
+    bool shaderSampledImageArrayNonUniformIndexing = false;
+    bool descriptorBindingPartiallyBound = false;
+    bool descriptorBindingVariableDescriptorCount = false;
+    bool descriptorBindingSampledImageUpdateAfterBind = false;
+    bool descriptorBindingUpdateUnusedWhilePending = false;
 
     // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)
 
@@ -172,6 +185,24 @@ class VulkanDevice {
     // [svr2011] What an app renderer drawing on this device needs (rex/external_frame.h):
     // descriptor indexing with update after bind, buffer device address, shaderInt64.
     bool appRendererFeatures = false;
+    // Optional functionality for stutter-free pipelines and pacing, all off when the device
+    // lacks it or vulkan_force_legacy_device is set (rex/ui/vulkan/device_extension_plan.h).
+
+    // VK_EXT_graphics_pipeline_library (#321)
+    bool graphicsPipelineLibrary = false;
+    bool graphicsPipelineLibraryFastLinking = false;
+    bool graphicsPipelineLibraryIndependentInterpolationDecoration = false;
+    // VK_EXT_extended_dynamic_state and the core part of VK_EXT_extended_dynamic_state2
+    // (promoted to 1.3); the functions are in Functions.
+    bool extendedDynamicState = false;
+    // VK_KHR_present_id2 / VK_KHR_present_wait2 (#480 / #481). Surface support is a
+    // separate surface capability.
+    bool presentId2 = false;
+    bool presentWait2 = false;
+    // VK_KHR_present_id / VK_KHR_present_wait (#295 / #249), beside v2 where both are
+    // offered: a surface without v2 falls back to v1.
+    bool presentId = false;
+    bool presentWait = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -203,6 +234,12 @@ class VulkanDevice {
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
+    bool ext_KHR_pipeline_library = false;           // #291
+    bool ext_EXT_graphics_pipeline_library = false;  // #321
+    bool ext_KHR_present_id = false;                 // #295
+    bool ext_KHR_present_wait = false;               // #249
+    bool ext_KHR_present_id2 = false;                // #480
+    bool ext_KHR_present_wait2 = false;              // #481
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -224,6 +261,12 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
+    // VK_EXT_extended_dynamic_state(2) (#268 / #378, promoted to 1.3), loaded on 1.3 only
+#include <rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc>
+    // VK_KHR_present_wait (#249)
+#include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+    // VK_KHR_present_wait2 (#481)
+#include <rex/ui/vulkan/functions/device_khr_present_wait2.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

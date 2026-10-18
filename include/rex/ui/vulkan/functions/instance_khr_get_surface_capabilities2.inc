@@ -1,0 +1,2 @@
+// VK_KHR_get_surface_capabilities2 functions used in ReXGlue.
+XE_UI_VULKAN_FUNCTION(vkGetPhysicalDeviceSurfaceCapabilities2KHR)

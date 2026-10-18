@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/kernel/xam/live/live.h>
 #include <rex/memory.h>
 #include <rex/stream.h>
 #include <rex/system/xtypes.h>
@@ -218,7 +219,9 @@ class UserProfile {
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
-  uint32_t signin_state() const { return 1; }
+  // 1 = signed in locally; 2 = signed in to Xbox LIVE (--wwe_online, once the game server
+  // answered).
+  uint32_t signin_state() const { return rex::kernel::xam::live::SignedIn() ? 2 : 1; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }

@@ -26,6 +26,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/external_frame.h>
+#include <rex/system/external_frame.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -56,6 +57,15 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(readback_resolve_log, false, "GPU",
+                    "Log every render-to-texture resolve with its frame, address and length")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(frame_event_log, false, "GPU",
+                    "Log each event that can delay a frame: presents skipped while pipelines "
+                    "build and blocking resolve readbacks")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
                     "used placeholder pipelines to avoid visible flashing")
@@ -69,6 +79,17 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+
+REXCVAR_DECLARE(bool, gpu_draw_census);
+
+namespace {
+// Draw census (see command_processor.cpp): what the host does with each guest draw.
+struct VulkanDrawCensus {
+  uint64_t draws = 0, copies = 0, no_effect = 0, memexport_vs = 0, memexport_ps = 0;
+  uint64_t points = 0, points_memexport = 0, swaps = 0;
+} g_vk_draw_census;
+}  // namespace
 
 namespace rex::graphics::vulkan {
 
@@ -2295,11 +2316,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   SCOPE_profile_cpu_f("gpu");
   // [svr2011] (the GPU thread got this far: a frame's commands all went through)
   rex::external_frame::CountSwap();
+  if (++g_vk_draw_census.swaps % 60 == 0 && REXCVAR_GET(gpu_draw_census)) {
+    const auto& c = g_vk_draw_census;
+    REXGPU_INFO("draw-census vulkan swaps={} draws={} copies={} no_effect={} memexport_vs={} "
+                "memexport_ps={} points={} points_memexport={}",
+                c.swaps, c.draws, c.copies, c.no_effect, c.memexport_vs, c.memexport_ps, c.points,
+                c.points_memexport);
+  }
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
   if (!graphics_system_)
     return;
+  DeliverResolveReadbacks(false);
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
@@ -2316,6 +2345,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
   if (skip_present_due_async_placeholder) {
+    if (REXCVAR_GET(frame_event_log)) {
+      REXGPU_INFO("Frame event: present skipped, frame {} drew with a pipeline still building",
+                  frame_current_);
+    }
     static bool skipped_incomplete_frame_logged = false;
     if (!skipped_incomplete_frame_logged) {
       skipped_incomplete_frame_logged = true;
@@ -2336,25 +2369,30 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
   VkImageView swap_texture_view = VK_NULL_HANDLE;
-  // [svr2011] A frame from the app's own renderer (rex/external_frame.h), drawn
-  // on this device by work submitted earlier on the same queue: shown like the
-  // front buffer, after a barrier making its writes visible.
-  rex::external_frame::Frame external_frame;
-  if (rex::external_frame::GetFrame(external_frame) && external_frame.vk_image_view) {
-    swap_texture_view = VkImageView(external_frame.vk_image_view);
+  const system::external_frame::SwapStep external_step =
+      system::external_frame::IsEnabled() ? system::external_frame::TakeForSwap()
+                                          : system::external_frame::SwapStep{};
+  const system::external_frame::Frame& external_frame = external_step.frame;
+  if (REXCVAR_GET(frame_event_log) && (external_step.repeated || external_step.skipped)) {
+    // A swap that shows the previous frame again, or jumps over published ones, judders on
+    // screen while the presents stay evenly spaced.
+    if (external_step.repeated) {
+      REXGPU_INFO("Frame event: external frame repeated, sequence {}", external_frame.sequence);
+    } else {
+      REXGPU_INFO("Frame event: external frame skipped {}, sequence {}", external_step.skipped,
+                  external_frame.sequence);
+    }
+  }
+  if (external_frame.image_view) {
+    // Present the native renderer's frame (RGBA8, already at output scale)
+    // through the usual gamma and post-effect path.
+    swap_texture_view =
+        reinterpret_cast<VkImageView>(static_cast<uintptr_t>(external_frame.image_view));
+    frontbuffer_width_scaled = external_frame.width;
+    frontbuffer_height_scaled = external_frame.height;
+    frontbuffer_width_unscaled = frontbuffer_width ? frontbuffer_width : external_frame.width;
+    frontbuffer_height_unscaled = frontbuffer_height ? frontbuffer_height : external_frame.height;
     frontbuffer_format = xenos::TextureFormat::k_8_8_8_8;
-    frontbuffer_width_scaled = frontbuffer_width_unscaled = external_frame.width;
-    frontbuffer_height_scaled = frontbuffer_height_unscaled = external_frame.height;
-    frontbuffer_width = external_frame.width;
-    frontbuffer_height = external_frame.height;
-    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    PushImageMemoryBarrier(
-        VkImage(external_frame.vk_image), range,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   } else {
     swap_texture_view = texture_cache_->RequestSwapTexture(
         frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
@@ -3657,6 +3695,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  if (system::external_frame::IsEnabled()) {
+    // The app's native renderer draws this frame from the guest's D3D calls;
+    // the command stream is still processed for fences and interrupts.
+    return true;
+  }
+
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
@@ -3673,9 +3717,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return false;
   };
 
+  ++g_vk_draw_census.draws;
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
+    ++g_vk_draw_census.copies;
     return IssueCopy();
   }
 
@@ -3693,6 +3739,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
+  g_vk_draw_census.memexport_vs += memexport_used_vertex;
+  if (prim_type == xenos::PrimitiveType::kPointList) {
+    ++g_vk_draw_census.points;
+    g_vk_draw_census.points_memexport += memexport_used_vertex;
+  }
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
       REXGPU_ERROR(
@@ -3729,10 +3780,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      ++g_vk_draw_census.no_effect;
       return true;
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+  g_vk_draw_census.memexport_ps += memexport_used_pixel;
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
       REXGPU_ERROR(
@@ -4378,6 +4431,8 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
         dfn.vkFreeMemory(device, new_memory, nullptr);
         return false;
       }
+      // Pending resolve copies may still point at the buffer about to be destroyed.
+      DeliverResolveReadbacks(false);
       if (readback.mapped_data[index] != nullptr && readback.memories[index] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[index]);
       }
@@ -4471,8 +4526,13 @@ bool VulkanCommandProcessor::IssueCopy() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                  written_address, written_length);
+    if (resolved && written_length && REXCVAR_GET(readback_resolve_log)) {
+      REXGPU_INFO("Resolve frame {} address {:08X} length {}", frame_current_, written_address,
+                  written_length);
+    }
+    return resolved;
   }
 
   return IssueCopy_ReadbackResolvePath();
@@ -4491,6 +4551,10 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   if (!written_length) {
     return true;
+  }
+  if (REXCVAR_GET(readback_resolve_log)) {
+    REXGPU_INFO("Resolve frame {} address {:08X} length {}", frame_current_, written_address,
+                written_length);
   }
 
   if (!memory_->TranslatePhysical(written_address)) {
@@ -4532,6 +4596,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
         dfn.vkFreeMemory(device, new_memory, nullptr);
         return false;
       }
+      // Pending resolve copies may still point at the buffer about to be destroyed.
+      DeliverResolveReadbacks(false);
       if (readback.mapped_data[index] != nullptr && readback.memories[index] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[index]);
       }
@@ -4553,8 +4619,39 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
+  if (readback.last_used_frame + 1 == frame_current_) {
+    ++readback.frame_streak;
+  } else if (readback.last_used_frame != frame_current_) {
+    readback.frame_streak = 1;
+  }
   readback.last_used_frame = frame_current_;
+  // A multi-pass bake that the CPU reads (created attires) resolves each target on isolated
+  // frames; targets resolved on consecutive frames are GPU-only effects, and syncing on them
+  // would halve the frame rate.
+  if (readback_mode == ReadbackResolveMode::kBurst &&
+      readback.frame_streak > kReadbackBurstFrames) {
+    return true;
+  }
+  if (REXCVAR_GET(frame_event_log) &&
+      (readback_mode == ReadbackResolveMode::kBurst || readback_mode == ReadbackResolveMode::kFull)) {
+    REXGPU_INFO("Frame event: {} resolve readback, frame {} address {:08X} length {} streak {}",
+                readback_mode == ReadbackResolveMode::kBurst ? "deferred" : "blocking",
+                frame_current_, written_address, written_length, readback.frame_streak);
+  }
   uint32_t write_index = readback.current_index;
+  if (readback_mode == ReadbackResolveMode::kBurst) {
+    for (const PendingResolveReadback& pending : pending_resolve_readbacks_) {
+      if (pending.key == resolve_key && pending.index == write_index) {
+        // Both slots of this target are still in flight; rare, so wait rather than overwrite.
+        if (REXCVAR_GET(frame_event_log)) {
+          REXGPU_INFO("Frame event: blocking resolve readback (slot reuse), frame {}",
+                      frame_current_);
+        }
+        DeliverResolveReadbacks(true);
+        break;
+      }
+    }
+  }
   uint32_t readback_size = AlignReadbackBufferSize(written_length);
   if (!ensure_readback_slot(readback, write_index, readback_size)) {
     return true;
@@ -4727,6 +4824,14 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
 
+  if (readback_mode == ReadbackResolveMode::kBurst) {
+    // Written to guest memory by DeliverResolveReadbacks once this submission completes.
+    pending_resolve_readbacks_.push_back(
+        {resolve_key, write_index, GetCurrentSubmission(), written_address, written_length});
+    readback.current_index = 1 - readback.current_index;
+    return true;
+  }
+
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
@@ -4765,6 +4870,42 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   readback.current_index = 1 - readback.current_index;
   return true;
+}
+
+void VulkanCommandProcessor::DeliverResolveReadbacks(bool wait) {
+  if (pending_resolve_readbacks_.empty()) {
+    return;
+  }
+  if (wait) {
+    AwaitAllQueueOperationsCompletion();
+  } else {
+    CheckSubmissionFenceAndDeviceLoss(0);
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  // In order, so a later copy to the same guest range lands last.
+  while (!pending_resolve_readbacks_.empty() &&
+         pending_resolve_readbacks_.front().submission <= submission_completed_) {
+    const PendingResolveReadback pending = pending_resolve_readbacks_.front();
+    pending_resolve_readbacks_.pop_front();
+    auto it = readback_buffers_.find(pending.key);
+    if (it == readback_buffers_.end()) {
+      continue;
+    }
+    const ReadbackBuffer& readback = it->second;
+    if (readback.mapped_data[pending.index] == nullptr ||
+        pending.length > readback.sizes[pending.index]) {
+      continue;
+    }
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = readback.memories[pending.index];
+    range.size = VK_WHOLE_SIZE;
+    dfn.vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &range);
+    if (uint8_t* destination = memory_->TranslatePhysical(pending.address)) {
+      std::memcpy(destination, readback.mapped_data[pending.index], pending.length);
+    }
+  }
 }
 
 void VulkanCommandProcessor::EvictOldReadbackBuffers(
@@ -5296,6 +5437,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
       texture_transient_descriptor_sets_used_.pop_front();
     }
 
+    DeliverResolveReadbacks(false);
     EvictOldReadbackBuffers(readback_buffers_);
     EvictOldReadbackBuffers(memexport_readback_buffers_);
 

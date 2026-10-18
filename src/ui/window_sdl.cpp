@@ -633,6 +633,7 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
     case SDL_EVENT_MOUSE_BUTTON_UP: {
       MouseEvent e(this, TranslateSDLMouseButton(event.button.button),
                    int32_t(event.button.x * density), int32_t(event.button.y * density));
+      e.set_clicks(event.button.clicks);
       if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
         OnMouseDown(e, destruction_receiver);
       } else {

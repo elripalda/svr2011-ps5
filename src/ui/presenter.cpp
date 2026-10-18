@@ -14,12 +14,18 @@
 #include <chrono>
 #include <thread>
 #include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/system/external_frame.h>
+#include <rex/thread.h>
+#include <rex/ui/present_pacing.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
@@ -85,6 +91,44 @@ REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
 
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(present_pace_to_guest_vblank, true, "UI/Presenter",
+                    "Present each guest frame at the next guest vblank, as the console does, "
+                    "instead of as soon as it is submitted")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(present_pacing_stats, false, "UI/Presenter",
+                    "Log paced presentation intervals, repeated vblanks and replaced frames "
+                    "every 5 seconds");
+REXCVAR_DEFINE_STRING(present_pacing_log, "", "UI/Presenter",
+                      "CSV file receiving one row per paced presentation (empty = off)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// SvR 2011 submits frames 1.5 ms (median) and 3.7 ms (p99.9) after the vblank; 5 ms catches
+// all but a handful while cutting ~12 ms of latency compared with the next vblank.
+REXCVAR_DEFINE_INT32(present_pacing_offset_us, 5000, "UI/Presenter",
+                     "Present each paced frame this many microseconds after the guest vblank it "
+                     "follows; 0 = on the next vblank. Lower values cut latency, but frames that "
+                     "finish later than the offset wait a whole extra vblank")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// At a fixed 360 Hz, vblank + 5 ms is only 0.56 ms before a refresh; see ChoosePresentOffsetUs.
+REXCVAR_DEFINE_INT32(present_pacing_min_margin_us, 1000, "UI/Presenter",
+                     "When the guest vblank follows a fixed-refresh display, the least time a "
+                     "paced present keeps before the display's next refresh; closer presents move "
+                     "to this long before the refresh after it. 0 = never move")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(present_wait, true, "UI/Presenter",
+                    "With vsync, use present-wait (VK_KHR_present_wait2, then VK_KHR_present_wait) "
+                    "to keep one frame queued and log when each present was shown; off or "
+                    "unavailable keeps timer pacing only")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(present_pacing_thread_priority, true, "UI/Presenter",
+                    "Run the pacing thread in the MMCSS Games task (else at highest priority) and "
+                    "ask Windows for full-speed timers")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(present_repeat_held_vblanks, true, "UI/Presenter",
+                    "When a guest vblank brings no new frame and the guest vblank does not follow "
+                    "a fixed-refresh display (variable refresh, host clock), present the last "
+                    "frame again so the display keeps the guest rate; off skips that present")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
@@ -299,6 +343,7 @@ Presenter::~Presenter() {
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
   assert_false(is_executing_ui_drawers_);
+  StopGuestOutputPacing();
 
 #if REX_PLATFORM_WIN32
   if (dxgi_ui_tick_thread_.joinable()) {
@@ -459,7 +504,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   // Reset ui_thread_paint_requested_ unconditionally also, regardless of
   // whether the UI needs to be drawn - the flag may be set to try reconnecting,
   // for example.
-  const bool paint_requested = ui_thread_paint_requested_.exchange(false, std::memory_order_relaxed);
+  bool paint_requested = ui_thread_paint_requested_.exchange(false, std::memory_order_relaxed);
   if (paint_requested) {
     do_paint = true;
   }
@@ -483,6 +528,12 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       }
     }
     if (do_paint) last_paint = std::chrono::steady_clock::now();
+  }
+  if (do_paint) {
+    ui_paints_[force_paint ? 0 : draw_ui ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+      ui_paints_[3].fetch_add(1, std::memory_order_relaxed);
+    }
   }
   PaintResult paint_result = PaintResult::kNotPresented;
   bool request_repaint_at_tick = false;
@@ -650,6 +701,310 @@ bool Presenter::RefreshGuestOutput(
     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
   }
 
+  if (REXCVAR_GET(present_pace_to_guest_vblank)) {
+    {
+      std::lock_guard<std::mutex> lock(guest_output_pacing_mutex_);
+      if (!guest_output_pacing_thread_.joinable() && !guest_output_pacing_shutdown_) {
+        guest_output_pacing_thread_ = std::thread([this]() { GuestOutputPacingThread(); });
+      }
+    }
+    guest_output_paced_frame_arrival_.store(
+        std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+    if (guest_output_paced_frame_pending_.exchange(true, std::memory_order_acq_rel)) {
+      guest_output_paced_frames_replaced_.fetch_add(1, std::memory_order_relaxed);
+      guest_output_paced_frames_replaced_since_present_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return is_active;
+  }
+  PresentLatestGuestOutput();
+  return is_active;
+}
+
+void Presenter::OnGuestVblankRateChange(std::chrono::steady_clock::duration period) {
+  std::lock_guard<std::mutex> lock(guest_output_pacing_mutex_);
+  guest_output_pacing_vblank_period_ = period;
+  guest_output_pacing_period_rejects_ = 0;
+  guest_output_pacing_skip_period_ = true;
+}
+
+void Presenter::OnGuestVblank(std::chrono::steady_clock::time_point vblank_time,
+                              uint32_t display_refreshes_per_vblank) {
+  {
+    std::lock_guard<std::mutex> lock(guest_output_pacing_mutex_);
+    if (!guest_output_pacing_thread_.joinable()) {
+      return;
+    }
+    guest_output_pacing_display_every_ = display_refreshes_per_vblank;
+    if (guest_output_pacing_skip_period_) {
+      guest_output_pacing_skip_period_ = false;
+      ++guest_output_pacing_vblank_count_;
+    } else if (guest_output_pacing_vblank_count_++) {
+      auto period = vblank_time - guest_output_pacing_vblank_time_;
+      auto& current = guest_output_pacing_vblank_period_;
+      // Ignore single gaps from missed ticks; a real rate change moves by less than half a
+      // period, or keeps disagreeing (a wrong estimate must not stick).
+      constexpr uint32_t kRejectsToAdopt = 8;
+      if (current <= decltype(period)::zero() || (period > current / 2 && period < current * 3 / 2) ||
+          ++guest_output_pacing_period_rejects_ >= kRejectsToAdopt) {
+        current = period;
+        guest_output_pacing_period_rejects_ = 0;
+      }
+    }
+    guest_output_pacing_vblank_time_ = vblank_time;
+  }
+  guest_output_pacing_condition_.notify_one();
+}
+
+void Presenter::StopGuestOutputPacing() {
+  std::thread thread;
+  {
+    std::lock_guard<std::mutex> lock(guest_output_pacing_mutex_);
+    guest_output_pacing_shutdown_ = true;
+    thread = std::move(guest_output_pacing_thread_);
+  }
+  guest_output_pacing_condition_.notify_one();
+  if (thread.joinable()) {
+    thread.join();
+  }
+}
+
+void Presenter::GuestOutputPacingThread() {
+  rex::thread::set_current_thread_name("Guest Output Pacing");
+  using Clock = std::chrono::steady_clock;
+  {
+    // Keep this thread's time when other programs run: MMCSS Games, else highest priority.
+    const bool raise = REXCVAR_GET(present_pacing_thread_priority);
+    const bool joined = raise && rex::thread::JoinMmcssGames();
+    const pacing::ThreadPriorityChoice choice = pacing::ChoosePacingThreadPriority(raise, joined);
+    if (choice == pacing::ThreadPriorityChoice::kHighest) {
+      rex::thread::SetCurrentThreadPriorityHighest();
+    }
+    const bool high_qos = raise && rex::thread::RequestHighQosTimers();
+    REXLOG_INFO("Guest output pacing thread: priority {}, full-speed timers {}",
+                pacing::ThreadPriorityChoiceName(choice), high_qos ? "on" : "off");
+  }
+  // Guest frames arrive shortly after each vblank. Present each one at a fixed offset after its
+  // vblank (by default the next tick): wake ahead of that moment and spin the last stretch. Waking
+  // on the vblank signal instead lands up to ~0.7 ms late and varies. This is not a guest thread,
+  // so spinning here does not take time from pinned guest cores.
+  constexpr auto kWakeAhead = std::chrono::microseconds(1000);
+  pacing::PresentWaiter* const waiter = GetPresentWaiter();
+  Clock::time_point last_target{};
+  Clock::time_point last_present{}, window_start = Clock::now();
+  uint32_t presents = 0, repeated_vblanks = 0, repeated_since_present = 0;
+  // Present-wait over the stats window.
+  uint32_t waited_presents = 0, wait_timeouts = 0, unshown_max = 0, shown_count = 0;
+  double wait_sum_ms = 0.0, wait_max_ms = 0.0, shown_sum_ms = 0.0, shown_max_ms = 0.0;
+  bool present_wait_seen = false;
+  long long logged_offset_us = -1;
+  const bool repeat_held = REXCVAR_GET(present_repeat_held_vblanks);
+  REXLOG_INFO("Guest output pacing: vblanks without a new frame {}",
+              repeat_held ? "present the last frame again unless the display is fixed-refresh"
+                          : "are skipped");
+  bool presented_before = false;
+  uint32_t repeat_presents = 0;
+  std::FILE* log = nullptr;
+  if (!REXCVAR_GET(present_pacing_log).empty()) {
+    log = std::fopen(REXCVAR_GET(present_pacing_log).c_str(), "w");
+    if (log) {
+      std::fputs(pacing::SwapLogHeader(), log);
+    }
+  }
+  const Clock::time_point log_origin = Clock::now();
+  if (log) {
+    // The log line's wall-clock time lines up present_us 0 with other runtime log events.
+    REXLOG_INFO("Paced presentation log started (present_us 0)");
+  }
+  auto us = [](Clock::duration d) {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+  };
+  Clock::time_point last_logged_present{};
+  double interval_sum_ms = 0.0, interval_square_sum_ms = 0.0, interval_max_ms = 0.0;
+  while (true) {
+    Clock::time_point vblank_time;
+    Clock::duration period;
+    uint64_t vblank_count;
+    uint32_t display_every;
+    {
+      std::unique_lock<std::mutex> lock(guest_output_pacing_mutex_);
+      guest_output_pacing_condition_.wait(lock, [&]() {
+        return guest_output_pacing_shutdown_ || guest_output_pacing_vblank_count_ >= 2;
+      });
+      if (guest_output_pacing_shutdown_) {
+        if (log) {
+          std::fclose(log);
+        }
+        rex::thread::LeaveMmcss();
+        return;
+      }
+      vblank_time = guest_output_pacing_vblank_time_;
+      period = guest_output_pacing_vblank_period_;
+      vblank_count = guest_output_pacing_vblank_count_;
+      display_every = guest_output_pacing_display_every_;
+    }
+    if (period <= Clock::duration::zero()) {
+      continue;
+    }
+    Clock::duration offset = period;
+    if (int32_t offset_us = REXCVAR_GET(present_pacing_offset_us); offset_us > 0) {
+      const long long display_period_us = display_every ? us(period) / display_every : 0;
+      const long long chosen_us = pacing::ChoosePresentOffsetUs(
+          offset_us, display_period_us, REXCVAR_GET(present_pacing_min_margin_us));
+      if (chosen_us != logged_offset_us) {
+        logged_offset_us = chosen_us;
+        REXLOG_INFO("Guest output pacing: present {} us after the guest vblank{}", chosen_us,
+                    display_period_us ? fmt::format(" (fixed display, refresh {} us)",
+                                                    display_period_us)
+                                      : std::string());
+      }
+      offset = std::min<Clock::duration>(std::chrono::microseconds(chosen_us), period);
+    }
+    // The next present moment after the last one, anchored to the latest ideal vblank time.
+    Clock::time_point target = vblank_time + offset;
+    while (target <= last_target + period / 2) {
+      target += period;
+    }
+    Clock::time_point now = Clock::now();
+    if (target - now > period * 2) {
+      // The guest clock stalled or jumped; resynchronize on the next signal.
+      last_target = Clock::time_point{};
+      rex::thread::PreciseSleep(std::chrono::microseconds(1000));
+      continue;
+    }
+    pacing::SleepThenSpin(
+        target, Clock::duration(kWakeAhead), [] { return Clock::now(); },
+        [](Clock::duration d) {
+          rex::thread::PreciseSleep(std::chrono::duration_cast<std::chrono::microseconds>(d));
+        },
+        [] { std::this_thread::yield(); });
+    last_target = target;
+    const pacing::VblankPresent vblank_present = pacing::ChooseVblankPresent(
+        guest_output_paced_frame_pending_.exchange(false, std::memory_order_acq_rel),
+        repeat_held, display_every != 0, presented_before);
+    if (vblank_present != pacing::VblankPresent::kNewFrame) {
+      ++repeated_vblanks;
+      ++repeated_since_present;
+      if (vblank_present == pacing::VblankPresent::kRepeat) {
+        // The last frame again, at the moment a new one would have been presented. Not a row in
+        // the swap log: its rows stay one per guest frame.
+        if (waiter) {
+          waiter->WaitForShown(0, period);
+        }
+        PresentLatestGuestOutput();
+        ++repeat_presents;
+      }
+      continue;
+    }
+    presented_before = true;
+    // With present-wait, keep one frame queued: wait until the previous present was shown. On
+    // time this costs nothing; it holds a present only when the display fell behind.
+    pacing::PresentWaiter::QueueWait queue_wait;
+    if (waiter) {
+      queue_wait = waiter->WaitForShown(0, period);
+    }
+    PresentLatestGuestOutput();
+    const Clock::time_point presented = Clock::now();
+    std::optional<pacing::PresentWaiter::Shown> shown;
+    if (waiter) {
+      shown = waiter->TakeLatestShown();
+    }
+    if (queue_wait.active) {
+      present_wait_seen = true;
+      const double wait_ms = std::chrono::duration<double, std::milli>(queue_wait.waited).count();
+      if (queue_wait.waited > Clock::duration::zero()) {
+        ++waited_presents;
+      }
+      wait_timeouts += queue_wait.timed_out;
+      wait_sum_ms += wait_ms;
+      wait_max_ms = std::max(wait_max_ms, wait_ms);
+      unshown_max = std::max(unshown_max, queue_wait.unshown_before);
+    }
+    if (shown) {
+      const double shown_ms =
+          std::chrono::duration<double, std::milli>(shown->shown - shown->presented).count();
+      ++shown_count;
+      shown_sum_ms += shown_ms;
+      shown_max_ms = std::max(shown_max_ms, shown_ms);
+    }
+    if (log) {
+      Clock::time_point arrival{Clock::duration(
+          guest_output_paced_frame_arrival_.load(std::memory_order_relaxed))};
+      pacing::SwapLogRow row;
+      row.present_us = us(presented - log_origin);
+      row.interval_us =
+          last_logged_present == Clock::time_point{} ? 0LL : us(presented - last_logged_present);
+      row.repeated_vblanks = repeated_since_present;
+      row.arrival_after_vblank_us = us(arrival - (target - offset));
+      row.latency_us = us(presented - arrival);
+      row.guest_vblank = vblank_count;
+      // Guest frames dropped before display since the last present.
+      row.frames_replaced =
+          guest_output_paced_frames_replaced_since_present_.exchange(0, std::memory_order_relaxed);
+      // The native renderer's frame the last guest swap showed (0 without one).
+      row.external_sequence = system::external_frame::LastSwappedSequence();
+      row.present_wait = queue_wait.active;
+      row.present_id = waiter ? waiter->LastId() : 0;
+      row.wait_us = us(queue_wait.waited);
+      row.unshown = queue_wait.unshown_before;
+      if (shown) {
+        row.has_shown = true;
+        row.shown_id = shown->id;
+        row.shown_us = us(shown->shown - log_origin);
+        row.shown_after_present_us = us(shown->shown - shown->presented);
+      }
+      std::fputs(pacing::FormatSwapLogRow(row).c_str(), log);
+      last_logged_present = presented;
+    }
+    repeated_since_present = 0;
+    if (!REXCVAR_GET(present_pacing_stats)) {
+      continue;
+    }
+    now = Clock::now();
+    if (last_present != Clock::time_point{}) {
+      double interval_ms = std::chrono::duration<double, std::milli>(now - last_present).count();
+      interval_sum_ms += interval_ms;
+      interval_square_sum_ms += interval_ms * interval_ms;
+      interval_max_ms = std::max(interval_max_ms, interval_ms);
+      ++presents;
+    }
+    last_present = now;
+    if (now - window_start >= std::chrono::seconds(5) && presents) {
+      double mean_ms = interval_sum_ms / presents;
+      double stdev_ms =
+          std::sqrt(std::max(0.0, interval_square_sum_ms / presents - mean_ms * mean_ms));
+      REXLOG_INFO(
+          "Paced presentation 5s: {} frames, interval {:.3f} ms mean, {:.3f} ms stdev, "
+          "{:.3f} ms max; {} vblanks without a new frame ({} presented the last frame again), "
+          "{} frames replaced before display, "
+          "{} host presents; window paints: {} forced, {} UI, {} requested, {} outdated",
+          presents, mean_ms, stdev_ms, interval_max_ms, repeated_vblanks, repeat_presents,
+          guest_output_paced_frames_replaced_.exchange(0, std::memory_order_relaxed),
+          host_presents_.exchange(0, std::memory_order_relaxed),
+          ui_paints_[0].exchange(0, std::memory_order_relaxed),
+          ui_paints_[1].exchange(0, std::memory_order_relaxed),
+          ui_paints_[2].exchange(0, std::memory_order_relaxed),
+          ui_paints_[3].exchange(0, std::memory_order_relaxed));
+      if (present_wait_seen) {
+        REXLOG_INFO(
+            "Present-wait 5s: {} presents waited on the previous one ({:.3f} ms mean over all, "
+            "{:.3f} ms max, {} timeouts), most unshown {}; present to shown {:.3f} ms mean, "
+            "{:.3f} ms max over {} shown",
+            waited_presents, wait_sum_ms / presents, wait_max_ms, wait_timeouts, unshown_max,
+            shown_count ? shown_sum_ms / shown_count : 0.0, shown_max_ms, shown_count);
+      } else {
+        REXLOG_INFO("Present-wait 5s: off (timer pacing)");
+      }
+      presents = repeated_vblanks = repeat_presents = 0;
+      interval_sum_ms = interval_square_sum_ms = interval_max_ms = 0.0;
+      waited_presents = wait_timeouts = unshown_max = shown_count = 0;
+      wait_sum_ms = wait_max_ms = shown_sum_ms = shown_max_ms = 0.0;
+      present_wait_seen = false;
+      window_start = now;
+    }
+  }
+}
+
+void Presenter::PresentLatestGuestOutput() {
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
   {
@@ -682,8 +1037,6 @@ bool Presenter::RefreshGuestOutput(
       host_gpu_loss_callback_(false, false);
     }
   }
-
-  return is_active;
 }
 
 void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
@@ -748,6 +1101,21 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       }
     }
   }
+}
+
+void Presenter::SetCasFromUIThread(bool enabled, float sharpness) {
+#if defined(REX_HAS_FIDELITYFX_SDK)
+  GuestOutputPaintConfig config = guest_output_paint_config_;
+  config.SetEffect(enabled ? GuestOutputPaintConfig::Effect::kCas
+                           : GuestOutputPaintConfig::Effect::kBilinear);
+  if (enabled) {
+    config.SetCasAdditionalSharpness(sharpness);
+  }
+  SetGuestOutputPaintConfigFromUIThread(config);
+#else
+  (void)enabled;
+  (void)sharpness;
+#endif
 }
 
 void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
@@ -1350,9 +1718,10 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
   if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
     return PaintMode::kUIThreadOnRequest;
   }
-  if (surface_paint_connection_has_implicit_vsync_) {
+  if (surface_paint_connection_has_implicit_vsync_ &&
+      !REXCVAR_GET(present_pace_to_guest_vblank)) {
     // Don't be causing host vertical sync CPU waits in the thread generating
-    // the guest output.
+    // the guest output. The pacing thread is dedicated, so it may wait.
     return PaintMode::kUIThreadOnRequest;
   }
   if (!ui_drawers_.empty()) {
@@ -1542,6 +1911,7 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
       g_last_presented_guest_frame = guest_frame;
       g_host_new_guest_presents.fetch_add(1, std::memory_order_relaxed);
     }
+    host_presents_.fetch_add(1, std::memory_order_relaxed);
   }
   switch (result) {
     case PaintResult::kPresented:

@@ -11,7 +11,10 @@
 
 #include <rex/rex_app.h>
 
+#include <chrono>
 #include <cstdlib>
+#include <future>
+#include <thread>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -30,9 +33,11 @@
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
+#include <rex/kernel/xam/live/upnp.h>
 #include <rex/string/numeric.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
+#include <rex/system/external_frame.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
@@ -425,7 +430,8 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
     }
   });
-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
+  // F4 belongs to the game's own settings page; the cvar overlay moves to F6.
+  rex::ui::RegisterBind("bind_settings", "F6", "Toggle settings overlay", [this] {
     if (settings_overlay_) {
       settings_overlay_.reset();
     } else {
@@ -455,10 +461,18 @@ void ReXApp::LaunchModule() {
     if (achievement_notification_ && achievement_notification_listener_ == 0 && runtime_ &&
         runtime_->kernel_state()) {
       std::weak_ptr<ui::AchievementNotificationDialog> notification = achievement_notification_;
+      auto* context = &app_context();
+      auto* drawer = imgui_drawer_.get();
       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
-          [notification](const rex::system::AchievementEvent& event) {
+          [notification, context, drawer](const rex::system::AchievementEvent& event) {
             if (auto dialog = notification.lock()) {
               dialog->Push(event);
+              // The toast registers itself only while it has something to show.
+              context->CallInUIThread([notification, drawer]() {
+                if (auto shown = notification.lock()) {
+                  drawer->AddDialog(shown.get());
+                }
+              });
             }
           });
     }
@@ -473,7 +487,10 @@ void ReXApp::LaunchModule() {
     }
 
     auto* graphics_system = runtime_->graphics_system();
-    if (graphics_system && !runtime_->cache_root().empty()) {
+    // The native renderer draws instead of Xenos, so its stored pipelines would only
+    // cost startup time (seconds on a fresh driver cache).
+    if (graphics_system && !runtime_->cache_root().empty() &&
+        !system::external_frame::IsEnabled()) {
       uint32_t title_id = runtime_->kernel_state()->title_id();
       if (title_id != 0) {
         REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
@@ -508,7 +525,38 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+  if (e.virtual_key() == ui::VirtualKey::kReturn && e.is_alt_pressed()) {
+    // A held key repeats; only the first press switches.
+    if (!e.prev_state()) {
+      ToggleFullscreen();
+    }
+    e.set_handled(true);
+    return;
+  }
   rex::ui::ProcessKeyEvent(e);
+}
+
+void ReXApp::OnMouseDown(ui::MouseEvent& e) {
+  // A double click only enters fullscreen: one in fullscreen is a stray click,
+  // and Alt+Enter is the way back to a window.
+  if (e.button() != ui::MouseEvent::Button::kLeft || e.clicks() != 2 || !window_ ||
+      window_->IsFullscreen()) {
+    return;
+  }
+  // A double click on an overlay window belongs to the overlay.
+  if (imgui_drawer_ && imgui_drawer_->GetIO().WantCaptureMouse) {
+    return;
+  }
+  ToggleFullscreen();
+  e.set_handled(true);
+}
+
+void ReXApp::ToggleFullscreen() {
+  if (!window_) {
+    return;
+  }
+  // Through the cvar, so the change callback applies it and the settings show it.
+  rex::cvar::SetFlagByName("fullscreen", window_->IsFullscreen() ? "false" : "true");
 }
 
 void ReXApp::OnClosing(ui::UIEvent& e) {
@@ -517,6 +565,31 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   shutting_down_.store(true, std::memory_order_release);
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
+  }
+  // The hard exit below skips InputSystem::Shutdown, so stop the pads here or a
+  // motor the game left running keeps buzzing. On a helper thread with a
+  // bounded wait: a straggler may still hold a driver lock.
+  if (runtime_ && runtime_->input_system()) {
+    auto* input = static_cast<rex::input::InputSystem*>(runtime_->input_system());
+    std::packaged_task<void()> stop([input] { input->StopVibration(); });
+    auto stopped = stop.get_future();
+    // Detached, so a stop stuck on a driver lock cannot hold up the exit. Safe
+    // only because std::_Exit below ends the process right after: the thread
+    // never outlives `input`.
+    std::thread(std::move(stop)).detach();
+    if (stopped.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {
+      REXLOG_WARN("Pad vibration stop timed out at exit");
+    }
+  }
+  // --wwe_online_upnp: the router mappings go with the game. Bounded the same way: the
+  // router may not answer.
+  if (rex::kernel::xam::live::upnp::Enabled()) {
+    std::packaged_task<void()> unmap([] { rex::kernel::xam::live::upnp::RemoveMappings(); });
+    auto unmapped = unmap.get_future();
+    std::thread(std::move(unmap)).detach();
+    if (unmapped.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+      REXLOG_WARN("Removing the UPnP port mappings timed out at exit");
+    }
   }
   // Hard-exit rather than run subsystem teardown, which can deadlock on a host
   // lock still held by a straggler TerminateTitle left running. Flush (not
@@ -529,6 +602,10 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 
 bool ReXApp::OnCloseRequested(ui::UIEvent& e) {
   (void)e;
+  // Written out at once, so a log that lacks it shows the close never reached
+  // the app (run 1 of the vibration work ended with no close lines at all).
+  REXLOG_INFO("Window close requested");
+  rex::FlushLogging();
   return OnWindowCloseRequested();
 }
 

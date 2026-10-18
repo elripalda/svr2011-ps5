@@ -101,6 +101,97 @@ void Sleep(std::chrono::microseconds duration) {
   }
 }
 
+void PreciseSleep(std::chrono::microseconds duration) {
+  struct HighResolutionTimer {
+    HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                           TIMER_ALL_ACCESS);
+    ~HighResolutionTimer() {
+      if (handle) {
+        CloseHandle(handle);
+      }
+    }
+  };
+  thread_local HighResolutionTimer timer;
+  if (duration.count() <= 0) {
+    return;
+  }
+  LARGE_INTEGER due_time;
+  due_time.QuadPart = -int64_t(duration.count()) * 10;
+  if (!timer.handle || !SetWaitableTimer(timer.handle, &due_time, 0, nullptr, nullptr, FALSE)) {
+    Sleep(duration);
+    return;
+  }
+  WaitForSingleObject(timer.handle, INFINITE);
+}
+
+namespace {
+// avrt.dll, loaded on demand so the runtime does not link it.
+struct Avrt {
+  using SetFn = HANDLE(WINAPI*)(LPCWSTR task, LPDWORD index);
+  using PriorityFn = BOOL(WINAPI*)(HANDLE handle, int priority);
+  using RevertFn = BOOL(WINAPI*)(HANDLE handle);
+  SetFn set = nullptr;
+  PriorityFn priority = nullptr;
+  RevertFn revert = nullptr;
+  Avrt() {
+    if (HMODULE module = LoadLibraryW(L"avrt.dll")) {
+      set = reinterpret_cast<SetFn>(GetProcAddress(module, "AvSetMmThreadCharacteristicsW"));
+      priority = reinterpret_cast<PriorityFn>(GetProcAddress(module, "AvSetMmThreadPriority"));
+      revert = reinterpret_cast<RevertFn>(GetProcAddress(module, "AvRevertMmThreadCharacteristics"));
+    }
+  }
+};
+const Avrt& GetAvrt() {
+  static const Avrt avrt;
+  return avrt;
+}
+thread_local HANDLE mmcss_handle = nullptr;
+}  // namespace
+
+bool JoinMmcssGames() {
+  const Avrt& avrt = GetAvrt();
+  if (mmcss_handle) {
+    return true;
+  }
+  if (!avrt.set) {
+    return false;
+  }
+  DWORD index = 0;
+  mmcss_handle = avrt.set(L"Games", &index);
+  if (!mmcss_handle) {
+    return false;
+  }
+  if (avrt.priority) {
+    avrt.priority(mmcss_handle, 1 /* AVRT_PRIORITY_HIGH */);
+  }
+  return true;
+}
+
+void LeaveMmcss() {
+  if (mmcss_handle && GetAvrt().revert) {
+    GetAvrt().revert(mmcss_handle);
+  }
+  mmcss_handle = nullptr;
+}
+
+void SetCurrentThreadPriorityHighest() {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+}
+
+bool RequestHighQosTimers() {
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+  PROCESS_POWER_THROTTLING_STATE state = {};
+  state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  // Control both, state off: not throttled (HighQoS), timer resolution honoured.
+  state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                      PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+  state.StateMask = 0;
+  return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+                               sizeof(state)) != FALSE;
+}
+
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
   if (SleepEx(static_cast<DWORD>(duration.count() / 1000), TRUE) == WAIT_IO_COMPLETION) {
     return SleepResult::kAlerted;

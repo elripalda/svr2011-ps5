@@ -613,6 +613,11 @@ void Window::OnRestored(WindowDestructionReceiver& destruction_receiver) {
   if (!CanSendEventsToListeners()) {
     return;
   }
+  // Minimizing can disconnect the surface and SDL may restore the same size without
+  // a resize event, so refresh it before notifying listeners.
+  if (presenter_surface_) {
+    presenter_->OnSurfaceResizeFromUIThread();
+  }
   UIEvent e(this);
   SendEventToListeners([&e](auto listener) { listener->OnRestored(e); }, destruction_receiver);
 }

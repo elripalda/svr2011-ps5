@@ -39,6 +39,11 @@ class ImGuiDialog {
 
   void Draw();
 
+  // True for a dialog with no input that is fine being redrawn only when the
+  // guest presents a new frame. While only such dialogs are shown, the UI is
+  // not repainted at the monitor refresh rate.
+  virtual bool PaintsWithGuestFrames() const { return false; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

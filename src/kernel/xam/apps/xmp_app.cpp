@@ -85,10 +85,10 @@ XmpApp::XmpApp(KernelState* kernel_state)
       next_song_handle_(1) {}
 
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
-  if (REXCVAR_GET(xmp_throttle) && !XThread::GetCurrentThread()->main_thread()) {
-    // Some stupid games will hammer this on a thread - induce a delay
-    // here to keep from starving real threads.
-    rex::thread::Sleep(std::chrono::milliseconds(1));
+  if (!XThread::GetCurrentThread()->main_thread()) {
+    // Some games poll this from a worker thread. Yield instead of sleeping:
+    // a fixed delay stalls games that call it once per frame (SVR 2011 backstage).
+    rex::thread::MaybeYield();
   }
 
   REXKRNL_TRACE("XMPGetStatus({:08X})", state_ptr);
@@ -493,9 +493,10 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                        user_playlist_playing_ ? 1 : 0);
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
 
-      if (REXCVAR_GET(xmp_throttle) && !XThread::GetCurrentThread()->main_thread()) {
-        // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
-        rex::thread::Sleep(std::chrono::milliseconds(10));
+      if (!XThread::GetCurrentThread()->main_thread()) {
+        // Atrain polls this in a tight loop forever, but SVR 2011 calls it twice per frame
+        // on a worker the main thread waits for; a 10 ms sleep there drops frames.
+        rex::thread::MaybeYield();
       }
 
       return X_E_SUCCESS;

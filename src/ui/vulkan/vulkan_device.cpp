@@ -21,6 +21,7 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/device_extension_plan.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -47,6 +48,10 @@ REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC, "UI/Vulka
 REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/Vulkan",
                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
                     "allow fallback to solid fill for line/point polygon modes)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_force_legacy_device, false, "UI/Vulkan",
+                    "Developer: do not enable graphics pipeline libraries, extended dynamic state "
+                    "or present-wait, to test the paths for devices without them")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -278,6 +283,21 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
 
+  // Optional extensions are only noted here; which ones to enable depends on the whole set.
+  DeviceOffer optional_offer;
+  optional_offer.vulkan_1_3 = properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0);
+  optional_offer.surface_capabilities2 =
+      vulkan_instance->extensions().ext_KHR_get_surface_capabilities2;
+  const std::unordered_map<std::string, bool*> optional_extensions = {
+      {"VK_KHR_pipeline_library", &optional_offer.pipeline_library},
+      {"VK_EXT_graphics_pipeline_library", &optional_offer.graphics_pipeline_library},
+      {"VK_KHR_present_id2", &optional_offer.present_id2},
+      {"VK_KHR_present_wait2", &optional_offer.present_wait2},
+      {"VK_KHR_present_id", &optional_offer.present_id},
+      {"VK_KHR_present_wait", &optional_offer.present_wait},
+  };
+  const bool force_legacy_device = REXCVAR_GET(vulkan_force_legacy_device);
+
   std::vector<const char*> enabled_extensions;
   {
     uint32_t supported_extension_count = 0;
@@ -298,6 +318,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       }
       assert_true(supported_extension_count == supported_extensions.size());
       for (const VkExtensionProperties& supported_extension : supported_extensions) {
+        const auto optional_extension_it =
+            optional_extensions.find(supported_extension.extensionName);
+        if (optional_extension_it != optional_extensions.cend()) {
+          *optional_extension_it->second = true;
+          continue;
+        }
         const auto requested_extension_it =
             requested_extensions.find(supported_extension.extensionName);
         if (requested_extension_it == requested_extensions.cend()) {
@@ -321,6 +347,28 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (with_swapchain && !device->extensions_.ext_KHR_swapchain) {
     REXLOG_WARN("Vulkan device '{}' doesn't support swapchains", properties.deviceName);
     return nullptr;
+  }
+
+  const DeviceRequest optional_request = RequestOptionalExtensions(
+      optional_offer, with_gpu_emulation, with_swapchain, force_legacy_device);
+  {
+    const auto enable_optional = [&](bool requested, const char* name, bool& enabled) {
+      if (requested) {
+        enabled_extensions.push_back(name);
+        enabled = true;
+      }
+    };
+    Extensions& ext = device->extensions_;
+    enable_optional(optional_request.pipeline_library, "VK_KHR_pipeline_library",
+                    ext.ext_KHR_pipeline_library);
+    enable_optional(optional_request.graphics_pipeline_library,
+                    "VK_EXT_graphics_pipeline_library", ext.ext_EXT_graphics_pipeline_library);
+    enable_optional(optional_request.present_id2, "VK_KHR_present_id2", ext.ext_KHR_present_id2);
+    enable_optional(optional_request.present_wait2, "VK_KHR_present_wait2",
+                    ext.ext_KHR_present_wait2);
+    enable_optional(optional_request.present_id, "VK_KHR_present_id", ext.ext_KHR_present_id);
+    enable_optional(optional_request.present_wait, "VK_KHR_present_wait",
+                    ext.ext_KHR_present_wait);
   }
 
   VkDeviceCreateInfo device_create_info = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -374,6 +422,23 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceDescriptorIndexingFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT>
       features_1_2_EXT_descriptor_indexing;
+  VulkanFeatures<VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT>
+      features_EXT_graphics_pipeline_library;
+  VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT properties_EXT_graphics_pipeline_library = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+  VulkanFeatures<VkPhysicalDevicePresentId2FeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR>
+      features_KHR_present_id2;
+  VulkanFeatures<VkPhysicalDevicePresentWait2FeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR>
+      features_KHR_present_wait2;
+  VulkanFeatures<VkPhysicalDevicePresentIdFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR>
+      features_KHR_present_id;
+  VulkanFeatures<VkPhysicalDevicePresentWaitFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR>
+      features_KHR_present_wait;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -416,6 +481,23 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_graphics_pipeline_library) {
+      features_EXT_graphics_pipeline_library.Link(supported_features_2, device_create_info);
+      properties_EXT_graphics_pipeline_library.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_EXT_graphics_pipeline_library;
+    }
+    if (device->extensions_.ext_KHR_present_id2) {
+      features_KHR_present_id2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_present_wait2) {
+      features_KHR_present_wait2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_present_id) {
+      features_KHR_present_id.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_present_wait) {
+      features_KHR_present_wait.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -684,6 +766,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(shaderCullDistance)
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
+    XE_UI_VULKAN_FEATURE(shaderInt64)
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -710,6 +793,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       }
       device->properties_.appRendererFeatures = app_renderer;
       REXLOG_INFO("* app renderer features: {}", app_renderer);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorIndexing);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, shaderSampledImageArrayNonUniformIndexing);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingVariableDescriptorCount);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingUpdateUnusedWhilePending);
     }
   } else {
     if (with_gpu_emulation) {
@@ -812,6 +903,44 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  {
+    DeviceFeatureOffer feature_offer;
+    feature_offer.graphicsPipelineLibrary =
+        features_EXT_graphics_pipeline_library.supported.graphicsPipelineLibrary;
+    feature_offer.graphicsPipelineLibraryFastLinking =
+        properties_EXT_graphics_pipeline_library.graphicsPipelineLibraryFastLinking;
+    feature_offer.graphicsPipelineLibraryIndependentInterpolationDecoration =
+        properties_EXT_graphics_pipeline_library
+            .graphicsPipelineLibraryIndependentInterpolationDecoration;
+    feature_offer.presentId2 = features_KHR_present_id2.supported.presentId2;
+    feature_offer.presentWait2 = features_KHR_present_wait2.supported.presentWait2;
+    feature_offer.presentId = features_KHR_present_id.supported.presentId;
+    feature_offer.presentWait = features_KHR_present_wait.supported.presentWait;
+    const OptionalFeatures optional = EnableOptionalFeatures(
+        optional_request, feature_offer, optional_offer.vulkan_1_3, force_legacy_device);
+    features_EXT_graphics_pipeline_library.enabled.graphicsPipelineLibrary =
+        optional.graphicsPipelineLibrary;
+    features_KHR_present_id2.enabled.presentId2 = optional.presentId2;
+    features_KHR_present_wait2.enabled.presentWait2 = optional.presentWait2;
+    features_KHR_present_id.enabled.presentId = optional.presentId;
+    features_KHR_present_wait.enabled.presentWait = optional.presentWait;
+    Properties& p = device->properties_;
+    p.graphicsPipelineLibrary = optional.graphicsPipelineLibrary;
+    p.graphicsPipelineLibraryFastLinking = optional.graphicsPipelineLibraryFastLinking;
+    p.graphicsPipelineLibraryIndependentInterpolationDecoration =
+        optional.graphicsPipelineLibraryIndependentInterpolationDecoration;
+    p.extendedDynamicState = optional.extendedDynamicState;
+    p.presentId2 = optional.presentId2;
+    p.presentWait2 = optional.presentWait2;
+    p.presentId = optional.presentId;
+    p.presentWait = optional.presentWait;
+    REXLOG_INFO("Vulkan optional device features{}:",
+                force_legacy_device ? " (forced off by vulkan_force_legacy_device)" : "");
+    for (const std::string& line : DescribeOptionalFeatures(optional)) {
+      REXLOG_INFO("* {}", line);
+    }
+  }
+
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
 #undef XE_UI_VULKAN_FEATURE
@@ -856,6 +985,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
 #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
+#include <rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
@@ -882,6 +1012,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+  }
+  if (device->extensions_.ext_KHR_present_wait) {
+#include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+  }
+  if (device->extensions_.ext_KHR_present_wait2) {
+#include <rex/ui/vulkan/functions/device_khr_present_wait2.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

@@ -28,6 +28,17 @@ set(REXKERNEL_SOURCES
     xam/apps/xlivebase_app.cpp
     xam/apps/xmp_app.cpp
 
+    # WWE All Stars recomp: online play (.scratch/online-play/)
+    xam/live/http.cpp
+    xam/live/identity.cpp
+    xam/live/live.cpp
+    xam/live/relay.cpp
+    xam/live/relay_protocol.cpp
+    xam/live/upnp.cpp
+    xam/live/session_data.cpp
+    xam/live/xlive_json.cpp
+    xam/live/xsession.cpp
+
     # XBDM subsystem - provides __imp__Xbdm* symbols
     xbdm/xbdm_module.cpp
     xbdm/xbdm_misc.cpp
@@ -67,3 +78,46 @@ list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
 target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
+
+# WWE All Stars recomp, online play: the client ported from the Xenia netplay fork talks
+# HTTP(S) to the game server with libcurl (Schannel) and reads its JSON with rapidjson, from
+# the source folders scripts/bootstrap.ps1 fetches at the fork's pinned commits.
+set(REXGLUE_CURL_SOURCE_DIR "" CACHE PATH "libcurl source folder (online play)")
+set(REXGLUE_RAPIDJSON_SOURCE_DIR "" CACHE PATH "rapidjson source folder (online play)")
+if(NOT EXISTS "${REXGLUE_CURL_SOURCE_DIR}/CMakeLists.txt" OR
+   NOT EXISTS "${REXGLUE_RAPIDJSON_SOURCE_DIR}/include/rapidjson/rapidjson.h")
+    message(FATAL_ERROR "Set REXGLUE_CURL_SOURCE_DIR and REXGLUE_RAPIDJSON_SOURCE_DIR "
+        "(scripts/bootstrap.ps1 fetches both).")
+endif()
+set(BUILD_SHARED_LIBS OFF)
+foreach(_curl_on BUILD_STATIC_LIBS CURL_DISABLE_INSTALL HTTP_ONLY)
+    set(${_curl_on} ON CACHE BOOL "" FORCE)
+endforeach()
+foreach(_curl_off BUILD_CURL_EXE BUILD_TESTING BUILD_LIBCURL_DOCS BUILD_MISC_DOCS
+        ENABLE_CURL_MANUAL BUILD_EXAMPLES CURL_ZLIB CURL_BROTLI CURL_ZSTD USE_NGHTTP2
+        USE_LIBIDN2 USE_WIN32_IDN CURL_USE_LIBPSL CURL_USE_LIBSSH2 CURL_USE_LIBSSH
+        CURL_USE_GSSAPI CURL_USE_OPENSSL CURL_USE_MBEDTLS CURL_USE_WOLFSSL CURL_USE_GNUTLS
+        CURL_USE_RUSTLS ENABLE_UNICODE CURL_LTO)
+    set(${_curl_off} OFF CACHE BOOL "" FORCE)
+endforeach()
+if(WIN32)
+    set(CURL_USE_SCHANNEL ON CACHE BOOL "" FORCE)
+endif()
+add_subdirectory(${REXGLUE_CURL_SOURCE_DIR} ${CMAKE_BINARY_DIR}/thirdparty/curl EXCLUDE_FROM_ALL)
+target_link_libraries(rexruntime PRIVATE CURL::libcurl_static)
+target_include_directories(rexruntime PUBLIC
+    $<BUILD_INTERFACE:${REXGLUE_RAPIDJSON_SOURCE_DIR}/include>)
+
+# UPnP port mapping (--wwe_online_upnp) with miniupnpc, at the fork's pinned commit.
+set(REXGLUE_MINIUPNPC_SOURCE_DIR "" CACHE PATH "miniupnpc source folder (online play)")
+if(NOT EXISTS "${REXGLUE_MINIUPNPC_SOURCE_DIR}/include/miniupnpc.h")
+    message(FATAL_ERROR "Set REXGLUE_MINIUPNPC_SOURCE_DIR (scripts/bootstrap.ps1 fetches it).")
+endif()
+foreach(_upnpc_off UPNPC_BUILD_SHARED UPNPC_BUILD_TESTS UPNPC_BUILD_SAMPLE)
+    set(${_upnpc_off} OFF CACHE BOOL "" FORCE)
+endforeach()
+set(UPNPC_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(UPNPC_NO_INSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory(${REXGLUE_MINIUPNPC_SOURCE_DIR} ${CMAKE_BINARY_DIR}/thirdparty/miniupnpc
+    EXCLUDE_FROM_ALL)
+target_link_libraries(rexruntime PRIVATE libminiupnpc-static)

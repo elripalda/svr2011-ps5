@@ -190,6 +190,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+    // #120. Needed by VK_KHR_present_id2 / VK_KHR_present_wait2.
+    requested_extensions.emplace("VK_KHR_get_surface_capabilities2",
+                                 &vulkan_instance->extensions_.ext_KHR_get_surface_capabilities2);
 #ifdef VK_USE_PLATFORM_XCB_KHR
     // #6.
     requested_extensions.emplace("VK_KHR_xcb_surface",
@@ -505,6 +508,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 #endif
   if (vulkan_instance->extensions_.ext_KHR_surface) {
 #include <rex/ui/vulkan/functions/instance_khr_surface.inc>
+  }
+  if (vulkan_instance->extensions_.ext_KHR_get_surface_capabilities2) {
+#include <rex/ui/vulkan/functions/instance_khr_get_surface_capabilities2.inc>
   }
   if (vulkan_instance->extensions_.ext_EXT_debug_utils) {
 #include <rex/ui/vulkan/functions/instance_ext_debug_utils.inc>

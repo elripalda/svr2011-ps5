@@ -17,6 +17,7 @@ set(REXGPU_XENOS_SOURCES
 
     # GPU system
     graphics_system.cpp
+    display_vblank.cpp
     command_processor.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
@@ -161,6 +162,11 @@ if(REXGLUE_USE_VULKAN)
         OSDependent
         OGLCompiler
     )
+endif()
+
+if(WIN32)
+    # D3DKMT vblank events (display_vblank.cpp).
+    target_link_libraries(rexgpu-xenos PRIVATE gdi32)
 endif()
 
 if(REXGLUE_USE_D3D12)

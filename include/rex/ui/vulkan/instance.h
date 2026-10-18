@@ -89,6 +89,8 @@ class VulkanInstance {
 #include <rex/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc>
     // VK_EXT_debug_utils (#129)
 #include <rex/ui/vulkan/functions/instance_ext_debug_utils.inc>
+    // VK_KHR_get_surface_capabilities2 (#120)
+#include <rex/ui/vulkan/functions/instance_khr_get_surface_capabilities2.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };
@@ -122,6 +124,7 @@ class VulkanInstance {
     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
     bool ext_EXT_debug_utils = false;                          // #129
     bool ext_KHR_portability_enumeration = false;              // #395
+    bool ext_KHR_get_surface_capabilities2 = false;            // #120
   };
 
   const Extensions& extensions() const { return extensions_; }
