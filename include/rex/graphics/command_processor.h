@@ -87,6 +87,12 @@ class CommandProcessor {
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
 
+  // The 256-entry display gamma table the guest last programmed (DC_LUT_30_COLOR per entry): for a
+  // renderer outside the command processor (the null backend's app) to show the frame through it.
+  const reg::DC_LUT_30_COLOR* guest_gamma_ramp_256_entry_table() const {
+    return gamma_ramp_256_entry_table_;
+  }
+
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
 
