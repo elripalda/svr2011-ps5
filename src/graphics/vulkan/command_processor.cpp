@@ -2490,18 +2490,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
-  // [svr2011] The app's own frames have the shape to show (16:9, or as wide
-  // as the window in the port's wide-screen matches): letterboxed to it.
-  if (external_frame.vk_image_view && external_frame.width && external_frame.height) {
-    display_width = external_frame.width;
-    display_height = external_frame.height;
-  }
 
   // [svr2011] Where the shown frames came from, now and then (a phone showed
   // only black while the native renderer drew: this tells which side stops).
   static uint64_t swaps = 0, swaps_external = 0, swaps_failed = 0;
-  const bool external_swap = swap_texture_view == VkImageView(external_frame.vk_image_view) &&
-                             external_frame.vk_image_view;
+  const bool external_swap =
+      external_frame.image_view &&
+      swap_texture_view == reinterpret_cast<VkImageView>(static_cast<uintptr_t>(external_frame.image_view));
   const bool refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
