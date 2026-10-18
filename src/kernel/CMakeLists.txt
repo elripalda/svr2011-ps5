@@ -86,8 +86,8 @@ if(REX_PS5)
     if(NOT EXISTS "${REXGLUE_RAPIDJSON_SOURCE_DIR}/include/rapidjson/rapidjson.h")
         message(FATAL_ERROR "Set REXGLUE_RAPIDJSON_SOURCE_DIR (Tencent/rapidjson at 7c73dd7).")
     endif()
-    target_include_directories(rexruntime PUBLIC
-        $<BUILD_INTERFACE:${REXGLUE_RAPIDJSON_SOURCE_DIR}/include>)
+    # (private: only the runtime's own Live sources read it, so the game's code isn't rebuilt)
+    target_include_directories(rexruntime PRIVATE ${REXGLUE_RAPIDJSON_SOURCE_DIR}/include)
 else()
 # WWE All Stars recomp, online play: the client ported from the Xenia netplay fork talks
 # HTTP(S) to the game server with libcurl (Schannel) and reads its JSON with rapidjson, from
