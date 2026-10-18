@@ -79,6 +79,13 @@ class Clock {
   // Sets the system time of the guest.
   static void SetGuestSystemTime(uint64_t system_time);
 
+  // Replaces the host tick count that drives every guest clock (timebase,
+  // system time, uptime); nullptr restores the host clock. Set it before guest
+  // threads run. Used for deterministic runs: the source decides how fast
+  // guest time passes.
+  using HostTickSource = uint64_t (*)();
+  static void set_host_tick_source(HostTickSource source);
+
   // Scales a time duration in milliseconds, from guest time.
   static uint32_t ScaleGuestDurationMillis(uint32_t guest_ms);
   // Scales a time duration in 100ns ticks like FILETIME, from guest time.

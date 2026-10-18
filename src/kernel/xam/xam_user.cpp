@@ -15,6 +15,9 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+#include <rex/kernel/xam/live/live.h>
+#include <rex/kernel/xam/live/xsession.h>
+#include <rex/kernel/xam/net_trace.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -49,8 +52,8 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
-        // maybe online profile?
-        xuid = user_profile->xuid();
+        // maybe online profile? Signed in to Live, the install's online XUID.
+        xuid = live::SignedIn() ? live::OnlineXuid() : user_profile->xuid();
         result = X_E_SUCCESS;
       } else if (type & 1) {
         // maybe offline profile?
@@ -100,6 +103,14 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   info->xuid = user_profile->xuid();
   info->signin_state = user_profile->signin_state();
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+  // Signed in to Live: the online XUID (unless only the offline one is asked for, flag 1)
+  // and the online name.
+  if (live::SignedIn()) {
+    if (flags != 1) {
+      info->xuid = live::OnlineXuid();
+    }
+    rex::string::copy_truncating(info->name, live::Gamertag(), rex::countof(info->name));
+  }
   return X_E_SUCCESS;
 }
 
@@ -113,7 +124,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  const auto& user_name = user_profile->name();
+  const auto user_name = live::SignedIn() ? live::Gamertag() : user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
@@ -382,8 +393,9 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // If we deny everything, games should hopefully not try to do stuff. Signed in to Live
+  // (--wwe_online), every privilege is granted.
+  *out_value = live::SignedIn() ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
@@ -713,11 +725,24 @@ u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u3
 }
 
 u32 XamSessionCreateHandle_entry(mapped_u32 handle_ptr) {
+  // With --wwe_online, a real session object (live/xsession.cpp).
+  if (live::Enabled()) {
+    uint32_t handle = 0;
+    const X_RESULT result = live::CreateSessionHandle(&handle);
+    *handle_ptr = handle;
+    return result;
+  }
   *handle_ptr = 0xCAFEDEAD;
   return X_ERROR_SUCCESS;
 }
 
 u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
+  if (live::Enabled()) {
+    uint32_t guest_object = 0;
+    const X_RESULT result = live::SessionObjectByHandle(handle, &guest_object);
+    *obj_ptr = guest_object;
+    return result;
+  }
   assert_true(handle == 0xCAFEDEAD);
   // TODO(PermaNull): Implement this properly,
   // For the time being returning 0xDEADF00D will prevent crashing.
@@ -738,7 +763,7 @@ REX_EXPORT(__imp__XamUserReadProfileSettings, rex::kernel::xam::XamUserReadProfi
 REX_EXPORT(__imp__XamUserReadProfileSettingsEx,
            rex::kernel::xam::XamUserReadProfileSettingsEx_entry)
 REX_EXPORT(__imp__XamUserWriteProfileSettings, rex::kernel::xam::XamUserWriteProfileSettings_entry)
-REX_EXPORT(__imp__XamUserCheckPrivilege, rex::kernel::xam::XamUserCheckPrivilege_entry)
+REX_TRACE_EXPORT(__imp__XamUserCheckPrivilege, rex::kernel::xam::XamUserCheckPrivilege_entry)
 REX_EXPORT(__imp__XamUserContentRestrictionGetFlags,
            rex::kernel::xam::XamUserContentRestrictionGetFlags_entry)
 REX_EXPORT(__imp__XamUserContentRestrictionGetRating,
@@ -754,8 +779,8 @@ REX_EXPORT(__imp__XamUserCreateAchievementEnumerator,
 REX_EXPORT(__imp__XamParseGamerTileKey, rex::kernel::xam::XamParseGamerTileKey_entry)
 REX_EXPORT(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_entry)
 REX_EXPORT(__imp__XamWriteGamerTile, rex::kernel::xam::XamWriteGamerTile_entry)
-REX_EXPORT(__imp__XamSessionCreateHandle, rex::kernel::xam::XamSessionCreateHandle_entry)
-REX_EXPORT(__imp__XamSessionRefObjByHandle, rex::kernel::xam::XamSessionRefObjByHandle_entry)
+REX_TRACE_EXPORT(__imp__XamSessionCreateHandle, rex::kernel::xam::XamSessionCreateHandle_entry)
+REX_TRACE_EXPORT(__imp__XamSessionRefObjByHandle, rex::kernel::xam::XamSessionRefObjByHandle_entry)
 
 REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);

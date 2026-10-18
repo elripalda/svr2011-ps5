@@ -14,6 +14,7 @@
 #include "rex/system/function_dispatcher.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -75,6 +76,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;
 
   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
+  void SetGuestVblankRate(double hz) override;
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
   virtual void ClearCaches();
@@ -120,6 +122,33 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   std::atomic<bool> vsync_worker_running_;
   system::object_ref<system::XHostThread> vsync_worker_thread_;
+
+  // SetGuestVblankRate's rate, 0 for the video mode's; read by the GPU VSync thread each vblank.
+  std::atomic<double> guest_vblank_rate_override_{0.0};
+  // Bumped by each SetGuestVblankRate, so the display thread can tell that the rate it locked
+  // to is already stale.
+  std::atomic<uint64_t> guest_vblank_rate_generation_{0};
+  // The video mode's refresh rate, read once before the GPU VSync thread starts (the mode is
+  // fixed for the session): querying it takes the cvar registry's lock.
+  std::atomic<double> video_mode_vblank_hz_{60.0};
+  // The guest vblank's current rate: the override, else the video mode's.
+  double GuestVblankHz() const;
+
+  // The guest vblank's ideal time (steady_clock ticks) and count, for comparing it with the
+  // host display's real vblank.
+  std::atomic<int64_t> guest_vblank_time_{0};
+  std::atomic<uint64_t> guest_vblank_count_{0};
+  std::atomic<bool> display_vblank_running_{false};
+  std::thread display_vblank_thread_;
+  void DisplayVblankThread();
+
+  // ADR-0016: while display_lock_every_ is N > 0, the display thread signals a guest vblank every
+  // N display refreshes and the GPU VSync thread waits for it instead of the host clock.
+  std::atomic<uint32_t> display_lock_every_{0};
+  std::mutex display_tick_mutex_;
+  std::condition_variable display_tick_cv_;
+  uint64_t display_ticks_ = 0;     // guest vblanks signalled so far
+  int64_t display_tick_time_ = 0;  // steady_clock ticks of the display refresh that made the last
 
   RegisterFile register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;

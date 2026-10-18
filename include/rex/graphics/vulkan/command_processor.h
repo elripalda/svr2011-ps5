@@ -452,7 +452,25 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t written_size[2] = {0, 0};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    // Consecutive frames this target has been resolved on, for ReadbackResolveMode::kBurst.
+    uint32_t frame_streak = 0;
   };
+  // Beyond this many consecutive frames a target counts as per-frame and is not read back.
+  // Created-attire bakes resolve each texture on isolated frames; finisher effects and menu
+  // tiles resolve the same target on 8+ frames in a row, and syncing on each doubled its frame.
+  static constexpr uint32_t kReadbackBurstFrames = 1;
+  // Burst-mode resolve copies that are written to guest memory once their submission completes,
+  // so no frame waits on the GPU for them.
+  struct PendingResolveReadback {
+    uint64_t key;
+    uint32_t index;
+    uint64_t submission;
+    uint32_t address;
+    uint32_t length;
+  };
+  std::deque<PendingResolveReadback> pending_resolve_readbacks_;
+  // Writes every completed pending resolve copy to guest memory; with wait, finishes all first.
+  void DeliverResolveReadbacks(bool wait);
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;

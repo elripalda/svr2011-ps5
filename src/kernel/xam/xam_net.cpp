@@ -12,14 +12,24 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <map>
+#include <set>
+#include <random>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
 #endif
 
 #include <rex/chrono/clock.h>
+#include <rex/kernel/xam/live/addressing.h>
+#include <rex/kernel/xam/live/live.h>
+#include <rex/kernel/xam/live/relay.h>
+#include <rex/kernel/xam/live/upnp.h>
 #include <rex/kernel/xam/module.h>
+#include <rex/kernel/xam/net_trace.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -28,9 +38,11 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/overlapped_receive.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xsocket.h>
 #include <rex/system/xthread.h>
+#include <rex/thread.h>
 #include <rex/system/xtypes.h>
 
 #if REX_PLATFORM_WIN32
@@ -43,6 +55,9 @@
 #include <netinet/ip.h>
 #include <sys/socket.h>
 #endif
+
+REXCVAR_DEFINE_BOOL(wwe_net_trace, false, "Kernel",
+                    "Log the guest's network, XMsg and session calls (rate-limited)");
 
 namespace rex {
 namespace kernel {
@@ -295,23 +310,167 @@ u32 NetDll_WSAGetLastError_entry() {
   return XThread::GetLastError();
 }
 
-u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_ptr,
-                             u32 buffer_count, mapped_u32 num_bytes_recv, mapped_u32 flags_ptr,
-                             ppc_ptr_t<XSOCKADDR_IN> from_addr,
-                             ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
-                             mapped_void completion_routine_ptr) {
-  if (overlapped_ptr) {
-    // auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(
-    //    overlapped_ptr->event_handle);
-
-    // if (evt) {
-    //  //evt->Set(0, false);
-    //}
+// --wwe_online_ip: a socket that sends or connects to a peer on this PC without a bind
+// leaves from this copy's address, not the default one.
+void BindToOnlineAddress(XSocket* socket, uint32_t destination) {
+  if (!live::Enabled() || socket->bound()) {
+    return;
   }
+  const uint32_t address = live::ImplicitBindAddress(destination, live::BindAddress());
+  if (!address) {
+    return;
+  }
+  N_XSOCKADDR_IN name;
+  name.sin_family = AF_INET;
+  name.sin_port = 0;
+  name.sin_addr = address;
+  socket->Bind(&name, sizeof(sockaddr_in));
+}
 
-  // we're not going to be receiving packets any time soon
-  // return error so we don't wait on that - Cancerous
-  return -1;
+namespace overlapped {
+
+// What a later attempt of a guest WSARecvFrom needs.
+struct Receive {
+  uint32_t socket;
+  uint32_t buffers_ptr;
+  uint32_t buffer_count;
+  uint32_t from_ptr;
+  uint32_t from_len_ptr;
+};
+
+net::OverlappedReceives<Receive> receives;
+
+// One datagram from the host socket into the guest buffers, or -1 when none is waiting.
+int TryReceive(const Receive& r) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(r.socket);
+  if (!socket) {
+    return -1;
+  }
+#if REX_PLATFORM_WIN32
+  const auto native = static_cast<SOCKET>(socket->native_handle());
+#else
+  const auto native = static_cast<int>(socket->native_handle());
+#endif
+  fd_set readable;
+  FD_ZERO(&readable);
+  FD_SET(native, &readable);
+  timeval no_wait{0, 0};
+  if (select(int(native + 1), &readable, nullptr, nullptr, &no_wait) <= 0) {
+    return -1;
+  }
+  // Room for any UDP datagram, so a large one is never cut short here.
+  static thread_local uint8_t data[65536];
+  N_XSOCKADDR_IN from;
+  uint32_t from_len = sizeof(from);
+  const int received = socket->RecvFrom(data, sizeof(data), 0, &from, &from_len);
+  if (received < 0) {
+    return -1;
+  }
+  auto* memory = REX_KERNEL_MEMORY();
+  auto* buffers = memory->TranslateVirtual<XWSABUF*>(r.buffers_ptr);
+  uint32_t copied = 0;
+  for (uint32_t i = 0; i < r.buffer_count && copied < uint32_t(received); ++i) {
+    const uint32_t n = std::min<uint32_t>(buffers[i].len, uint32_t(received) - copied);
+    std::memcpy(memory->TranslateVirtual(buffers[i].buf_ptr), data + copied, n);
+    copied += n;
+  }
+  if (r.from_ptr) {
+    auto* out = memory->TranslateVirtual<XSOCKADDR_IN*>(r.from_ptr);
+    out->sin_family = from.sin_family;
+    // A peer's mapped router port reaches the game as its game port.
+    out->sin_port = live::upnp::Peers().Game(from.sin_addr, from.sin_port);
+    out->sin_addr = from.sin_addr;
+    std::memset(out->x_sin_zero, 0, sizeof(out->x_sin_zero));
+  }
+  if (r.from_len_ptr) {
+    memory::store_and_swap<uint32_t>(memory->TranslateVirtual(r.from_len_ptr), 16);
+  }
+  return int(copied);
+}
+
+// The OVERLAPPED of a finished operation: status, size, and its event signalled.
+void Complete(uint32_t overlapped_ptr, uint32_t bytes) {
+  auto* overlapped = REX_KERNEL_MEMORY()->TranslateVirtual<XWSAOVERLAPPED*>(overlapped_ptr);
+  overlapped->internal = 0;
+  overlapped->internal_high = bytes;
+  if (overlapped->event_handle) {
+    xboxkrnl::xeNtSetEvent(overlapped->event_handle, nullptr);
+  }
+}
+
+}  // namespace overlapped
+
+// A receive that finds no datagram stays pending (WSA_IO_PENDING) when it has an
+// OVERLAPPED; WSAGetOverlappedResult then polls the host socket for it.
+u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket_handle, u32 buffers_ptr, u32 buffer_count,
+                             mapped_u32 num_bytes_recv, mapped_u32 flags_ptr, u32 from_ptr,
+                             u32 from_len_ptr, u32 overlapped_ptr, u32 completion_routine) {
+  if (!REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle)) {
+    XThread::SetLastError(0x2736);  // WSAENOTSOCK
+    return -1;
+  }
+  using Status = decltype(overlapped::receives)::Status;
+  const overlapped::Receive request{socket_handle, buffers_ptr, buffer_count, from_ptr,
+                                    from_len_ptr};
+  const auto outcome = overlapped::receives.Start(overlapped_ptr, request, overlapped::TryReceive);
+  switch (outcome.status) {
+    case Status::kCompleted:
+      if (num_bytes_recv) {
+        *num_bytes_recv = uint32_t(outcome.bytes);
+      }
+      if (flags_ptr) {
+        *flags_ptr = 0;
+      }
+      if (overlapped_ptr) {
+        overlapped::Complete(overlapped_ptr, uint32_t(outcome.bytes));
+      }
+      XThread::SetLastError(0);
+      return 0;
+    case Status::kPending: {
+      auto* overlapped =
+          REX_KERNEL_MEMORY()->TranslateVirtual<XWSAOVERLAPPED*>(overlapped_ptr);
+      overlapped->internal = X_STATUS_PENDING;
+      if (overlapped->event_handle) {
+        xboxkrnl::xeNtClearEvent(overlapped->event_handle);
+      }
+      XThread::SetLastError(net::kWsaIoPending);
+      return -1;
+    }
+    default:
+      XThread::SetLastError(net::kWsaEWouldBlock);
+      return -1;
+  }
+}
+
+u32 NetDll_WSAGetOverlappedResult_entry(u32 caller, u32 socket_handle, u32 overlapped_ptr,
+                                        mapped_u32 bytes_transferred, u32 wait,
+                                        mapped_u32 flags_ptr) {
+  if (!overlapped_ptr) {
+    XThread::SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  using Status = decltype(overlapped::receives)::Status;
+  // A wait gives up after 5 s (a closed socket never delivers), as an incomplete result.
+  const auto outcome = overlapped::receives.Poll(
+      overlapped_ptr, wait ? std::chrono::seconds(5) : std::chrono::seconds(0),
+      overlapped::TryReceive, [] { return std::chrono::steady_clock::now(); },
+      [] { rex::thread::Sleep(std::chrono::milliseconds(1)); });
+  if (outcome.status == Status::kIncomplete) {
+    XThread::SetLastError(net::kWsaIoIncomplete);
+    return 0;
+  }
+  if (outcome.status == Status::kCompleted) {
+    overlapped::Complete(overlapped_ptr, uint32_t(outcome.bytes));
+  }
+  // Completed now, or earlier (a receive that completed at once, or a send).
+  auto* overlapped = REX_KERNEL_MEMORY()->TranslateVirtual<XWSAOVERLAPPED*>(overlapped_ptr);
+  if (bytes_transferred) {
+    *bytes_transferred = overlapped->internal_high;
+  }
+  if (flags_ptr) {
+    *flags_ptr = 0;
+  }
+  return 1;
 }
 
 // If the socket is a VDP socket, buffer 0 is the game data length, and buffer 1
@@ -320,7 +479,6 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
                            u32 num_buffers, mapped_u32 num_bytes_sent, u32 flags,
                            ppc_ptr_t<XSOCKADDR_IN> to_ptr, u32 to_len,
                            ppc_ptr_t<XWSAOVERLAPPED> overlapped, mapped_void completion_routine) {
-  assert(!overlapped);
   assert(!completion_routine);
 
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
@@ -346,10 +504,19 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
+  BindToOnlineAddress(socket.get(), native_to.sin_addr);
+  native_to.sin_port = live::upnp::Peers().External(native_to.sin_addr, native_to.sin_port);
+  if (!live::relay::DropsDirect(native_to.sin_addr, native_to.sin_port)) {
+    socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
+  }
 
-  // TODO: Instantly complete overlapped
-
+  if (num_bytes_sent) {
+    *num_bytes_sent = combined_buffer_size;
+  }
+  // Sends complete at once.
+  if (overlapped) {
+    overlapped::Complete(overlapped.guest_address(), combined_buffer_size);
+  }
   return 0;
 }
 
@@ -435,7 +602,83 @@ struct XnAddrStatus {
   static const uint32_t XNET_GET_XNADDR_TROUBLESHOOT = 0x00008000;
 };
 
+// Keys, addresses and QoS for Player Match peers, after the Xenia netplay fork's
+// xam_net.cc (Copyright 2026 Xenia Canary, BSD license). Players reach each other directly
+// at the addresses the game server sees, so there is no security association to set up:
+// a key is only remembered for XNetInAddrToXnAddr.
+namespace peers {
+std::mutex mutex;
+uint64_t registered_key = 0;  // the last XNKID XNetRegisterKey was given
+
+uint64_t LoadKey(uint32_t guest_xnkid) {
+  return guest_xnkid ? memory::load_and_swap<uint64_t>(REX_KERNEL_MEMORY()->TranslateVirtual(guest_xnkid))
+                     : 0;
+}
+
+// Peers' records from the server, by XUID and by MAC, so each is asked for once; MACs the
+// server doesn't know are remembered too.
+std::map<uint64_t, live::PlayerRecord> known;
+std::set<std::array<uint8_t, 6>> unknown_macs;
+
+std::optional<live::PlayerRecord> PeerByMac(const uint8_t* mac) {
+  {
+    std::lock_guard lock(mutex);
+    for (const auto& [xuid, record] : known) {
+      if (std::memcmp(record.mac.data(), mac, record.mac.size()) == 0) {
+        return record;
+      }
+    }
+  }
+  std::array<uint8_t, 6> key;
+  std::memcpy(key.data(), mac, key.size());
+  {
+    std::lock_guard lock(mutex);
+    if (unknown_macs.count(key)) {
+      return std::nullopt;
+    }
+  }
+  const auto record = live::FindPlayerByMac(key);
+  std::lock_guard lock(mutex);
+  if (record) {
+    known[record->xuid] = *record;
+  } else {
+    unknown_macs.insert(key);
+  }
+  return record;
+}
+
+std::optional<live::PlayerRecord> PeerByXuid(uint64_t xuid) {
+  {
+    std::lock_guard lock(mutex);
+    if (const auto found = known.find(xuid); found != known.end()) {
+      return found->second;
+    }
+  }
+  const auto record = live::FindPlayerByXuid(xuid);
+  if (record) {
+    std::lock_guard lock(mutex);
+    known[xuid] = *record;
+  }
+  return record;
+}
+}  // namespace peers
+
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+  // Signed in to Live: the address the game server sees this copy at, and the install's MAC
+  // (after the Xenia netplay fork's XLiveAPI::IpGetConsoleXnAddr, BSD license).
+  if (live::SignedIn()) {
+    addr_ptr.Zero();
+    addr_ptr->ina.s_addr = htonl(live::LocalAddress());
+    addr_ptr->inaOnline.s_addr = htonl(live::OnlineAddress());
+    addr_ptr->wPortOnline = 36000;
+    const auto mac = live::Mac();
+    std::memcpy(addr_ptr->abEnet, mac.data(), mac.size());
+    addr_ptr->abOnline[16] = 1;  // SGADDR platform type: Xbox 360
+    return XnAddrStatus::XNET_GET_XNADDR_ETHERNET | XnAddrStatus::XNET_GET_XNADDR_STATIC |
+           XnAddrStatus::XNET_GET_XNADDR_GATEWAY | XnAddrStatus::XNET_GET_XNADDR_DNS |
+           XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+  }
+
   // Just return a loopback address atm.
   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
@@ -473,6 +716,14 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
 
 void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                      u32 string_size) {
+  if (live::Enabled()) {
+    rex::string::copy_truncating(
+        string_out,
+        fmt::format("{}.{}.{}.{}", in_addr >> 24, (in_addr >> 16) & 0xFF, (in_addr >> 8) & 0xFF,
+                    in_addr & 0xFF),
+        string_size);
+    return;
+  }
   rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
 }
 
@@ -480,14 +731,67 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 // subsequent socket calls (like a handle to a XNet address)
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
-  return 1;
+  // Signed in to Live, another player is reached at the address in its XNADDR that suits
+  // (live::PeerAddress), and this copy at its own (after the fork's XNetXnAddrToInAddr).
+  if (!live::SignedIn() || !xn_addr || !in_addr) {
+    return 1;
+  }
+  const auto mac = live::Mac();
+  uint32_t address = live::PeerAddress(ntohl(xn_addr->ina.s_addr),
+                                       ntohl(xn_addr->inaOnline.s_addr), live::OnlineAddress());
+  if (std::memcmp(xn_addr->abEnet, mac.data(), mac.size()) == 0) {
+    address = live::LocalAddress();
+  } else if (const auto peer = peers::PeerByMac(xn_addr->abEnet)) {
+    // Reached at its public address: through the router ports it mapped, if any.
+    if (live::ParseIPv4(peer->host_address) == address) {
+      live::upnp::Peers().Remember(address, peer->mapped_ports);
+    }
+    // Direct when the peer answers a direct probe, else its stand-in address, where the
+    // relay transport listens for it (live::relay::AddressFor).
+    if (live::relay::Configured()) {
+      address = live::relay::AddressFor(peer->xuid, address);
+    }
+  }
+  memory::store_and_swap<uint32_t>(in_addr.host_address(), address);
+  return 0;
 }
 
 // Does the reverse of the above.
 // FIXME: Arguments may not be correct.
-u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
+u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, u32 in_addr, ppc_ptr_t<XNADDR> xn_addr,
                                     mapped_void xid) {
-  return 1;
+  // Signed in to Live: this copy's XNADDR, or another player's from the server
+  // (players/find gives its MAC); the key is the one XNetRegisterKey was given.
+  if (!live::SignedIn() || !xn_addr) {
+    return 1;
+  }
+  xn_addr.Zero();
+  if (in_addr == live::LocalAddress() || in_addr == live::OnlineAddress() ||
+      in_addr == INADDR_LOOPBACK) {
+    NetDll_XNetGetTitleXnAddr_entry(caller, xn_addr);
+  } else {
+    uint32_t local = in_addr, online = in_addr;
+    const auto relayed_xuid = live::relay::PeerAt(in_addr);
+    const auto player =
+        relayed_xuid ? peers::PeerByXuid(*relayed_xuid) : live::FindPlayer(in_addr);
+    if (player) {
+      online = live::ParseIPv4(player->host_address).value_or(in_addr);
+      local = live::ParseIPv4(player->local_address).value_or(online);
+      std::memcpy(xn_addr->abEnet, player->mac.data(), player->mac.size());
+      if (in_addr == online) {
+        live::upnp::Peers().Remember(in_addr, player->mapped_ports);
+      }
+    }
+    xn_addr->ina.s_addr = htonl(local);
+    xn_addr->inaOnline.s_addr = htonl(online);
+    xn_addr->wPortOnline = 36000;
+    xn_addr->abOnline[16] = 1;  // SGADDR platform type: Xbox 360
+  }
+  if (xid) {
+    std::lock_guard lock(peers::mutex);
+    memory::store_and_swap<uint64_t>(xid.host_address(), peers::registered_key);
+  }
+  return 0;
 }
 
 // https://www.google.com/patents/WO2008112448A1?cl=en
@@ -557,11 +861,6 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
   return 0;
 }
 
-u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
-                               u32 flags) {
-  return X_ERROR_FUNCTION_FAILED;
-}
-
 u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
   if (!addr_ptr) {
     return -1;
@@ -596,6 +895,7 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
 }
 
 u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
+  overlapped::receives.Forget(socket_handle);
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -670,6 +970,13 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
 
   N_XSOCKADDR_IN native_name(name);
+  // --wwe_online_ip: each copy on one PC keeps its peer ports on its own address.
+  if (live::Enabled()) {
+    const auto target = live::PlanBind(native_name.sin_addr, native_name.sin_port,
+                                       live::BindAddress());
+    native_name.sin_addr = target.address;
+    native_name.sin_port = target.port;
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
@@ -688,6 +995,10 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
   }
 
   N_XSOCKADDR native_name(name);
+  // sa_data: the port, then the IPv4 address, both big-endian.
+  const auto* bytes = reinterpret_cast<const uint8_t*>(native_name.sa_data);
+  BindToOnlineAddress(socket.get(), uint32_t(bytes[2]) << 24 | uint32_t(bytes[3]) << 16 |
+                                        uint32_t(bytes[4]) << 8 | bytes[5]);
   X_STATUS status = socket->Connect(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
@@ -874,7 +1185,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
 
   if (from_ptr) {
     from_ptr->sin_family = native_from.sin_family;
-    from_ptr->sin_port = native_from.sin_port;
+    from_ptr->sin_port = live::upnp::Peers().Game(native_from.sin_addr, native_from.sin_port);
     from_ptr->sin_addr = native_from.sin_addr;
     std::memset(from_ptr->x_sin_zero, 0, sizeof(from_ptr->x_sin_zero));
   }
@@ -916,6 +1227,11 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
+  BindToOnlineAddress(socket.get(), native_to.sin_addr);
+  native_to.sin_port = live::upnp::Peers().External(native_to.sin_addr, native_to.sin_port);
+  if (live::relay::DropsDirect(native_to.sin_addr, native_to.sin_port)) {
+    return buf_len;  // as if sent
+  }
   return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
 }
 
@@ -933,170 +1249,349 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
   XThread::SetLastError(error_code);
 }
 
+// Signed in to Live, an LSP server (the game server's Rendez-Vous) is reached directly,
+// without a security gateway: its secure address is its real address and connecting
+// succeeds at once. Otherwise these fail as the stubs did (r3 = 1).
+u32 NetDll_XNetServerToInAddr_entry(u32 caller, u32 ina, u32 service_id, mapped_u32 out) {
+  if (!live::SignedIn()) {
+    return 1;
+  }
+  if (out) {
+    *out = ina;
+  }
+  return 0;
+}
+
+u32 NetDll_XNetConnect_entry(u32 caller, u32 ina) {
+  return live::SignedIn() ? 0 : 1;
+}
+
+u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
+  constexpr uint32_t kConnected = 2;  // XNET_CONNECT_STATUS_CONNECTED
+  return live::SignedIn() ? kConnected : 1;
+}
+
+
+// (caller, XNKID* id, XNKEY* key): a system-link style ID and the fork's constant key.
+u32 NetDll_XNetCreateKey_entry(u32 caller, u32 xnkid_ptr, u32 xnkey_ptr) {
+  if (!live::Enabled()) {
+    return 1;
+  }
+  auto* memory = REX_KERNEL_MEMORY();
+  std::random_device random;
+  const uint64_t id = ((uint64_t(random()) << 32) | random()) & 0x00FFFFFFFFFFFFFFull;
+  if (xnkid_ptr) {
+    memory::store_and_swap<uint64_t>(memory->TranslateVirtual(xnkid_ptr), id);
+  }
+  if (xnkey_ptr) {
+    uint8_t* key = memory->TranslateVirtual(xnkey_ptr);
+    for (int i = 0; i < 16; ++i) {
+      key[i] = uint8_t(i);
+    }
+  }
+  return 0;
+}
+
+u32 NetDll_XNetRegisterKey_entry(u32 caller, u32 xnkid_ptr, u32 xnkey_ptr) {
+  if (!live::Enabled()) {
+    return 1;
+  }
+  std::lock_guard lock(peers::mutex);
+  peers::registered_key = peers::LoadKey(xnkid_ptr);
+  REXKRNL_INFO("[online] XNetRegisterKey {:016X}", peers::registered_key);
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterKey_entry(u32 caller, u32 xnkid_ptr) {
+  if (!live::Enabled()) {
+    return 1;
+  }
+  std::lock_guard lock(peers::mutex);
+  if (peers::LoadKey(xnkid_ptr) == peers::registered_key) {
+    peers::registered_key = 0;
+  }
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterInAddr_entry(u32 caller, u32 ina) {
+  return live::Enabled() ? 0 : 1;
+}
+
+// XNQOS: count, count_pending, then one 24-byte XNQOSINFO per target.
+namespace qos {
+constexpr uint8_t kComplete = 0x01, kTargetContacted = 0x02, kDataReceived = 0x08;
+constexpr uint32_t kListenSetData = 0x04;
+constexpr uint32_t kHeader = 8, kInfo = 24;
+}  // namespace qos
+
+// (caller, XNKID* id, data, size, bits per second, flags): with LISTEN_SET_DATA the host's
+// QoS data goes to the server, for searchers' XNetQosLookup.
+u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
+                               u32 flags) {
+  if (!live::SignedIn()) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  if ((flags & qos::kListenSetData) && data && data_size && id) {
+    const uint64_t session_id = peers::LoadKey(id.guest_address());
+    live::PostQosData(session_id, std::string(reinterpret_cast<const char*>(data.host_address()),
+                                              data_size));
+  }
+  return 0;
+}
+
+// (caller, count, XNADDR** addresses, XNKID** ids, XNKEY** keys, gateways, gateway addresses,
+// service IDs, probes, bits per second, flags, event, XNQOS** out): every target answers at
+// once with the data its host listed and a 10 ms round trip.
+u32 NetDll_XNetQosLookup_entry(u32 caller, u32 count, u32 addresses_ptr, u32 ids_ptr,
+                               u32 keys_ptr, u32 num_gateways, u32 gateways_ptr,
+                               u32 service_ids_ptr, u32 probes, u32 bits_per_second,
+                               u32 flags, u32 event_handle, mapped_u32 qos_out) {
+  if (!qos_out || !live::SignedIn()) {
+    return 0x271D;  // WSAEACCES
+  }
+  auto* memory = REX_KERNEL_MEMORY();
+  const uint32_t targets = count + num_gateways;
+  std::vector<std::string> data(targets);
+  for (uint32_t i = 0; i < count && ids_ptr; ++i) {
+    const uint32_t id_ptr = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(ids_ptr + i * 4));
+    data[i] = live::GetQosData(peers::LoadKey(id_ptr));
+  }
+  uint32_t size = qos::kHeader + targets * qos::kInfo;
+  for (const auto& d : data) {
+    size += uint32_t((d.size() + 7) & ~size_t(7));
+  }
+  const uint32_t qos_ptr = memory->SystemHeapAlloc(size);
+  uint8_t* q = memory->TranslateVirtual(qos_ptr);
+  std::memset(q, 0, size);
+  uint32_t tail = qos::kHeader + targets * qos::kInfo;
+  for (uint32_t i = 0; i < targets; ++i) {
+    uint8_t* info = q + qos::kHeader + i * qos::kInfo;
+    uint8_t info_flags = qos::kComplete | qos::kTargetContacted;
+    if (!data[i].empty()) {
+      info_flags |= qos::kDataReceived;
+      memory::store_and_swap<uint16_t>(info + 6, uint16_t(data[i].size()));
+      memory::store_and_swap<uint32_t>(info + 8, qos_ptr + tail);
+      std::memcpy(q + tail, data[i].data(), data[i].size());
+      tail += uint32_t((data[i].size() + 7) & ~size_t(7));
+    }
+    info[0] = info_flags;
+    memory::store_and_swap<uint16_t>(info + 2, uint16_t(probes));  // probes sent
+    memory::store_and_swap<uint16_t>(info + 4, uint16_t(probes));  // probes received
+    memory::store_and_swap<uint16_t>(info + 12, 10);               // rtt min (ms)
+    memory::store_and_swap<uint16_t>(info + 14, 10);               // rtt median (ms)
+    memory::store_and_swap<uint32_t>(info + 16, 5u << 20);         // up bits/s
+    memory::store_and_swap<uint32_t>(info + 20, 5u << 20);         // down bits/s
+  }
+  memory::store_and_swap<uint32_t>(q, targets);
+  memory::store_and_swap<uint32_t>(q + 4, 0);
+  *qos_out = qos_ptr;
+  if (event_handle) {
+    xboxkrnl::xeNtSetEvent(event_handle, nullptr);
+  }
+  return 0;
+}
+
+// (caller, socket, sockaddr_in*, int* length)
+u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 name_len) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    XThread::SetLastError(0x2736);  // WSAENOTSOCK
+    return -1;
+  }
+  if (!name) {
+    XThread::SetLastError(0x271E);  // WSAEFAULT
+    return -1;
+  }
+  sockaddr_in native{};
+#if REX_PLATFORM_WIN32
+  int native_len = sizeof(native);
+  const int result = getsockname(static_cast<SOCKET>(socket->native_handle()),
+                                 reinterpret_cast<sockaddr*>(&native), &native_len);
+#else
+  socklen_t native_len = sizeof(native);
+  const int result = getsockname(static_cast<int>(socket->native_handle()),
+                                 reinterpret_cast<sockaddr*>(&native), &native_len);
+#endif
+  if (result != 0) {
+    XThread::SetLastError(0x2726);  // WSAEINVAL
+    return -1;
+  }
+  name->sin_family = native.sin_family;
+  name->sin_port = ntohs(native.sin_port);
+  name->sin_addr = ntohl(native.sin_addr.s_addr);
+  std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+  if (name_len) {
+    *name_len = 16;
+  }
+  return 0;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
 
-REX_EXPORT(__imp__NetDll_XNetStartup, rex::kernel::xam::NetDll_XNetStartup_entry)
-REX_EXPORT(__imp__NetDll_XNetCleanup, rex::kernel::xam::NetDll_XNetCleanup_entry)
-REX_EXPORT(__imp__NetDll_XNetGetOpt, rex::kernel::xam::NetDll_XNetGetOpt_entry)
-REX_EXPORT(__imp__NetDll_XNetRandom, rex::kernel::xam::NetDll_XNetRandom_entry)
-REX_EXPORT(__imp__NetDll_WSAStartup, rex::kernel::xam::NetDll_WSAStartup_entry)
-REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
-REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
-REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
-REX_EXPORT(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry)
-REX_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents,
-           rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
-REX_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
-REX_EXPORT(__imp__NetDll_WSACloseEvent, rex::kernel::xam::NetDll_WSACloseEvent_entry)
-REX_EXPORT(__imp__NetDll_WSAResetEvent, rex::kernel::xam::NetDll_WSAResetEvent_entry)
-REX_EXPORT(__imp__NetDll_WSASetEvent, rex::kernel::xam::NetDll_WSASetEvent_entry)
-REX_EXPORT(__imp__NetDll_XNetGetTitleXnAddr, rex::kernel::xam::NetDll_XNetGetTitleXnAddr_entry)
-REX_EXPORT(__imp__NetDll_XNetGetDebugXnAddr, rex::kernel::xam::NetDll_XNetGetDebugXnAddr_entry)
-REX_EXPORT(__imp__NetDll_XNetXnAddrToMachineId,
-           rex::kernel::xam::NetDll_XNetXnAddrToMachineId_entry)
-REX_EXPORT(__imp__NetDll_XNetInAddrToString, rex::kernel::xam::NetDll_XNetInAddrToString_entry)
-REX_EXPORT(__imp__NetDll_XNetXnAddrToInAddr, rex::kernel::xam::NetDll_XNetXnAddrToInAddr_entry)
-REX_EXPORT(__imp__NetDll_XNetInAddrToXnAddr, rex::kernel::xam::NetDll_XNetInAddrToXnAddr_entry)
-REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
-           rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
-REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
-           rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
-REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
-REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
-REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-REX_EXPORT(__imp__NetDll_XNetQosRelease, rex::kernel::xam::NetDll_XNetQosRelease_entry)
-REX_EXPORT(__imp__NetDll_XNetQosListen, rex::kernel::xam::NetDll_XNetQosListen_entry)
-REX_EXPORT(__imp__NetDll_inet_addr, rex::kernel::xam::NetDll_inet_addr_entry)
-REX_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
-REX_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
-REX_EXPORT(__imp__NetDll_shutdown, rex::kernel::xam::NetDll_shutdown_entry)
-REX_EXPORT(__imp__NetDll_setsockopt, rex::kernel::xam::NetDll_setsockopt_entry)
-REX_EXPORT(__imp__NetDll_ioctlsocket, rex::kernel::xam::NetDll_ioctlsocket_entry)
-REX_EXPORT(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry)
-REX_EXPORT(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry)
-REX_EXPORT(__imp__NetDll_listen, rex::kernel::xam::NetDll_listen_entry)
-REX_EXPORT(__imp__NetDll_accept, rex::kernel::xam::NetDll_accept_entry)
-REX_EXPORT(__imp__NetDll_select, rex::kernel::xam::NetDll_select_entry)
-REX_EXPORT(__imp__NetDll_recv, rex::kernel::xam::NetDll_recv_entry)
-REX_EXPORT(__imp__NetDll_recvfrom, rex::kernel::xam::NetDll_recvfrom_entry)
-REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
-REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
-REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
-REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetStartup, rex::kernel::xam::NetDll_XNetStartup_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetCleanup, rex::kernel::xam::NetDll_XNetCleanup_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetGetOpt, rex::kernel::xam::NetDll_XNetGetOpt_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetRandom, rex::kernel::xam::NetDll_XNetRandom_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSAStartup, rex::kernel::xam::NetDll_WSAStartup_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSAGetOverlappedResult,
+                 rex::kernel::xam::NetDll_WSAGetOverlappedResult_entry)
+REX_TRACE_EXPORT_SOCKADDR(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry, 9)
+REX_TRACE_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents, rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSACloseEvent, rex::kernel::xam::NetDll_WSACloseEvent_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSAResetEvent, rex::kernel::xam::NetDll_WSAResetEvent_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSASetEvent, rex::kernel::xam::NetDll_WSASetEvent_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetGetTitleXnAddr, rex::kernel::xam::NetDll_XNetGetTitleXnAddr_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetGetDebugXnAddr, rex::kernel::xam::NetDll_XNetGetDebugXnAddr_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetXnAddrToMachineId, rex::kernel::xam::NetDll_XNetXnAddrToMachineId_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetInAddrToString, rex::kernel::xam::NetDll_XNetInAddrToString_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetXnAddrToInAddr, rex::kernel::xam::NetDll_XNetXnAddrToInAddr_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetInAddrToXnAddr, rex::kernel::xam::NetDll_XNetInAddrToXnAddr_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetSetSystemLinkPort, rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus, rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetQosRelease, rex::kernel::xam::NetDll_XNetQosRelease_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetQosListen, rex::kernel::xam::NetDll_XNetQosListen_entry)
+REX_TRACE_EXPORT(__imp__NetDll_inet_addr, rex::kernel::xam::NetDll_inet_addr_entry)
+REX_TRACE_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
+REX_TRACE_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
+REX_TRACE_EXPORT(__imp__NetDll_shutdown, rex::kernel::xam::NetDll_shutdown_entry)
+REX_TRACE_EXPORT(__imp__NetDll_setsockopt, rex::kernel::xam::NetDll_setsockopt_entry)
+REX_TRACE_EXPORT(__imp__NetDll_ioctlsocket, rex::kernel::xam::NetDll_ioctlsocket_entry)
+REX_TRACE_EXPORT_SOCKADDR(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry, 5)
+REX_TRACE_EXPORT_SOCKADDR(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry, 5)
+REX_TRACE_EXPORT(__imp__NetDll_listen, rex::kernel::xam::NetDll_listen_entry)
+REX_TRACE_EXPORT(__imp__NetDll_accept, rex::kernel::xam::NetDll_accept_entry)
+REX_TRACE_EXPORT(__imp__NetDll_select, rex::kernel::xam::NetDll_select_entry)
+REX_TRACE_EXPORT(__imp__NetDll_recv, rex::kernel::xam::NetDll_recv_entry)
+REX_TRACE_EXPORT(__imp__NetDll_recvfrom, rex::kernel::xam::NetDll_recvfrom_entry)
+REX_TRACE_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
+REX_TRACE_EXPORT_SOCKADDR(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry, 8)
+REX_TRACE_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
+REX_TRACE_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetServerToInAddr,
+                 rex::kernel::xam::NetDll_XNetServerToInAddr_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetConnect, rex::kernel::xam::NetDll_XNetConnect_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetGetConnectStatus,
+                 rex::kernel::xam::NetDll_XNetGetConnectStatus_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetCreateKey, rex::kernel::xam::NetDll_XNetCreateKey_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetUnregisterKey,
+                 rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetUnregisterInAddr,
+                 rex::kernel::xam::NetDll_XNetUnregisterInAddr_entry)
+REX_TRACE_EXPORT(__imp__NetDll_XNetQosLookup, rex::kernel::xam::NetDll_XNetQosLookup_entry)
+REX_TRACE_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
 
-REX_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
-REX_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
-REX_EXPORT_STUB(__imp__NetDll_UpnpActionGetResults);
-REX_EXPORT_STUB(__imp__NetDll_UpnpCleanup);
-REX_EXPORT_STUB(__imp__NetDll_UpnpCloseHandle);
-REX_EXPORT_STUB(__imp__NetDll_UpnpDescribeCreate);
-REX_EXPORT_STUB(__imp__NetDll_UpnpDescribeGetResults);
-REX_EXPORT_STUB(__imp__NetDll_UpnpDoWork);
-REX_EXPORT_STUB(__imp__NetDll_UpnpEventCreate);
-REX_EXPORT_STUB(__imp__NetDll_UpnpEventGetCurrentState);
-REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
-REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
-REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
-REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
-REX_EXPORT_STUB(__imp__NetDll_WSACancelOverlappedIO);
-REX_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
-REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
-REX_EXPORT_STUB(__imp__NetDll_WSARecv);
-REX_EXPORT_STUB(__imp__NetDll_WSASend);
-REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCloseHandle);
-REX_EXPORT_STUB(__imp__NetDll_XHttpConnect);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCrackUrl);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCrackUrlW);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCreateUrl);
-REX_EXPORT_STUB(__imp__NetDll_XHttpCreateUrlW);
-REX_EXPORT_STUB(__imp__NetDll_XHttpDoWork);
-REX_EXPORT_STUB(__imp__NetDll_XHttpGetPerfCounters);
-REX_EXPORT_STUB(__imp__NetDll_XHttpOpen);
-REX_EXPORT_STUB(__imp__NetDll_XHttpOpenRequest);
-REX_EXPORT_STUB(__imp__NetDll_XHttpOpenRequestUsingMemory);
-REX_EXPORT_STUB(__imp__NetDll_XHttpQueryAuthSchemes);
-REX_EXPORT_STUB(__imp__NetDll_XHttpQueryHeaders);
-REX_EXPORT_STUB(__imp__NetDll_XHttpQueryOption);
-REX_EXPORT_STUB(__imp__NetDll_XHttpReadData);
-REX_EXPORT_STUB(__imp__NetDll_XHttpReceiveResponse);
-REX_EXPORT_STUB(__imp__NetDll_XHttpResetPerfCounters);
-REX_EXPORT_STUB(__imp__NetDll_XHttpSendRequest);
-REX_EXPORT_STUB(__imp__NetDll_XHttpSetCredentials);
-REX_EXPORT_STUB(__imp__NetDll_XHttpSetOption);
-REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
-REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
-REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
-REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
-REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
-REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
-REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
-REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
-REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
-REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
-REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
-REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
-REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
-REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
-REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-REX_EXPORT_STUB(__imp__NetDll_XmlDownloadStart);
-REX_EXPORT_STUB(__imp__NetDll_XmlDownloadStop);
-REX_EXPORT_STUB(__imp__NetDll_XnpCapture);
-REX_EXPORT_STUB(__imp__NetDll_XnpConfig);
-REX_EXPORT_STUB(__imp__NetDll_XnpConfigUPnP);
-REX_EXPORT_STUB(__imp__NetDll_XnpConfigUPnPPortAndExternalAddr);
-REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptRecv);
-REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptSetCallbacks);
-REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptSetExtendedReceiveCallback);
-REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptXmit);
-REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptXmitAsIp);
-REX_EXPORT_STUB(__imp__NetDll_XnpGetActiveSocketList);
-REX_EXPORT_STUB(__imp__NetDll_XnpGetConfigStatus);
-REX_EXPORT_STUB(__imp__NetDll_XnpGetKeyList);
-REX_EXPORT_STUB(__imp__NetDll_XnpGetQosLookupList);
-REX_EXPORT_STUB(__imp__NetDll_XnpGetSecAssocList);
-REX_EXPORT_STUB(__imp__NetDll_XnpGetVlanXboxName);
-REX_EXPORT_STUB(__imp__NetDll_XnpLoadConfigParams);
-REX_EXPORT_STUB(__imp__NetDll_XnpLoadMachineAccount);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonClearChallenge);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonClearQEvent);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetChallenge);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetQFlags);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetQVals);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetStatus);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetChallengeResponse);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetPState);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetQEvent);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetQFlags);
-REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetQVals);
-REX_EXPORT_STUB(__imp__NetDll_XnpNoteSystemTime);
-REX_EXPORT_STUB(__imp__NetDll_XnpPersistTitleState);
-REX_EXPORT_STUB(__imp__NetDll_XnpQosHistoryGetAggregateMeasurement);
-REX_EXPORT_STUB(__imp__NetDll_XnpQosHistoryGetEntries);
-REX_EXPORT_STUB(__imp__NetDll_XnpQosHistoryLoad);
-REX_EXPORT_STUB(__imp__NetDll_XnpQosHistorySaveMeasurements);
-REX_EXPORT_STUB(__imp__NetDll_XnpRegisterKeyForCallerType);
-REX_EXPORT_STUB(__imp__NetDll_XnpReplaceKeyForCallerType);
-REX_EXPORT_STUB(__imp__NetDll_XnpSaveConfigParams);
-REX_EXPORT_STUB(__imp__NetDll_XnpSaveMachineAccount);
-REX_EXPORT_STUB(__imp__NetDll_XnpSetVlanXboxName);
-REX_EXPORT_STUB(__imp__NetDll_XnpToolIpProxyInject);
-REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
-REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
-REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
-REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);
-REX_EXPORT_STUB(__imp__NetDll_getsockopt);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpActionGetResults);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpCleanup);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpCloseHandle);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpDescribeCreate);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpDescribeGetResults);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpDoWork);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpEventCreate);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpEventGetCurrentState);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_UpnpStartup);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_WSACancelOverlappedIO);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_WSARecv);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_WSASend);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpCloseHandle);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpConnect);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpCrackUrl);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpCrackUrlW);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpCreateUrl);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpCreateUrlW);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpDoWork);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpGetPerfCounters);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpOpen);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpOpenRequest);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpOpenRequestUsingMemory);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpQueryAuthSchemes);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpQueryHeaders);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpQueryOption);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpReadData);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpReceiveResponse);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpResetPerfCounters);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpSendRequest);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpSetCredentials);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpSetOption);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpStartup);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XmlDownloadStart);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XmlDownloadStop);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpCapture);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpConfig);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpConfigUPnP);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpConfigUPnPPortAndExternalAddr);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptRecv);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptSetCallbacks);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptSetExtendedReceiveCallback);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptXmit);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptXmitAsIp);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpGetActiveSocketList);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpGetConfigStatus);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpGetKeyList);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpGetQosLookupList);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpGetSecAssocList);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpGetVlanXboxName);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLoadConfigParams);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLoadMachineAccount);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonClearChallenge);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonClearQEvent);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonGetChallenge);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonGetQFlags);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonGetQVals);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonGetStatus);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonSetChallengeResponse);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonSetPState);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonSetQEvent);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonSetQFlags);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpLogonSetQVals);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpNoteSystemTime);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpPersistTitleState);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpQosHistoryGetAggregateMeasurement);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpQosHistoryGetEntries);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpQosHistoryLoad);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpQosHistorySaveMeasurements);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpRegisterKeyForCallerType);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpReplaceKeyForCallerType);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpSaveConfigParams);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpSaveMachineAccount);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpSetVlanXboxName);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpToolIpProxyInject);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_getpeername);
+REX_TRACE_EXPORT_STUB(__imp__NetDll_getsockopt);

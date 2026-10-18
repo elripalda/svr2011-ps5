@@ -43,6 +43,8 @@ set(REXSYSTEM_SOURCES
     module.cpp
     function_dispatcher.cpp
     gpu_plugin_loader.cpp
+    external_frame.cpp
+    host_gpu_loss.cpp
     thread.cpp
     thread_state.cpp
     xex_module.cpp

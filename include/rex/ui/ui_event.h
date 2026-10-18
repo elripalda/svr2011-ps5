@@ -150,10 +150,14 @@ class MouseEvent : public UIEvent {
   // Fractional, so accumulate before rounding.
   float dx() const { return dx_; }
   float dy() const { return dy_; }
+  // Clicks in a row for a button press (2 for a double click).
+  int32_t clicks() const { return clicks_; }
+  void set_clicks(int32_t clicks) { clicks_ = clicks; }
 
  private:
   bool handled_ = false;
   Button button_;
+  int32_t clicks_ = 1;
   int32_t x_ = 0;
   int32_t y_ = 0;
   int32_t scroll_x_ = 0;

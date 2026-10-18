@@ -205,6 +205,9 @@ class XmaContext {
   ~XmaContext();
 
   int Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr);
+  // One decode pass; true when it wrote PCM or consumed input. A context with
+  // input and room stays enabled and is decoded again without a new kick
+  // (xma/work_rules.h).
   bool Work();
 
   void Enable();
@@ -251,7 +254,8 @@ class XmaContext {
   uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
 
   void Decode(XMA_CONTEXT_DATA* data);
-  void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
+  // Writes the pending frame's next subframes; returns the blocks written.
+  uint32_t Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
   void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
   void ClearLocked(XMA_CONTEXT_DATA* data);
   void ResetDecoderState();

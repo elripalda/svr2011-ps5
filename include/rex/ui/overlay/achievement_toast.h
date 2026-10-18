@@ -35,6 +35,9 @@ class AchievementToastDialog : public AchievementNotificationDialog {
   // Thread-safe: safe to call from any thread, including guest threads.
   void Push(const rex::system::AchievementEvent& event) override;
 
+  // The fade is timed by the clock, so a guest frame's paint is enough.
+  bool PaintsWithGuestFrames() const override { return true; }
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 

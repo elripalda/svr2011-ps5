@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <unordered_map>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -37,6 +38,38 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(gpu_draw_census, false, "GPU",
+                    "Log cumulative PM4 draw and indirect-buffer packet counts every 60 swaps, "
+                    "to compare against the game's D3D draw calls");
+
+namespace {
+// Only the command processor thread touches these.
+struct DrawCensus {
+  uint64_t draw_indx = 0;
+  uint64_t draw_indx_2 = 0;
+  uint64_t indirect = 0;
+  uint32_t indirect_min = UINT32_MAX;
+  uint32_t indirect_max = 0;
+  uint64_t swaps = 0;
+  // Physical address of the indirect buffer being executed, 0 for the primary ring.
+  uint32_t current_ib = 0;
+  uint32_t current_ib_words = 0;
+  uint32_t parent_ib = 0;
+  std::unordered_map<uint32_t, bool> dumped_ibs;
+  // DRAW_INDX_2 per (indirect buffer, primitive type), reset at each log.
+  std::unordered_map<uint64_t, uint64_t> draw2_sources;
+  // Per indirect buffer address: executions, content changes between them,
+  // and the last content hash and length (dwords). Reset at each log.
+  struct IbHistory {
+    uint64_t executions = 0;
+    uint64_t changes = 0;
+    uint64_t hash = 0;
+    uint32_t length = 0;
+  };
+  std::unordered_map<uint32_t, IbHistory> ib_history;
+} g_draw_census;
+}  // namespace
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -50,8 +83,10 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       " none: Disable readback (default)\n"
                       " fast: Read previous frame (delayed, copy every frame)\n"
                       " some: Read previous frame (delayed, copy on cache miss)\n"
-                      " full: Immediate sync readback (accurate but stalls)")
-    .allowed({"none", "fast", "some", "full"})
+                      " full: Immediate sync readback (accurate but stalls)\n"
+                      " burst: Immediate sync readback for a target's first resolve in a run of\n"
+                      "        consecutive frames; none for the rest of the run")
+    .allowed({"none", "fast", "some", "full", "burst"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
@@ -95,6 +130,9 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   }
   if (value == "full") {
     return ReadbackResolveMode::kFull;
+  }
+  if (value == "burst") {
+    return ReadbackResolveMode::kBurst;
   }
   return ReadbackResolveMode::kDisabled;
 }
@@ -639,6 +677,11 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
+  const uint32_t outer_ib = g_draw_census.current_ib;
+  const uint32_t outer_words = g_draw_census.current_ib_words;
+  g_draw_census.parent_ib = outer_ib;
+  g_draw_census.current_ib = ptr;
+  g_draw_census.current_ib_words = count;
   do {
     if (!ExecutePacket(&reader)) {
       // Return up a level if we encounter a bad packet.
@@ -647,6 +690,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+  g_draw_census.current_ib = outer_ib;
+  g_draw_census.current_ib_words = outer_words;
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
@@ -768,6 +813,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
     case PM4_INDIRECT_BUFFER:
     case PM4_INDIRECT_BUFFER_PFD:
+      ++g_draw_census.indirect;
       result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count);
       break;
     case PM4_WAIT_REG_MEM:
@@ -798,9 +844,52 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
       break;
     case PM4_DRAW_INDX:
+      ++g_draw_census.draw_indx;
       result = ExecutePacketType3_DRAW_INDX(reader, packet, count);
       break;
     case PM4_DRAW_INDX_2:
+      ++g_draw_census.draw_indx_2;
+      if (count && reader->read_count() >= sizeof(uint32_t)) {
+        const auto offset = reader->read_offset();
+        const uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+        reader->set_read_offset(offset);
+        ++g_draw_census.draw2_sources[(uint64_t(g_draw_census.current_ib) << 8) |
+                                      (initiator & 0x3F)];
+        // Point-list draws come from a buffer D3D builds once; dump it the first time.
+        if ((initiator & 0x3F) == 1 && g_draw_census.current_ib &&
+            REXCVAR_GET(gpu_draw_census) &&
+            !g_draw_census.dumped_ibs[g_draw_census.current_ib]) {
+          g_draw_census.dumped_ibs[g_draw_census.current_ib] = true;
+          const auto* words = reinterpret_cast<const uint32_t*>(
+              memory_->TranslatePhysical(g_draw_census.current_ib));
+          const uint32_t n = std::min<uint32_t>(g_draw_census.current_ib_words, 4096);
+          std::string dump;
+          for (uint32_t i = 0; i < n;) {
+            const uint32_t h = rex::byte_swap(words[i]);
+            const uint32_t type = h >> 30;
+            if (type == 3) {
+              const uint32_t op = (h >> 8) & 0x7F, c = ((h >> 16) & 0x3FFF) + 1;
+              dump += fmt::format(" [{}:op{:02X}", i, op);
+              for (uint32_t k = 1; k <= c && k <= 4 && i + k < n; ++k) {
+                dump += fmt::format(" {:08X}", rex::byte_swap(words[i + k]));
+              }
+              dump += "]";
+              i += 1 + c;
+            } else if (type == 0) {
+              const uint32_t c = ((h >> 16) & 0x3FFF) + 1;
+              dump += fmt::format(" [{}:reg{:04X}x{} {:08X}]", i, h & 0x7FFF, c,
+                                  i + 1 < n ? rex::byte_swap(words[i + 1]) : 0);
+              i += 1 + c;
+            } else {
+              dump += fmt::format(" [{}:t{} {:08X}]", i, type, h);
+              ++i;
+            }
+          }
+          REXGPU_INFO("draw-census gpu point-list ib={:08X} words={} parent={:08X}:{}",
+                      g_draw_census.current_ib, g_draw_census.current_ib_words,
+                      g_draw_census.parent_ib, dump);
+        }
+      }
       result = ExecutePacketType3_DRAW_INDX_2(reader, packet, count);
       break;
     case PM4_SET_CONSTANT:
@@ -960,6 +1049,44 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
+  if (++g_draw_census.swaps % 60 == 0 && REXCVAR_GET(gpu_draw_census)) {
+    REXGPU_INFO("draw-census gpu swaps={} draw_indx={} draw_indx_2={} indirect={} "
+                "indirect_ptr={:08X}..{:08X}",
+                g_draw_census.swaps, g_draw_census.draw_indx, g_draw_census.draw_indx_2,
+                g_draw_census.indirect, g_draw_census.indirect_min, g_draw_census.indirect_max);
+    std::vector<std::pair<uint64_t, uint64_t>> sources(g_draw_census.draw2_sources.begin(),
+                                                       g_draw_census.draw2_sources.end());
+    std::sort(sources.begin(), sources.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string top;
+    for (size_t i = 0; i < sources.size() && i < 8; ++i) {
+      top += fmt::format(" ib={:08X}/prim={}:{}", uint32_t(sources[i].first >> 8),
+                         uint32_t(sources[i].first & 0x3F), sources[i].second);
+    }
+    REXGPU_INFO("draw-census gpu draw_indx_2 sources (last 60 swaps):{}", top);
+    uint64_t ib_static = 0, ib_changing = 0, ib_words = 0;
+    std::string changing;
+    for (const auto& [address, history] : g_draw_census.ib_history) {
+      ib_words += uint64_t(history.length) * history.executions;
+      if (history.changes) {
+        ++ib_changing;
+        if (changing.size() < 400) {
+          changing += fmt::format(" {:08X}:{}/{}x{}w", address, history.changes,
+                                  history.executions, history.length);
+        }
+      } else {
+        ++ib_static;
+      }
+    }
+    REXGPU_INFO("draw-census gpu ib-history (last 60 swaps) buffers={} static={} changing={} "
+                "words={} changed:{}",
+                g_draw_census.ib_history.size(), ib_static, ib_changing, ib_words, changing);
+    g_draw_census.ib_history.clear();
+    g_draw_census.draw2_sources.clear();
+    g_draw_census.indirect_min = UINT32_MAX;
+    g_draw_census.indirect_max = 0;
+  }
+
   ++counter_;
   return true;
 }
@@ -969,8 +1096,26 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
   // indirect buffer dispatch
   uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
+  g_draw_census.indirect_min = std::min(g_draw_census.indirect_min, list_ptr);
+  g_draw_census.indirect_max = std::max(g_draw_census.indirect_max, list_ptr);
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
+  if (REXCVAR_GET(gpu_draw_census) && list_length) {
+    // FNV-1a over the buffer: are command buffers replayed or rebuilt?
+    const auto* words =
+        reinterpret_cast<const uint8_t*>(memory_->TranslatePhysical(list_ptr));
+    uint64_t hash = 14695981039346656037ull;
+    for (uint32_t i = 0; i < list_length * 4; ++i) {
+      hash = (hash ^ words[i]) * 1099511628211ull;
+    }
+    auto& history = g_draw_census.ib_history[list_ptr];
+    if (history.executions && (history.hash != hash || history.length != list_length)) {
+      ++history.changes;
+    }
+    ++history.executions;
+    history.hash = hash;
+    history.length = list_length;
+  }
   ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
   return true;
 }

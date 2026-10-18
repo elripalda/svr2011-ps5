@@ -20,7 +20,11 @@ namespace rex::ui {
 AchievementToastDialog::AchievementToastDialog(ImGuiDrawer* drawer,
                                                ImmediateDrawer* immediate_drawer,
                                                rex::Runtime* runtime)
-    : AchievementNotificationDialog(drawer), icon_cache_(immediate_drawer, runtime) {}
+    : AchievementNotificationDialog(drawer), icon_cache_(immediate_drawer, runtime) {
+  // Registered only while a toast is queued: any registered dialog makes the presenter
+  // paint on the UI thread instead of the guest output thread.
+  drawer->RemoveDialog(this);
+}
 
 AchievementToastDialog::~AchievementToastDialog() {}
 
@@ -48,6 +52,7 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
       }
     }
     if (queue_.empty()) {
+      imgui_drawer()->RemoveDialog(this);
       return;
     }
     toast = queue_.front();

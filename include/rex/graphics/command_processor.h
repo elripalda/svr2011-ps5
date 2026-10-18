@@ -44,6 +44,9 @@ enum class ReadbackResolveMode {
   kFast,
   kSome,
   kFull,
+  // Immediate readback only for a target's first resolve in a run of consecutive frames, so
+  // one-off render-to-texture results stay exact and per-frame targets cost nothing.
+  kBurst,
 };
 
 struct SwapState {

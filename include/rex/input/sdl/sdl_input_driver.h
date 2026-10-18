@@ -33,6 +33,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   ~SDLInputDriver() override;
 
   X_STATUS Setup() override;
+  std::string_view vibration_backend() const override { return "sdl"; }
 
   void EnumerateDevices(std::vector<DeviceInfo>& out) override;
   X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override;

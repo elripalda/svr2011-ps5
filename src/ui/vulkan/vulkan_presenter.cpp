@@ -49,6 +49,15 @@
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
+REXCVAR_DECLARE(bool, present_wait);  // presenter.cpp
+
+REXCVAR_DEFINE_BOOL(present_vsync, true, "UI/Presenter",
+                    "Vsync: show each frame on a display refresh (FIFO), so it never tears; off "
+                    "presents immediately for the lowest latency")
+    // Read when the swapchain is created; a change rebuilds it through
+    // Presenter::OnSurfaceResizeFromUIThread (WWE: live VSync).
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
                     "Allow immediate present mode (no vsync)");
 
@@ -190,6 +199,8 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 }
 
 VulkanPresenter::~VulkanPresenter() {
+  // The pacing thread presents through this object and its present waiter.
+  StopGuestOutputPacing();
   // Destroy the swapchain after its images are not used for drawing anymore.
   // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
   // fence clearly indicating when it's safe to destroy a swapchain, so we
@@ -769,7 +780,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
+        paint_context_.swapchain_present_wait, surface_unusable);
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -777,6 +789,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Couldn't create the swapchain for the existing surface - start over.
       paint_context_.DestroySwapchainAndVulkanSurface();
+    } else {
+      paint_context_.AttachPresentWaiter();
     }
   }
 
@@ -873,7 +887,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
+        paint_context_.swapchain_present_wait, surface_unusable);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -883,6 +898,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
                               : SurfacePaintConnectResult::kFailure;
     }
     // Successfully attached (at least for now).
+    paint_context_.AttachPresentWaiter();
   }
 
   // From now on, in case of failure,
@@ -1109,8 +1125,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out) {
+    VkExtent2D& image_extent_out, bool& is_fifo_out, pacing::PresentWaitMode& present_wait_out,
+    bool& ui_surface_unusable_out) {
   ui_surface_unusable_out = false;
+  present_wait_out = pacing::PresentWaitMode::kTimer;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -1381,7 +1399,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  if (REXCVAR_GET(present_vsync)) {
+    // One image per refresh, never torn. With variable refresh (FreeSync, G-Sync) the display
+    // still shows each frame when it arrives; FIFO is always available.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
@@ -1405,6 +1427,35 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   }
   swapchain_create_info.clipped = VK_TRUE;
   swapchain_create_info.oldSwapchain = old_swapchain;
+
+  // Present-wait (v2, then v1) where the device and, for v2, this surface support it.
+  const VulkanDevice::Properties& device_properties = vulkan_device->properties();
+  pacing::PresentWaitInputs present_wait_inputs;
+  present_wait_inputs.enabled = REXCVAR_GET(present_wait);
+  present_wait_inputs.fifo = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR;
+  present_wait_inputs.device_wait2 = device_properties.presentWait2;
+  present_wait_inputs.device_wait1 = device_properties.presentWait;
+  if (present_wait_inputs.enabled && present_wait_inputs.fifo && device_properties.presentWait2 &&
+      ifn.vkGetPhysicalDeviceSurfaceCapabilities2KHR) {
+    VkSurfaceCapabilitiesPresentWait2KHR wait2_capabilities = {
+        VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR};
+    VkSurfaceCapabilitiesPresentId2KHR id2_capabilities = {
+        VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR, &wait2_capabilities};
+    VkSurfaceCapabilities2KHR capabilities2 = {VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+                                               &id2_capabilities};
+    VkPhysicalDeviceSurfaceInfo2KHR surface_info = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, nullptr, surface};
+    if (ifn.vkGetPhysicalDeviceSurfaceCapabilities2KHR(physical_device, &surface_info,
+                                                       &capabilities2) == VK_SUCCESS) {
+      present_wait_inputs.surface_wait2 =
+          id2_capabilities.presentId2Supported && wait2_capabilities.presentWait2Supported;
+    }
+  }
+  const pacing::PresentWaitMode present_wait = pacing::ChoosePresentWait(present_wait_inputs);
+  if (present_wait == pacing::PresentWaitMode::kWait2) {
+    swapchain_create_info.flags |=
+        VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+  }
   VkSwapchainKHR swapchain;
   if (dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain) != VK_SUCCESS) {
     REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
@@ -1416,6 +1467,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
       uint32_t(swapchain_create_info.presentMode));
+  REXLOG_INFO("VulkanPresenter: frame pacing feedback: {}",
+              pacing::PresentWaitModeName(present_wait));
+  present_wait_out = present_wait;
 
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;
@@ -1425,7 +1479,43 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   return swapchain;
 }
 
+void VulkanPresenter::PaintContext::AttachPresentWaiter() {
+  if (swapchain == VK_NULL_HANDLE || swapchain_present_wait == pacing::PresentWaitMode::kTimer) {
+    return;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const VkSwapchainKHR waited_swapchain = swapchain;
+  const bool v2 = swapchain_present_wait == pacing::PresentWaitMode::kWait2;
+  // Runs on the waiter thread only, and never after Detach (in PrepareForSwapchainRetirement)
+  // returned, so the swapchain outlives every call.
+  present_waiter->Attach([&dfn, device, waited_swapchain, v2](
+                             uint64_t id, std::chrono::nanoseconds timeout) {
+    VkResult result;
+    if (v2) {
+      VkPresentWait2InfoKHR info = {VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR, nullptr, id,
+                                    uint64_t(timeout.count())};
+      result = dfn.vkWaitForPresent2KHR(device, waited_swapchain, &info);
+    } else {
+      result = dfn.vkWaitForPresentKHR(device, waited_swapchain, id, uint64_t(timeout.count()));
+    }
+    switch (result) {
+      case VK_SUCCESS:
+      case VK_SUBOPTIMAL_KHR:
+        return pacing::PresentWaiter::WaitResult::kShown;
+      case VK_TIMEOUT:
+        return pacing::PresentWaiter::WaitResult::kTimeout;
+      default:
+        REXLOG_WARN("VulkanPresenter: present-wait failed ({}); timer pacing for this swapchain",
+                    int(result));
+        return pacing::PresentWaiter::WaitResult::kFailed;
+    }
+  });
+}
+
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
+  // No present-wait may run on a swapchain that is about to be retired or destroyed.
+  present_waiter->Detach();
   if (swapchain != VK_NULL_HANDLE) {
     submission_tracker.AwaitAllSubmissionsCompletion();
   }
@@ -2236,11 +2326,32 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pSwapchains = &paint_context_.swapchain;
   present_info.pImageIndices = &swapchain_image_index;
   present_info.pResults = nullptr;
+  // Present-wait: the id this present can be waited on with.
+  uint64_t present_id = 0;
+  VkPresentId2KHR present_id2 = {VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR};
+  VkPresentIdKHR present_id1 = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+  if (paint_context_.swapchain_present_wait != pacing::PresentWaitMode::kTimer) {
+    present_id = paint_context_.present_waiter->NextId();
+  }
+  if (present_id) {
+    if (paint_context_.swapchain_present_wait == pacing::PresentWaitMode::kWait2) {
+      present_id2.swapchainCount = 1;
+      present_id2.pPresentIds = &present_id;
+      present_info.pNext = &present_id2;
+    } else {
+      present_id1.swapchainCount = 1;
+      present_id1.pPresentIds = &present_id;
+      present_info.pNext = &present_id1;
+    }
+  }
   VkResult present_result;
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+  }
+  if (present_id && (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR)) {
+    paint_context_.present_waiter->Presented(present_id, std::chrono::steady_clock::now());
   }
   switch (present_result) {
     case VK_SUCCESS:

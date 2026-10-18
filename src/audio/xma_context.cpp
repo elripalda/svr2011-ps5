@@ -7,6 +7,8 @@
 ******************************************************************************
 *
 * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+* @modified    WWE All Stars recomp, 2026 - Output-valid rule and frame drain
+*              (xma/work_rules.h), parts from Xenia Canary (BSD-3)
 */
 
 #include <algorithm>
@@ -15,6 +17,7 @@
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
+#include <rex/audio/xma/work_rules.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/memory/ring_buffer.h>
@@ -98,27 +101,42 @@ bool XmaContext::Work() {
   }
 
   std::lock_guard<std::mutex> lock(lock_);
+  // A lock (Disable) can land between the check above and taking lock_.
+  if (!is_enabled()) {
+    return false;
+  }
   set_is_enabled(false);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
   const XMA_CONTEXT_DATA initial_data = data;
 
+  // Not valid means the ring is full: nothing to do until the title reads.
+  // With input or a frame left the context stays eligible (xma/work_rules.h).
   if (!data.output_buffer_valid) {
-    return true;
+    set_is_enabled(data.IsAnyInputBufferValid() || current_frame_remaining_subframes_ > 0);
+    return false;
   }
 
   memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
+  uint32_t blocks_written = 0;
+  const uint32_t capacity_blocks = output_rb.capacity() / kOutputBytesPerBlock;
+  // Valid with equal offsets is an empty ring.
+  const uint32_t blocks_at_start = output_rb.read_count() / kOutputBytesPerBlock;
+  auto ring_full = [&] { return blocks_at_start + blocks_written >= capacity_blocks; };
 
   // Consume-only context: no input, just drain remaining subframes.
   if (data.IsConsumeOnlyContext()) {
     if (current_frame_remaining_subframes_ == 0) {
-      return true;
+      return false;
     }
-    Consume(&output_rb, &data);
+    blocks_written += Consume(&output_rb, &data);
     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+    if (ring_full()) {
+      data.output_buffer_valid = 0;
+    }
     StoreContextMerged(data, initial_data, context_ptr);
-    return true;
+    return blocks_written > 0;
   }
 
   // Minimum free blocks needed before attempting a decode.
@@ -128,27 +146,62 @@ bool XmaContext::Work() {
       static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
 
   if (minimum_subframe_decode_count > remaining_subframe_blocks_in_output_buffer_) {
+    // No room yet: stays eligible while it has input or a frame to finish.
+    set_is_enabled(data.IsAnyInputBufferValid() || current_frame_remaining_subframes_ > 0);
     StoreContextMerged(data, initial_data, context_ptr);
-    return true;
+    return false;
   }
 
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+    const uint32_t read_offset_before = data.input_buffer_read_offset;
+    const uint32_t buffer_before = data.current_buffer;
     Decode(&data);
-    Consume(&output_rb, &data);
+    const uint32_t written = Consume(&output_rb, &data);
+    blocks_written += written;
 
-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+    if (!xma::KeepPassGoing({
+            .room_for_decode =
+                remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count,
+            .input_valid = data.IsAnyInputBufferValid(),
+            .frame_pending = current_frame_remaining_subframes_ > 0,
+            .waiting_for_next_buffer = data.error_status == 4,
+            .progressed = written > 0 || data.input_buffer_read_offset != read_offset_before ||
+                          data.current_buffer != buffer_before,
+        })) {
       break;
     }
   }
 
   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 
-  if (output_rb.empty()) {
+  const bool progressed =
+      blocks_written > 0 ||
+      data.input_buffer_read_offset != initial_data.input_buffer_read_offset ||
+      data.current_buffer != initial_data.current_buffer ||
+      data.input_buffer_0_valid != initial_data.input_buffer_0_valid ||
+      data.input_buffer_1_valid != initial_data.input_buffer_1_valid;
+  const xma::PassDecision decision = xma::DecideAfterPass({
+      .ring_full = ring_full(),
+      .room_for_decode = remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count,
+      .input_valid = data.IsAnyInputBufferValid(),
+      .progressed = progressed,
+      .waiting_for_next_buffer = data.error_status == 4,
+      .frame_pending = current_frame_remaining_subframes_ > 0,
+  });
+  if (!decision.output_valid) {
     data.output_buffer_valid = 0;
+  }
+  if (decision.input_exhausted) {
+    REXAPU_INFO("XmaContext {}: no progress with input valid; marking input exhausted", id());
+    data.input_buffer_0_valid = 0;
+    data.input_buffer_1_valid = 0;
+  }
+  if (decision.keep_decoding) {
+    set_is_enabled(true);
   }
 
   StoreContextMerged(data, initial_data, context_ptr);
-  return true;
+  return progressed;
 }
 
 void XmaContext::Enable() {
@@ -169,6 +222,7 @@ bool XmaContext::Block(bool poll) {
 
 void XmaContext::Clear() {
   std::lock_guard<std::mutex> lock(lock_);
+  set_is_enabled(false);  // stops continued decoding, as Disable() does
   REXAPU_NOISY_DEBUG("XmaContext: reset context {}", id());
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
@@ -422,9 +476,9 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
   fresh.Store(context_ptr);
 }
 
-void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data) {
+uint32_t XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data) {
   if (!current_frame_remaining_subframes_) {
-    return;
+    return 0;
   }
 
   if (loop_frame_output_limit_ > 0) {
@@ -435,7 +489,7 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
       remaining_subframe_blocks_in_output_buffer_ -= data->output_buffer_padding;
       current_frame_remaining_subframes_ = 0;
       loop_frame_output_limit_ = 0;
-      return;
+      return 0;
     }
   }
 
@@ -466,6 +520,7 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
 
   remaining_subframe_blocks_in_output_buffer_ -= subframes_to_write + headroom;
   current_frame_remaining_subframes_ -= subframes_to_write;
+  return static_cast<uint32_t>(subframes_to_write);
 }
 
 int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {

@@ -57,6 +57,10 @@ class IGraphicsSystem {
   virtual ui::GraphicsProvider* provider() const { return nullptr; }
   virtual ui::Presenter* presenter() const { return nullptr; }
 
+  // The guest vblank's rate while the game wants one other than its video mode's (WWE: 120 fps
+  // matches); 0 returns to the video mode's rate. Applies from the next vblank. Default: none.
+  virtual void SetGuestVblankRate(double hz) { (void)hz; }
+
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
     (void)callback;

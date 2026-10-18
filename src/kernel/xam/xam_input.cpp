@@ -129,7 +129,8 @@ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION>
 
   (void)unk;  // Unused in this implementation
   auto* is = input_system();
-  return is->SetState(actual_user_index, vibration);
+  // The raw index too: the vibration ledger tells "any user" apart from user 0.
+  return is->SetState(actual_user_index, vibration, user_index);
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetkeystroke(v=vs.85).aspx

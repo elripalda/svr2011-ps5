@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <string_view>
 #include <vector>
 
 #include <rex/input/device.h>
@@ -45,6 +46,10 @@ class InputDriver {
                                       X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+
+  /// The name the vibration log line gives this driver ("sdl", "xinput").
+  /// Empty for drivers with no real pads (MnK, NOP).
+  virtual std::string_view vibration_backend() const { return {}; }
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;

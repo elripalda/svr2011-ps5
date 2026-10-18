@@ -102,12 +102,22 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
     return result;
   }
 
-  // Search for sibling XEX patch file
-  auto patch_entry = kernel_state_->file_system()->ResolvePath(path_ + "p");
+  // Search for the XEX patch: first in a title update mounted as update:\ (so
+  // the game data stays a clean disc copy), then next to the XEX.
+  const auto file_name = path_.substr(path_.find_last_of('\\') + 1);
+  auto* file_system = kernel_state_->file_system();
+  std::string update_target;  // only whether update: is mounted matters
+  rex::filesystem::Entry* patch_entry = nullptr;
+  if (file_system->FindSymbolicLink("update:", update_target)) {
+    patch_entry = file_system->ResolvePath("update:\\" + file_name + "p");
+  }
+  if (!patch_entry) {
+    patch_entry = file_system->ResolvePath(path_ + "p");
+  }
   if (patch_entry) {
     auto patch_path = patch_entry->absolute_path();
 
-    REXSYS_DEBUG("Loading XEX patch from {}", patch_path);
+    REXSYS_INFO("Loading XEX patch from {}", patch_path);
 
     auto patch_module = object_ref<UserModule>(new UserModule(kernel_state_));
     result = patch_module->LoadFromFile(patch_path);
@@ -120,9 +130,11 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
       REXSYS_ERROR("Failed to load XEX patch, code: {}", result);
     }
 
-    if (result) {
-      return X_STATUS_UNSUCCESSFUL;
-    }
+    // A patch that does not load or apply leaves the disc image, or one it
+    // half patched. The load goes on so that the host can check the image it
+    // got and tell the player what is wrong (WWE All Stars: its startup image
+    // check, which every start runs), instead of a bare load failure. A host
+    // without such a check would run that image.
   }
 
   return LoadXexContinue();

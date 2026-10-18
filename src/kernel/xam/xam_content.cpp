@@ -22,6 +22,10 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(license_mask, 0, "Kernel", "Set license mask for activated content");
+// Marketplace content (DLC) a player dumped from their own console was licensed to that console's
+// account; with this on, it opens with every licence bit set wherever it came from.
+REXCVAR_DEFINE_BOOL(marketplace_full_license, true, "Kernel",
+                    "Open marketplace content (DLC) with a full licence");
 
 namespace rex {
 namespace kernel {
@@ -107,7 +111,9 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
     // TODO(gibbed): disc drive content
   }
 
-  REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
+  REXKRNL_INFO("XamContentCreateEnumerator: user {} device {:08X} type {:08X} count {} -> {} items",
+               uint32_t(user_index), uint32_t(device_id), uint32_t(content_type),
+               uint32_t(items_per_enumerate), e->item_count());
 
   *handle_out = e->handle();
   return X_ERROR_SUCCESS;
@@ -141,7 +147,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     *disposition_ptr = 0;
   }
 
-  auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
+  // The root name is copied: the deferred (overlapped) run outlives the guest buffer, and games
+  // keep it on the stack (WWE All Stars passes "DLC0" from its stack).
+  auto run = [content_manager, xuid, root_name = std::string(root_name.value()), flags, content_data,
               disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
@@ -214,11 +222,18 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       }
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
+      if (XSUCCEEDED(result) && content_data.content_type == XContentType::kMarketplaceContent &&
+          REXCVAR_GET(marketplace_full_license)) {
+        content_license = 0xFFFFFFFF;
+      }
     }
 
     if (license_mask_ptr && XSUCCEEDED(result)) {
       *license_mask_ptr = content_license;
     }
+    REXKRNL_INFO("XamContentCreate: root {} type {:08X} file {} flags {:X} -> {:08X}, license {:08X}",
+                 root_name, static_cast<uint32_t>(XContentType(content_data.content_type)), content_data.file_name(), uint32_t(flags),
+                 result, content_license);
 
     if (disposition_ptr) {
       *disposition_ptr = static_cast<uint32_t>(disposition);

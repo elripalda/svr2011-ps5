@@ -283,8 +283,17 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void OnMinimized(ui::UIEvent& e) override;
   void OnRestored(ui::UIEvent& e) override;
 
-  // WindowInputListener overrides
+ protected:
+  // WindowInputListener overrides; an app that overrides them calls these for
+  // the binds and the fullscreen toggle.
   void OnKeyDown(ui::KeyEvent& e) override;
+  void OnMouseDown(ui::MouseEvent& e) override;
+
+  // Alt+Enter switches between fullscreen and a window; a double click in a
+  // window goes fullscreen.
+  void ToggleFullscreen();
+
+ private:
 
   PPCImageInfo ppc_info_;
   PathConfig resolved_defaults_;

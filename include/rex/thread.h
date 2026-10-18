@@ -113,6 +113,18 @@ void SyncMemory();
 
 // Sleeps the current thread for at least as long as the given duration.
 void Sleep(std::chrono::microseconds duration);
+// Sub-millisecond sleep; Sleep rounds to whole milliseconds on Windows.
+void PreciseSleep(std::chrono::microseconds duration);
+
+// Puts the current thread in the MMCSS "Games" task at high priority (Windows; avrt.dll is
+// loaded on demand). Returns false where that is not possible. Leave with LeaveMmcss.
+bool JoinMmcssGames();
+void LeaveMmcss();
+// THREAD_PRIORITY_HIGHEST for the current thread (never TIME_CRITICAL).
+void SetCurrentThreadPriorityHighest();
+// Asks Windows to keep this process at full speed (HighQoS) and to honour its timer
+// resolution even when the window is hidden. Returns whether the request was accepted.
+bool RequestHighQosTimers();
 template <typename Rep, typename Period>
 void Sleep(std::chrono::duration<Rep, Period> duration) {
   Sleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));

@@ -9,7 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstring>
+
+#include <rex/kernel/xam/live/live.h>
 #include <rex/kernel/xam/module.h>
+#include <rex/kernel/xam/net_trace.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -83,9 +87,41 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
   return result;
 }
 
-u32 XamCreateEnumeratorHandle_entry(u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 unk5, u32 unk6,
-                                    u32 unk7, u32 unk8) {
-  return X_ERROR_INVALID_PARAMETER;
+u32 XamCreateEnumeratorHandle_entry(u32 user_index, u32 app_id, u32 open_message,
+                                    u32 close_message, u32 extra_size, u32 item_count, u32 flags,
+                                    mapped_u32 handle_out) {
+  // Signed in to Live, XTitleServerCreateEnumerator (XLiveBase 0x58039, the Live list of LSP
+  // title servers) lists the game server's Rendez-Vous address (after the Xenia netplay
+  // fork's XLiveBaseApp, BSD license).
+  constexpr uint32_t kXLiveBase = 0xFC;
+  constexpr uint32_t kTitleServerEnumerate = 0x58039;
+  constexpr size_t kTitleServerInfoSize = 0xD0;  // XTITLE_SERVER_INFO
+  if (app_id != kXLiveBase || open_message != kTitleServerEnumerate || !handle_out ||
+      !live::SignedIn()) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  auto e = make_object<XStaticUntypedEnumerator>(REX_KERNEL_STATE(), item_count,
+                                                 kTitleServerInfoSize);
+  void* extra = nullptr;
+  auto result =
+      e->Initialize(user_index, app_id, open_message, close_message, flags, extra_size, &extra);
+  if (XFAILED(result)) {
+    return result;
+  }
+  for (const auto& server : live::TitleServers()) {
+    if (e->item_count() >= item_count) {
+      break;
+    }
+    // inaServer (network order), dwFlags, szServerInfo[200].
+    uint8_t* item = e->AppendItem();
+    std::memset(item, 0, kTitleServerInfoSize);
+    memory::store_and_swap<uint32_t>(item, server.address);
+    memory::store_and_swap<uint32_t>(item + 4, server.flags);
+    std::memcpy(item + 8, server.description.data(),
+                std::min<size_t>(server.description.size(), kTitleServerInfoSize - 9));
+  }
+  *handle_out = e->handle();
+  return X_ERROR_SUCCESS;
 }
 
 u32 XamGetPrivateEnumStructureFromHandle_entry(u32 handle, mapped_u32 out_object_ptr) {
@@ -109,7 +145,7 @@ u32 XamGetPrivateEnumStructureFromHandle_entry(u32 handle, mapped_u32 out_object
 }  // namespace kernel
 }  // namespace rex
 
-REX_EXPORT(__imp__XamEnumerate, rex::kernel::xam::XamEnumerate_entry)
-REX_EXPORT(__imp__XamCreateEnumeratorHandle, rex::kernel::xam::XamCreateEnumeratorHandle_entry)
+REX_TRACE_EXPORT(__imp__XamEnumerate, rex::kernel::xam::XamEnumerate_entry)
+REX_TRACE_EXPORT(__imp__XamCreateEnumeratorHandle, rex::kernel::xam::XamCreateEnumeratorHandle_entry)
 REX_EXPORT(__imp__XamGetPrivateEnumStructureFromHandle,
            rex::kernel::xam::XamGetPrivateEnumStructureFromHandle_entry)

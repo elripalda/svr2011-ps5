@@ -19,6 +19,8 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/ui/present_pacing.h>
+#include <rex/ui/present_waiter.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
@@ -147,6 +149,10 @@ class VulkanPresenter final : public Presenter {
                               bool& is_8bpc_out_ref) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+
+  pacing::PresentWaiter* GetPresentWaiter() override {
+    return paint_context_.present_waiter.get();
+  }
 
  private:
   // Usable for both the guest output image itself and for intermediate images.
@@ -353,7 +359,10 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& ui_surface_unusable_out);
+        pacing::PresentWaitMode& present_wait_out, bool& ui_surface_unusable_out);
+
+    // After a swapchain was created: follow its presents where present-wait is on.
+    void AttachPresentWaiter();
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -414,6 +423,12 @@ class VulkanPresenter final : public Presenter {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+    // Whether presents carry ids that the waiter follows (rex/ui/present_pacing.h).
+    pacing::PresentWaitMode swapchain_present_wait = pacing::PresentWaitMode::kTimer;
+    // Lives as long as the presenter; attached to the current swapchain where present-wait is on
+    // and detached before the swapchain is retired.
+    std::unique_ptr<pacing::PresentWaiter> present_waiter =
+        std::make_unique<pacing::PresentWaiter>();
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
   };

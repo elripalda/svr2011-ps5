@@ -207,6 +207,19 @@ void Sleep(std::chrono::microseconds duration) {
 }
 
 // TODO(bwrsandman) Implement by allowing alert interrupts from IO operations
+void PreciseSleep(std::chrono::microseconds duration) {
+  Sleep(duration);
+}
+
+bool JoinMmcssGames() {
+  return false;
+}
+void LeaveMmcss() {}
+void SetCurrentThreadPriorityHighest() {}
+bool RequestHighQosTimers() {
+  return false;
+}
+
 thread_local bool alertable_state_ = false;
 bool DispatchCurrentThreadUserCallback();
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
