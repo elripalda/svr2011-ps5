@@ -28,6 +28,24 @@
 
 namespace rex::graphics {
 
+// A game's replacement art for some of its textures. Before a 2D tiled texture's top level is
+// uploaded, the replacer gets that level's place in guest memory, as the guest wrote it, and may
+// rewrite those bytes in place (same format, size and tiling). It returns true when it wrote, and
+// the copy on the GPU is then refreshed from the new bytes. Called on the GPU thread.
+struct TextureReplaceLevel {
+  uint32_t format;           // xenos::TextureFormat
+  uint32_t width;            // texels
+  uint32_t height;
+  uint32_t block_width;      // texels per block (4 for DXT)
+  uint32_t block_height;
+  uint32_t bytes_per_block;
+  uint32_t pitch_blocks;     // row pitch in blocks, aligned to the 32-block tile
+  uint32_t address;          // guest physical address of the level
+  uint32_t size;             // bytes the level spans from there
+};
+using TextureReplacer = bool (*)(const TextureReplaceLevel& level);
+void SetTextureReplacer(TextureReplacer replacer);
+
 // Manages host copies of guest textures, performing untiling, format and endian
 // conversion of textures stored in the shared memory, and also handling
 // invalidation.
@@ -561,6 +579,8 @@ class TextureCache {
                           PendingSharedMemoryRange* pending_ranges_out,
                           size_t& pending_range_count_out);
   bool CommitPreparedTextureLoad(const PendingTextureLoad& pending_load);
+  // Lets the replacer (SetTextureReplacer) rewrite the texture's top level before its upload.
+  void ReplaceBaseLevel(const TextureKey& key);
 
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 

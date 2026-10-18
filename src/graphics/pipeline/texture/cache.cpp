@@ -396,6 +396,7 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
 
   TextureKey texture_key = texture.key();
   if (base_outdated) {
+    ReplaceBaseLevel(texture_key);
     PendingSharedMemoryRange pending_range;
     pending_range.start = texture_key.base_page << 12;
     pending_range.length =
@@ -411,6 +412,51 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   }
 
   return true;
+}
+
+namespace {
+std::atomic<TextureReplacer> texture_replacer{nullptr};
+}  // namespace
+
+void SetTextureReplacer(TextureReplacer replacer) {
+  texture_replacer.store(replacer, std::memory_order_release);
+}
+
+void TextureCache::ReplaceBaseLevel(const TextureKey& key) {
+  TextureReplacer replacer = texture_replacer.load(std::memory_order_acquire);
+  if (!replacer || key.scaled_resolve || !key.tiled || !key.base_page ||
+      key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1) {
+    return;
+  }
+  // A base level in the packed mip tail starts part-way into it: not one replaced art covers.
+  if (key.packed_mips && key.GetWidth() <= 16 && key.GetHeight() <= 16) {
+    return;
+  }
+  const FormatInfo* info = FormatInfo::Get(key.format);
+  if (!info || !info->bits_per_pixel) {
+    return;
+  }
+  const texture_util::TextureGuestLayout layout = key.GetGuestLayout();
+  TextureReplaceLevel level;
+  level.format = uint32_t(key.format);
+  level.width = key.GetWidth();
+  level.height = key.GetHeight();
+  level.block_width = info->block_width;
+  level.block_height = info->block_height;
+  level.bytes_per_block = info->bytes_per_block();
+  if (!level.bytes_per_block) {
+    return;
+  }
+  level.pitch_blocks = layout.base.row_pitch_bytes / level.bytes_per_block;
+  level.address = key.base_page << 12;
+  level.size = layout.base.level_data_extent_bytes;
+  if (!level.size || !replacer(level)) {
+    return;
+  }
+  // The bytes changed behind the shared memory's back: upload them again, and let anything else
+  // made from them reload.
+  shared_memory().MemoryInvalidationCallback(level.address, level.size, true);
+  key.LogAction("Replaced");
 }
 
 bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_load) {
