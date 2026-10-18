@@ -81,7 +81,13 @@ target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexa
 
 if(REX_PS5)
     # [ps5] No libcurl or miniupnpc on the PS5 yet: online play's HTTP requests fail (offline) and
-    # UPnP is off (src/kernel/xam/live/http.cpp, upnp.cpp).
+    # UPnP is off (src/kernel/xam/live/http.cpp, upnp.cpp). rapidjson (headers) is still used.
+    set(REXGLUE_RAPIDJSON_SOURCE_DIR "" CACHE PATH "rapidjson source folder (online play)")
+    if(NOT EXISTS "${REXGLUE_RAPIDJSON_SOURCE_DIR}/include/rapidjson/rapidjson.h")
+        message(FATAL_ERROR "Set REXGLUE_RAPIDJSON_SOURCE_DIR (Tencent/rapidjson at 7c73dd7).")
+    endif()
+    target_include_directories(rexruntime PUBLIC
+        $<BUILD_INTERFACE:${REXGLUE_RAPIDJSON_SOURCE_DIR}/include>)
 else()
 # WWE All Stars recomp, online play: the client ported from the Xenia netplay fork talks
 # HTTP(S) to the game server with libcurl (Schannel) and reads its JSON with rapidjson, from

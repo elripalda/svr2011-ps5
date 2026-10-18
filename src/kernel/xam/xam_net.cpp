@@ -29,6 +29,7 @@
 #include <rex/kernel/xam/live/relay.h>
 #include <rex/kernel/xam/live/upnp.h>
 #include <rex/kernel/xam/module.h>
+#include <rex/kernel/xam/online_hooks.h>
 #include <rex/kernel/xam/net_trace.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -61,6 +62,18 @@
 
 REXCVAR_DEFINE_BOOL(wwe_net_trace, false, "Kernel",
                     "Log the guest's network, XMsg and session calls (rate-limited)");
+
+// [svr2011] Online: the game is signed in to an online service (xam_user.cpp)
+// and its GameSpy web services (Community Creations) go to online_server.
+// (SvR 2011's online play, off unless a game turns it on; WWE All Stars' is wwe_online.)
+REXCVAR_DEFINE_BOOL(online_enabled, false, "Online",
+                    "Signed in online: the ONLINE menu, Community Creations on online_server");
+REXCVAR_DEFINE_STRING(online_server, "https://sho-ti.me/svr", "Online",
+                      "The Community Creations server (its URL; the port relays the game's GameSpy traffic there)");
+// [svr2011] The port's relay (online.cpp) on this PC: the game's GameSpy
+// connections go to it (http on online_relay_http, presence on online_relay_gp).
+REXCVAR_DEFINE_UINT32(online_relay_http, 0, "Online", "(set by the game: its relay's http port)");
+REXCVAR_DEFINE_UINT32(online_relay_gp, 0, "Online", "(set by the game: its relay's presence port)");
 
 namespace rex {
 namespace kernel {
