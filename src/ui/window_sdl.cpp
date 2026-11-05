@@ -143,6 +143,15 @@ WindowSDL::~WindowSDL() {
   DestroySDLWindow();
 }
 
+// [svr2011] SVR2011_WINDOW_HIDDEN=1: test games with no visible window at all.
+static bool WindowHiddenForTests() {
+  static const bool hidden = [] {
+    const char* v = std::getenv("SVR2011_WINDOW_HIDDEN");
+    return v && *v == '1';
+  }();
+  return hidden;
+}
+
 bool WindowSDL::OpenImpl() {
   // SDL window coordinates are physical pixels on Windows and X11. Cocoa
   // uses logical points and applies the backing scale itself.
@@ -205,7 +214,12 @@ bool WindowSDL::OpenImpl() {
     }
   }
 #endif
-  SDL_ShowWindow(sdl_window_);
+  // [svr2011] Tests on one screen (SVR2011_WINDOW_HIDDEN=1): the window is
+  // never shown (created SDL_WINDOW_HIDDEN, stays so); the renderer keeps
+  // drawing into it, and frame shots read its back buffer.
+  if (!WindowHiddenForTests()) {
+    SDL_ShowWindow(sdl_window_);
+  }
 
   // Actualize state for the common Window code. Listener dispatch is handled
   // by Window::Open after OpenImpl returns; these only record initial state.
@@ -407,6 +421,9 @@ void WindowSDL::RearmCursorAutoHideTimer() {
 void WindowSDL::FocusImpl() {
   if (!sdl_window_) {
     return;
+  }
+  if (WindowHiddenForTests()) {
+    return;  // ([svr2011] raising shows a hidden window)
   }
   SDL_RaiseWindow(sdl_window_);
 }

@@ -221,11 +221,20 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
         io_status_block->information = bytes_read;
       }
 
+      // [svr2011] An asynchronous file's read always completes through its APC
+      // and event - a failed one too, its status in the IO status block - and
+      // returns X_STATUS_PENDING. A failed read returned X_STATUS_PENDING (or
+      // END_OF_FILE) with no APC: a caller sleeping alertably for the completion
+      // (SvR 2011's loader: ReadFileEx + SleepEx(INFINITE, TRUE)) waited for
+      // ever. A synchronous file's read returns its status as before. (As
+      // NtReadFileScatter and NtWriteFile below already do.)
+      const bool async_file = !file->is_synchronous();
+
       // Queue the APC callback. It must be delivered via the APC mechanism even
       // though were are completing immediately.
       // Low bit probably means do not queue to IO ports.
       if ((uint32_t)apc_routine_ptr & ~1) {
-        if (apc_context && result == X_STATUS_SUCCESS) {
+        if (apc_context && (result == X_STATUS_SUCCESS || async_file)) {
           auto thread = XThread::GetCurrentThread();
           uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr) & ~1u;
           uint32_t apc_ctx = apc_context.guest_address();
@@ -241,7 +250,7 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
         }
       }
 
-      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
+      if (async_file) {
         result = X_STATUS_PENDING;
       }
 

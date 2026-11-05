@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <memory>
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -280,6 +281,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_LOCAL_EXTENSION
 #undef XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
+
+  // [svr2011] the app's optional ones (instance.h), where the driver has them
+  const std::vector<std::string> app_extensions = OptionalDeviceExtensions();
+  std::unique_ptr<bool[]> app_extension_enabled(new bool[app_extensions.size() + 1]());
+  for (size_t i = 0; i < app_extensions.size(); ++i) {
+    requested_extensions.emplace(app_extensions[i], &app_extension_enabled[i]);
+  }
+  const auto app_extension_on = [&](const std::string& name) {
+    for (size_t i = 0; i < app_extensions.size(); ++i) {
+      if (app_extensions[i] == name && app_extension_enabled[i]) return true;
+    }
+    return false;
+  };
 
   std::vector<const char*> enabled_extensions;
   {
@@ -694,6 +708,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+      // [svr2011] buffer device address: only for an app that asked, with its
+      // gate extension enabled (instance.h - NVIDIA NGX: VK_NVX_binary_import)
+      const std::string bda_gate = BufferDeviceAddressGate();
+      if (!bda_gate.empty() && app_extension_on(bda_gate) &&
+          features_1_2.supported.bufferDeviceAddress) {
+        features_1_2.enabled.bufferDeviceAddress = VK_TRUE;
+        REXLOG_INFO("* buffer device address (for {})", bda_gate);
+      }
       // [svr2011] for an app renderer on this device (rex/external_frame.h)
       // (the native renderer's shaders read their constants from a storage
       // buffer: no buffer device address or 64-bit integers needed)
