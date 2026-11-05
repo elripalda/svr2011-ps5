@@ -33,9 +33,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kColumns = 5;
-constexpr float kPanelW2 = 1600, kPanelH2 = 900;
-constexpr float kCardW = 280, kThumbH = 210, kCardGap = 24, kRowPitch = 300;
+// (24 a page: 4 across, 6 rows, every row full)
+constexpr int kColumns = 4;
+constexpr float kPanelW2 = 1600, kPanelH2 = 940;
+constexpr float kCardW = 356, kThumbH = 267, kCardGap = 24, kRowPitch = 351;
 constexpr uint64_t kPiece = 4ull << 20;  // (a download, a range at a time)
 
 // The types and orders the server knows (its discovery.py), and how the page names them.
