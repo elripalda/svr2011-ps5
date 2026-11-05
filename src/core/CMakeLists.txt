@@ -110,7 +110,7 @@ elseif(PS5)
     # PS5 system services the platform layer calls (display splash, users,
     # DualSense, audio out).
     target_link_libraries(rexcore PUBLIC SceSystemService SceUserService ScePad SceAudioOut ps5platform)
-    target_sources(rexcore PRIVATE ps5_libc_extras.c ps5_diag.cpp)
+    target_sources(rexcore PRIVATE ps5_libc_extras.c ps5_getcwd.c ps5_diag.cpp)
 elseif(ANDROID)  # [svr2011] pthread and rt are part of bionic's libc
     target_link_libraries(rexcore PRIVATE dl log android)
 elseif(UNIX)

@@ -14,4 +14,7 @@ static const AVCodec* const codec_list[] = {
 #if CONFIG_XMAFRAMES_DECODER
     &ff_xmaframes_decoder,
 #endif
+#if CONFIG_H264_DECODER  // [ps5 port] (the PS5's config: mods' .mp4 movies)
+    &ff_h264_decoder,
+#endif
     NULL};

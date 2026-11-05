@@ -661,6 +661,45 @@ if(IS_X86_64)
     )
 endif()
 
+# [ps5 port] The H.264 decoder (config_ps5_x86_64.h): the PS5 has no system
+# decoder the port can use, and mods' entrance movies are .mp4 (hd_movies.cpp).
+if(PS5)
+    target_sources(libavcodec PRIVATE
+        ${FFMPEG_DIR}/libavcodec/atsc_a53.c
+        ${FFMPEG_DIR}/libavcodec/cabac.c
+        ${FFMPEG_DIR}/libavcodec/golomb.c
+        ${FFMPEG_DIR}/libavcodec/h2645_parse.c
+        ${FFMPEG_DIR}/libavcodec/h264_cabac.c
+        ${FFMPEG_DIR}/libavcodec/h264_cavlc.c
+        ${FFMPEG_DIR}/libavcodec/h264_direct.c
+        ${FFMPEG_DIR}/libavcodec/h264_loopfilter.c
+        ${FFMPEG_DIR}/libavcodec/h264_mb.c
+        ${FFMPEG_DIR}/libavcodec/h264_parse.c
+        ${FFMPEG_DIR}/libavcodec/h264_picture.c
+        ${FFMPEG_DIR}/libavcodec/h264_ps.c
+        ${FFMPEG_DIR}/libavcodec/h264_refs.c
+        ${FFMPEG_DIR}/libavcodec/h264_sei.c
+        ${FFMPEG_DIR}/libavcodec/h264_slice.c
+        ${FFMPEG_DIR}/libavcodec/h264chroma.c
+        ${FFMPEG_DIR}/libavcodec/h264data.c
+        ${FFMPEG_DIR}/libavcodec/h264dec.c
+        ${FFMPEG_DIR}/libavcodec/h264dsp.c
+        ${FFMPEG_DIR}/libavcodec/h264idct.c
+        ${FFMPEG_DIR}/libavcodec/h264pred.c
+        ${FFMPEG_DIR}/libavcodec/h264qpel.c
+        ${FFMPEG_DIR}/libavcodec/startcode.c
+        ${FFMPEG_DIR}/libavcodec/videodsp.c
+        ${FFMPEG_DIR}/libavcodec/x86/h264_intrapred_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/h264_qpel.c
+        ${FFMPEG_DIR}/libavcodec/x86/h264chroma_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/h264dsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/videodsp_init.c
+    )
+    # (PIC: the inline asm's tables rip-relative, as FFmpeg's configure has
+    # it for a position-independent build - the PS5's is)
+    target_compile_definitions(libavcodec PRIVATE PIC)
+endif()
+
 # ARM64 optimizations for libavcodec
 if(IS_ARM64)
     target_sources(libavcodec PRIVATE
