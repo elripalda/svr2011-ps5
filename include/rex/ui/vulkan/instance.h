@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <rex/platform.h>
@@ -27,6 +28,18 @@ namespace vulkan {
 // the system's. Set before the instance is created.
 using LoaderOpener = void* (*)();
 void SetLoaderOpener(LoaderOpener opener);
+
+// [svr2011] An app's optional instance / device extensions (e.g. NVIDIA NGX for
+// DLSS), set in the process environment before the provider is made (it's
+// made in the GPU plugin DLL - no statics to share): REX_VULKAN_OPTIONAL_
+// INSTANCE_EXTENSIONS / REX_VULKAN_OPTIONAL_DEVICE_EXTENSIONS, names separated
+// by spaces, each enabled only where the driver lists it;
+// REX_VULKAN_BUFFER_DEVICE_ADDRESS_GATE=<device extension>: buffer device
+// address (Vulkan 1.2) only when the device has it and that extension was
+// enabled with it. Unset: nothing changes.
+std::vector<std::string> OptionalInstanceExtensions();
+std::vector<std::string> OptionalDeviceExtensions();
+std::string BufferDeviceAddressGate();
 
 class VulkanInstance {
  public:

@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -25,6 +28,9 @@
 #if REX_PLATFORM_MAC
 #include "vulkan_moltenvk.h"
 #endif
+#if REX_PLATFORM_WIN32
+#include <windows.h>  // [svr2011] (GetEnvironmentVariableA)
+#endif
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
 REXCVAR_DEFINE_INT32(vulkan_debug_message_repeats, 5, "UI/Vulkan",
@@ -38,6 +44,35 @@ namespace vulkan {
 static LoaderOpener g_loader_opener = nullptr;  // [svr2011]
 
 void SetLoaderOpener(LoaderOpener opener) { g_loader_opener = opener; }
+
+// [svr2011] An app's optional extensions (instance.h): the process environment.
+static std::string ProcessEnv(const char* name) {
+#if REX_PLATFORM_WIN32
+  char value[4096];
+  const DWORD n = GetEnvironmentVariableA(name, value, DWORD(sizeof(value)));
+  return n && n < sizeof(value) ? std::string(value, n) : std::string();
+#else
+  const char* v = std::getenv(name);
+  return v ? std::string(v) : std::string();
+#endif
+}
+static std::vector<std::string> SplitNames(const std::string& s) {
+  std::vector<std::string> out;
+  size_t at = 0;
+  while (at < s.size()) {
+    const size_t end = std::min(s.find(' ', at), s.size());
+    if (end > at) out.emplace_back(s.substr(at, end - at));
+    at = end + 1;
+  }
+  return out;
+}
+std::vector<std::string> OptionalInstanceExtensions() {
+  return SplitNames(ProcessEnv("REX_VULKAN_OPTIONAL_INSTANCE_EXTENSIONS"));
+}
+std::vector<std::string> OptionalDeviceExtensions() {
+  return SplitNames(ProcessEnv("REX_VULKAN_OPTIONAL_DEVICE_EXTENSIONS"));
+}
+std::string BufferDeviceAddressGate() { return ProcessEnv("REX_VULKAN_BUFFER_DEVICE_ADDRESS_GATE"); }
 
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                                                        const bool try_enable_validation) {
@@ -180,6 +215,15 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     requested_extensions.emplace("VK_EXT_metal_surface",
                                  &vulkan_instance->extensions_.ext_EXT_metal_surface);
 #endif
+  }
+
+  // [svr2011] the app's optional ones (instance.h), where the driver has them
+  static std::vector<std::string> app_extensions;
+  static std::unique_ptr<bool[]> app_extension_enabled;
+  app_extensions = OptionalInstanceExtensions();
+  app_extension_enabled.reset(new bool[app_extensions.size() + 1]());
+  for (size_t i = 0; i < app_extensions.size(); ++i) {
+    requested_extensions.emplace(app_extensions[i], &app_extension_enabled[i]);
   }
 
   std::vector<const char*> enabled_extensions;

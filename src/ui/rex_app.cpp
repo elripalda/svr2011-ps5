@@ -607,8 +607,11 @@ void ReXApp::OnDestroy() {
     window_->RemoveInputListener(this);
     window_->RemoveListener(this);
   }
-  window_.reset();
+  // The runtime first: its input drivers (MnkInputDriver) detach from the window as they go - with the window
+  // gone first, ~MnkInputDriver's RemoveInputListener touched a deleted window (the game's own early exit,
+  // "Execution complete" -> QuitFromUIThread: SvR 2011 2.1.8 report 6fd821's shutdown crash).
   runtime_.reset();
+  window_.reset();
 }
 
 void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {
