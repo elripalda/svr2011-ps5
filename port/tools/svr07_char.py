@@ -36,6 +36,8 @@ COLOR = (2048, 1024)
 NORMAL = (1024, 1024)
 MK = (512, 256)
 PAD = 4
+SHINE = 48   # (the normal sheet's alpha: bake)
+MISSING = '\0missing'   # (the box for meshes whose texture the pac doesn't carry)
 
 
 def slot_names(m8, s8):
@@ -76,31 +78,47 @@ def pack(sizes, W, H):
     raise RuntimeError('textures do not fit')
 
 
-def bake(kids):
+def bake(kids, legs=None):
     """-> ({child: m8 with sheet UVs}, color DDS, normal DDS, Mk DDS, notes)"""
     tex = {n.lower(): d for n, d in S8.tex_read(kids[0xa])}
     m8s = {k: S8.read08(kids[k]) for k in (0, 0x2710, 0x4e20) if k in kids and kids[k][:4] == b'JBOY'}
-    diffuse_of, normal_of = {}, {}
+    for m8 in m8s.values():   # (a diva's straight legs onto the diva skeleton's: svr08_char.Template.leg_fit)
+        S8.repose(m8, legs)
+    diffuse_of, normal_of, missing = {}, {}, []
     for k, m8 in m8s.items():
         for i, s8 in enumerate(m8['meshes']):
             sl = slot_names(m8, s8)
             d = sl.get('texDiffuse')
             if d not in tex:
+                # (a modded pac can name a texture it doesn't carry: left as it was, the mesh's UVs spanned the whole
+                # baked sheet - every part's colours as specks; it gets a plain grey box instead, and a note)
+                missing.append('%s mesh %d (%s)' % ({0: 'body', 0x2710: 'hair', 0x4e20: 'gear'}[k], i, d or 'no texture'))
+                diffuse_of[(k, i)] = MISSING
                 continue
             diffuse_of[(k, i)] = d
             n = sl.get('texNormal')
             if n in tex and not n.startswith('dummy'):
                 normal_of.setdefault(d, n)
-    images = {d: Image.open(io.BytesIO(tex[d])).convert('RGBA') for d in sorted(set(diffuse_of.values()))}   # (sorted: a set's order follows the hash seed - the packed sheet changed every run)
+    images = {d: Image.open(io.BytesIO(tex[d])).convert('RGBA') for d in sorted(set(diffuse_of.values()) - {MISSING})}
+    if missing:
+        images[MISSING] = Image.new('RGBA', (8, 8), (128, 128, 128, 0))   # (sorted: a set's order follows the hash seed - the packed sheet changed every run)
     scale, boxes = pack({d: im.size for d, im in images.items()}, *COLOR)
     color = Image.new('RGBA', COLOR, (128, 128, 128, 255))
-    normal = Image.new('RGBA', NORMAL, (128, 128, 255, 255))
+    # (the normal sheet's alpha is the skin shaders' shine mask - SpecLev x normal.a. 2007's skin normal maps keep a
+    # mask (Kurt Angle's body 0-68), its gear / hands / knees ones are opaque, as was this sheet behind parts with no
+    # normal map: those shone at full SpecLev, a white glare on SvR 2007 wrestlers - report 20261101-162315. 48, the
+    # FBX import's "no normal map" shine, where there is no mask)
+    normal = Image.new('RGBA', NORMAL, (128, 128, 255, SHINE))
     sx, sy = NORMAL[0] / COLOR[0], NORMAL[1] / COLOR[1]
     for d, (x, y, w, h) in boxes.items():
-        color.paste(images[d].resize((w, h), Image.LANCZOS), (x, y))
+        # (S8.resize_rgba, not Image.resize: Pillow premultiplies RGBA, so where a 2007 part's alpha is near 0 -
+        # Mick Foley's vest 0..32, pants 1..15 - its colour came out as dark streaks and coloured specks)
+        color.paste(S8.resize_rgba(images[d], (w, h), Image.LANCZOS), (x, y))
         if d in normal_of:
             nb = (int(x * sx), int(y * sy), max(1, int(w * sx)), max(1, int(h * sy)))
-            nim = Image.open(io.BytesIO(tex[normal_of[d]])).convert('RGBA').resize(nb[2:], Image.LANCZOS)
+            nim = S8.resize_rgba(Image.open(io.BytesIO(tex[normal_of[d]])).convert('RGBA'), nb[2:], Image.LANCZOS)
+            if nim.getchannel('A').getextrema()[0] >= 250:   # (an opaque one: no mask of its own - 48)
+                nim.putalpha(SHINE)
             normal.paste(nim, nb[:2])
     for (k, i), d in diffuse_of.items():
         x, y, w, h = boxes[d]
@@ -109,22 +127,28 @@ def bake(kids):
                      for u, v in s8['uvs']]
     ao = Image.new('L', MK, 255)
     mk = Image.merge('RGBA', (Image.new('L', MK, 0), ao, ao, Image.new('L', MK, 255)))
-    notes = '%d part textures baked at %.0f%%' % (len(boxes), scale * 100)
+    notes = '%d part textures baked at %.0f%% (%s)' % (len(boxes), scale * 100, ', '.join(sorted(set(diffuse_of.values()) - {MISSING})))
+    if missing:
+        notes += '; NOT IN THE PAC, drawn grey: ' + ', '.join(missing)
     return m8s, S8.dds_encode(color, 'DXT5'), S8.dds_encode(normal, 'DXT5'), S8.dds_encode(mk, 'DXT5'), notes
 
 
 def attire(kids, tp, portrait):
     """one 2011 attire (PACH children) from a 2007 EMD entry's children"""
-    m8s, color_d, normal_d, mk_d, notes = bake(kids)
+    legs = tp.leg_fit(kids[0])
+    m8s, color_d, normal_d, mk_d, notes = bake(kids, legs)
+    if legs:
+        notes += "; legs bent onto the template skeleton's"
     textures = ['color', 'normal', 'mk', 'noise', 'cubemap']
     SKIN = {'texDiffuse': 'color', 'texNormal': 'normal', 'texOcclusion': 'mk', 'texTilingMap': 'noise'}
     EYE = {'texDiffuse': 'color', 'texCubeRefction': 'cubemap', 'texRefctionReg': 'color', 'texOcclusion': 'mk'}
+    nodes = tp.nodes_at(kids[0], legs)   # (the template's nodes on the source's joints: svr08_char.Template.nodes_at)
     out = {0: jboy.write(S8.model(tp, tp.body, [(m8s[0], lambda s: (tp.p_eye, EYE) if 'Reflect' in s['shader'] else (tp.p_skin, SKIN))],
-                                  textures))}
+                                  textures, nodes))}
     if 0x2710 in m8s:
-        out[0x2710] = jboy.write(S8.model(tp, tp.hair, [(m8s[0x2710], lambda s: (tp.p_hair, SKIN))], textures[:5]))
+        out[0x2710] = jboy.write(S8.model(tp, tp.hair, [(m8s[0x2710], lambda s: (tp.p_hair, SKIN))], textures[:5], nodes))
     if 0x4e20 in m8s:
-        out[0x4e20] = jboy.write(S8.model(tp, tp.lash, [(m8s[0x4e20], lambda s: (tp.p_lash, {'texDiffuse': 'color'}))], ['color']))
+        out[0x4e20] = jboy.write(S8.model(tp, tp.lash, [(m8s[0x4e20], lambda s: (tp.p_lash, {'texDiffuse': 'color'}))], ['color'], nodes))
     ta = [('normal', normal_d), ('noise', tp.ttex['noise']), ('Mk', mk_d)]
     ta += [(n, d) for n, d in tp.ttex.items() if n.lower().startswith('bloodhair')]
     out[0xa] = S8.tex_write(ta, tp.t[0xa][:16])
@@ -140,7 +164,6 @@ def attire(kids, tp, portrait):
 
 def convert(src, out, template, cid, portrait=None, limit=4):
     """-> [(2007 entry, 2011 entry, notes)], [entries left out]"""
-    tp = S8.Template(template)
     h, g, t = svrfmt.epac_read(open(src, 'rb').read())
     emd = next(es for ty, es in g if ty == b'EMD ')
     ents = []
@@ -151,6 +174,8 @@ def convert(src, out, template, cid, portrait=None, limit=4):
     if not ents:
         raise RuntimeError('no wrestler (kind 2) model in %s' % os.path.basename(src))
     ents.sort(key=lambda e: e[1])
+    tp, tcid = S8.template_for(template, ents[0][2][0])   # (a diva: 2011's diva skeleton, ch143)
+    convert.skeleton = tcid
     entries, kept = [], []
     for k, (s, att, kids) in enumerate(ents[:limit]):
         o, notes = attire(kids, tp, portrait)

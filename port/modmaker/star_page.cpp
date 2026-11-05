@@ -8,7 +8,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <map>
+#include <functional>
+#include <memory>
 #include <set>
 #include <thread>
 
@@ -26,6 +29,7 @@
 #include "tool_run.h"
 #include "svrfmt/png.h"
 #include "disc_list.h"
+#include "simple_port.h"
 #include "imgui_internal.h"
 
 namespace mm {
@@ -94,7 +98,17 @@ std::wstring StyleChPac() {
 }
 // test aids: --star <id> picks the model, --star-* files, --test-star-save <file> saves the mod and quits
 int g_test_id = 0;
-std::wstring g_test_model, g_test_picture, g_test_save, g_test_full;
+extern std::string g_test_cae;  // (--star-cae: TestCae)
+struct MadeEntrance {  // (a created entrance the game listed: MadeEntrances)
+  int id = 0;
+  std::string name;
+};
+std::vector<MadeEntrance> MadeEntrances();
+bool UseMadeEntrance(int id, const std::string& name);
+void CreatedEntranceRow();
+extern std::string g_test_import;  // (--star-import-moveset: TestImportMoveset)
+void RunTestImport(const std::string& spec);
+std::wstring g_test_model, g_test_picture, g_test_save, g_test_full, g_test_load;
 std::string g_test_hometown;
 int g_test_pose = -1;
 std::string g_test_name;
@@ -135,6 +149,8 @@ const FileCheck& Check(const std::wstring& path, const char* kind) {
         c.ok = n >= 4 && !std::memcmp(head, "EPK8", 4) && c.size >= 0x4000;
         if (!c.ok) c.note = n >= 4 && !std::memcmp(head, "EPAC", 4) ? "an EPAC (an arena or menu pac), not a character model pac (EPK8)"
                                                                       : "not a character model pac (EPK8)";
+      } else if (!std::strcmp(kind, "bik") && n >= 8 && !std::memcmp(head + 4, "ftyp", 4)) {
+        c.ok = true;  // (an .mp4: the game plays it in HD)
       } else if (!std::strcmp(kind, "bik")) {
         c.ok = n >= 28 && !std::memcmp(head, "BIK", 3);
         if (c.ok) c.w = int(Le32(head + 20)), c.h = int(Le32(head + 24));
@@ -180,12 +196,18 @@ bool SetPortrait(Bytes& pac, const Image& bust) {
 }
 
 // Everything the build needs, copied off the UI thread.
+constexpr int kReduceMax = 120000;  // (Reduce detail's top: the big-model memory, tools/model_budget.py LIMIT - a
+                                    // 124,000-vertex model took 1,489 of its 1,600 pages)
+
 struct Job {
+  std::string needs;    // (kNeedsVersion for a model over the old 192 pages, written into the manifest)
+  std::string project;  // (ModProjectText: the page's project keys, into the mod)
   std::map<int, int> moveset;
   std::string id, manifest;
-  std::wstring model, song, movie, voice, attires[4];
+  std::wstring model, song, movie, voice, cae, attires[4];
+  std::string threads;  // (the Threads parts tab's threads.txt)
   std::string attire_names[4];
-  Image picture, picture_small, picture_full;
+  Image picture, picture_small, picture_full, picture_load;
   std::vector<Image> signs;
   std::wstring moves, pack;
   std::map<int, std::string> gear;  // (entrance gear choices)
@@ -585,6 +607,225 @@ void MovePicker() {
   }
 }
 
+// ---- a whole moveset from somewhere else (player request, 20 Oct): a 2011 superstar's, one of the superstar mods
+// installed in the game, or another game's superstar (the Port moves menu, simple_port.h ForStar)
+int g_imp_src = -1;  // -1 closed, 0 a 2011 superstar, 1 one of my mods, 2 another game
+char g_imp_find[48] = "";
+int g_imp_pick = -1;  // (the list's chosen row)
+bool g_imp_test_save = false;  // (test aid game:<game>:<item>: the project saved once their moves are in)
+struct ImportMod {
+  fs::path dir;
+  std::string name;
+  int base = 0;
+};
+std::vector<ImportMod> g_imp_mods;
+
+// The moves a move pack brings (pack.txt's waze / wazecopy / wazename lines: the game plays them whatever misc.pac
+// says), read once per pack folder and change.
+const std::set<int>& PackMoveIds(const std::wstring& pack) {
+  static std::map<std::wstring, std::pair<fs::file_time_type, std::set<int>>> cache;
+  static const std::set<int> kNone;
+  if (pack.empty()) return kNone;
+  std::error_code ec;
+  const fs::path f = fs::path(pack) / L"pack.txt";
+  const auto t = fs::last_write_time(f, ec);
+  auto& c = cache[pack];
+  if (ec || c.first == t) return c.second;
+  c.first = t, c.second.clear();
+  Bytes b;
+  ReadFile(PathStr(f), b);
+  const std::string text(b.begin(), b.end());
+  for (size_t at = 0; at < text.size();) {
+    size_t e = text.find('\n', at);
+    if (e == std::string::npos) e = text.size();
+    const std::string l = text.substr(at, e - at);
+    at = e + 1;
+    for (const char* k : {"waze ", "wazecopy ", "wazename "})
+      if (l.rfind(k, 0) == 0) c.second.insert(std::atoi(l.c_str() + std::strlen(k)));
+  }
+  return c.second;
+}
+
+// A move the game can play (as its MoveUsable): misc.pac has a record with its move kinds, or a move pack brings it.
+// (Stock profiles hold a few the game can't: RVD's 0x0E0 10280 - in a match such a slot gets the base's move.)
+// True when the game's moves didn't load (nothing to tell by).
+bool MoveUsable(int id, const std::wstring& pack) {
+  const auto& infos = MoveInfos();
+  if (infos.empty() || PackMoveIds(pack).count(id)) return true;
+  for (const PackMove& pm : PackMoves())  // (the installed move packs' and this mod's)
+    if (pm.id == id) return true;
+  const auto it = infos.find(id);
+  return it != infos.end() && std::any_of(std::begin(it->second.bits), std::end(it->second.bits), [](uint8_t b) { return b != 0; });
+}
+
+// Slot -> move id ("0xOFF=id" lines, a moves.txt) on top of `full`; a ported mod's "# same: / # similar:" notes too.
+void OverlayMoves(const std::string& t, std::vector<int>& full, std::map<int, std::string>& notes) {
+  std::string note;
+  for (size_t at = 0; at < t.size();) {
+    size_t e = t.find('\n', at);
+    if (e == std::string::npos) e = t.size();
+    std::string item = t.substr(at, e - at);
+    at = e + 1;
+    if (!item.empty() && item.back() == '\r') item.pop_back();
+    if (item.rfind("# same:", 0) == 0 || item.rfind("# similar:", 0) == 0) {
+      note = item.substr(2);
+      continue;
+    }
+    const size_t eq = item.find('=');
+    if (eq == std::string::npos || item[0] == '#') continue;
+    const int off = int(std::strtol(item.c_str(), nullptr, 0)), id = std::atoi(item.c_str() + eq + 1);
+    if (off >= 0 && off < 2 * kMoveSlots && !(off & 1) && id > 0) {
+      full[size_t(off / 2)] = id;
+      if (!note.empty()) notes[off / 2] = note;
+    }
+    note.clear();
+  }
+}
+
+// The whole moveset `full` (every slot) as the project's: the slots that differ from the style's become its picks
+// (the earlier picks and a moves list file go: they'd sit under or over the new set), a pack joins the project's.
+void TakeWholeMoveset(const std::vector<int>& full, const std::map<int, std::string>& notes, const std::wstring& pack,
+                      const std::string& from) {
+  const std::vector<int> base = ProfileMoves(kStyles[g_star.style].template_id);
+  g_star.moveset.clear(), g_star.moveset_note.clear(), g_star.moves.clear();
+  int n = 0;
+  std::string skipped;
+  for (int s = 0; s < int(full.size()) && s < kMoveSlots; ++s) {
+    const int was = s < int(base.size()) ? base[size_t(s)] : 0;
+    if (!full[size_t(s)] || full[size_t(s)] == was) continue;
+    if (!MoveUsable(full[size_t(s)], pack)) {  // (the game couldn't play it: the style's stays)
+      char b[32];
+      std::snprintf(b, sizeof b, " 0x%03X=%d", s * 2, full[size_t(s)]);
+      skipped += b;
+      continue;
+    }
+    g_star.moveset[s] = full[size_t(s)], ++n;
+    if (const auto it = notes.find(s); it != notes.end()) g_star.moveset_note[s] = it->second;
+  }
+  if (!pack.empty()) g_star.pack = simple_port::CombinePacks(g_star.pack, pack);
+  Touch();
+  if (!skipped.empty()) Log("import moveset: " + from + ": moves the game can't play, the style's kept:" + skipped);
+  Log("import moveset: " + from + ": " + std::to_string(n) + " slots differ from the style's" + (pack.empty() ? "" : ", with its move pack"));
+  Status(from + "'s whole moveset is your superstar's now (" + std::to_string(n) + " slots differ from your fighting style's).");
+}
+
+bool ImportFromStar(int id) {
+  const std::vector<int> moves = ProfileMoves(id);
+  const StarInfo* st = StarById(id);
+  if (moves.empty() || !st) return Status("That superstar's moves couldn't be read (misc.pac)."), false;
+  std::vector<int> full(size_t(kMoveSlots), 0);
+  std::copy_n(moves.begin(), std::min(moves.size(), full.size()), full.begin());
+  TakeWholeMoveset(full, {}, L"", st->name);
+  return true;
+}
+
+void ReadImportMods() {
+  g_imp_mods.clear();
+  std::error_code ec;
+  for (const auto& e : fs::directory_iterator(fs::path(g_game) / L"Mods" / L"Superstars", ec)) {
+    Bytes man;
+    if (!e.is_directory(ec) || !ReadFile(PathStr(e.path() / L"manifest.txt"), man)) continue;
+    const std::string t(man.begin(), man.end());
+    ImportMod m;
+    m.dir = e.path();
+    m.name = Value(t, "name");
+    if (m.name.empty()) m.name = Utf8(e.path().filename().wstring());
+    m.base = std::atoi(Value(t, "base").c_str());
+    g_imp_mods.push_back(std::move(m));
+  }
+  std::sort(g_imp_mods.begin(), g_imp_mods.end(), [](const ImportMod& a, const ImportMod& b) { return Lower(a.name) < Lower(b.name); });
+}
+
+// A superstar mod's moveset: its base's moves, its moves list on top, its move pack (moves\pack.txt) with it.
+bool ImportFromMod(const fs::path& dir) {
+  Bytes man;
+  if (!ReadFile(PathStr(dir / L"manifest.txt"), man)) return Status("That mod has no manifest.txt."), false;
+  const std::string t(man.begin(), man.end());
+  std::string name = Value(t, "name"), file = Value(t, "moves");
+  if (name.empty()) name = Utf8(dir.filename().wstring());
+  if (file.empty()) file = "moves.txt";
+  std::vector<int> full(size_t(kMoveSlots), 0);
+  const std::vector<int> moves = ProfileMoves(std::atoi(Value(t, "base").c_str()));
+  std::copy_n(moves.begin(), std::min(moves.size(), full.size()), full.begin());
+  std::map<int, std::string> notes;
+  Bytes mv;
+  const bool listed = ReadFile(PathStr(dir / fs::u8path(file)), mv);
+  if (listed) OverlayMoves(std::string(mv.begin(), mv.end()), full, notes);
+  if (moves.empty() && !listed) return Status(name + " has no moves to bring: no moves list, and its base's couldn't be read."), false;
+  std::error_code ec;
+  const fs::path pack = dir / L"moves";
+  TakeWholeMoveset(full, notes, fs::exists(pack / L"pack.txt", ec) ? pack.wstring() : std::wstring(), name);
+  return true;
+}
+
+void ImportMovesetSection() {
+  ImGui::Spacing();
+  ImGui::TextUnformatted("Import a whole moveset from:");
+  static const char* const kSrc[] = {"A 2011 superstar", "One of my superstar mods", "Another game"};
+  for (int i = 0; i < 3; ++i) {
+    if (i) ImGui::SameLine();
+    if (ImGui::RadioButton(kSrc[i], g_imp_src == i)) {
+      g_imp_src = i, g_imp_pick = -1, g_imp_find[0] = 0;
+      if (i == 1) ReadImportMods();
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Close##imp")) g_imp_src = -1;
+  ImGui::TextDisabled("The whole set replaces this superstar's moves (the moves you picked and a moves list file).");
+  if (g_imp_src == 2) {  // (the Port moves menu: a game, a superstar, their moves - "Use ... for my superstar")
+    simple_port::ForStarResult r;
+    if (simple_port::ForStar(simple_port::kMoves, r)) {
+      g_star.moveset.clear(), g_star.moveset_note.clear(), g_star.moves.clear();
+      std::string text;
+      for (const auto& l : r.lines) text += l + "\n";
+      ParseMoveset(text, '\n');
+      g_star.pack = simple_port::CombinePacks(g_star.pack, r.pack);
+      for (auto it = g_star.moveset.begin(); it != g_star.moveset.end();) {  // (ones the game can't play: the style's)
+        if (MoveUsable(it->second, g_star.pack)) {
+          ++it;
+          continue;
+        }
+        Log("import moveset: the game can't play move " + std::to_string(it->second) + ": the style's kept");
+        g_star.moveset_note.erase(it->first);
+        it = g_star.moveset.erase(it);
+      }
+      Touch();
+      Log("import moveset: " + r.what + ": " + std::to_string(r.lines.size()) + " slots");
+      Status(r.what + " are your superstar's now (the slots that couldn't come over keep your fighting style's).");
+      g_imp_src = -1;
+      if (g_imp_test_save) g_imp_test_save = false, TestSaveMod(g_test_save), PostMessageW(g_wnd, WM_CLOSE, 0, 0);
+    }
+    return;
+  }
+  ImGui::SetNextItemWidth(240 * g_scale);
+  ImGui::InputTextWithHint("##impf", "find a superstar", g_imp_find, sizeof g_imp_find);
+  const std::string f = Lower(g_imp_find);
+  std::string chosen;
+  ImGui::BeginChild("imp_list", ImVec2(360 * g_scale, 200 * g_scale), true);
+  if (g_imp_src == 0) {
+    for (const auto& st : Stars()) {
+      if (!f.empty() && Lower(st.name).find(f) == std::string::npos) continue;
+      if (ImGui::Selectable((st.name + "##" + std::to_string(st.id)).c_str(), g_imp_pick == st.id)) g_imp_pick = st.id;
+      if (g_imp_pick == st.id) chosen = st.name;
+    }
+  } else {
+    if (g_imp_mods.empty()) ImGui::TextDisabled("No superstar mods in the game's Mods\\Superstars.");
+    for (int i = 0; i < int(g_imp_mods.size()); ++i) {
+      const ImportMod& m = g_imp_mods[size_t(i)];
+      if (!f.empty() && Lower(m.name).find(f) == std::string::npos) continue;
+      if (ImGui::Selectable((m.name + "##m" + std::to_string(i)).c_str(), g_imp_pick == i)) g_imp_pick = i;
+      if (g_imp_pick == i) chosen = m.name;
+    }
+  }
+  ImGui::EndChild();
+  ImGui::BeginDisabled(chosen.empty());
+  if (ImGui::Button(chosen.empty() ? "Use their moveset" : ("Use " + chosen + "'s moveset").c_str(), ImVec2(300 * g_scale, 0))) {
+    const bool ok = g_imp_src == 0 ? ImportFromStar(g_imp_pick) : ImportFromMod(g_imp_mods[size_t(g_imp_pick)].dir);
+    if (ok) g_imp_src = -1;
+  }
+  ImGui::EndDisabled();
+}
+
 void MovesetSection() {
   const int changed = int(g_star.moveset.size());
   const std::string head = "Moveset" + (changed ? " (" + std::to_string(changed) + " changed)" : std::string(": the style's")) + "###moveset";
@@ -608,6 +849,12 @@ void MovesetSection() {
   ImGui::Checkbox("all slots", &g_moveset_all);
   ImGui::SameLine();
   if (changed && ImGui::SmallButton("Back to the style's moves")) g_star.moveset.clear(), Touch();
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Import a whole moveset...")) g_imp_src = g_imp_src < 0 ? 0 : -1;
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Every move of a 2011 superstar, of one of your superstar mods (with its own move pack), or of a "
+                      "superstar from another game (the Port moves menu).");
+  if (g_imp_src >= 0) ImportMovesetSection();
   if (!g_moveset_all && !changed) ImGui::TextDisabled("Tick \"all slots\" (or find one) to change a move.");
   const std::string f = Lower(g_moveset_find);
   const bool can_watch = anims_page::MovesIndexed();
@@ -675,14 +922,16 @@ void MovesetSection() {
   ImGui::Unindent();
 }
 
-// theme_gain= as written (1 decimal), "" at 0.0 (the key left out)
-std::string GainText() {
-  const int t = int(std::lround(std::clamp(g_star.theme_gain, -20.0f, 6.0f) * 10));
+// theme_gain= / call_gain= as written (1 decimal), "" at 0.0 (the key left out)
+std::string DbText(float db, float lo, float hi) {
+  const int t = int(std::lround(std::clamp(db, lo, hi) * 10));
   if (!t) return "";
   char b[16];
   std::snprintf(b, sizeof b, "%s%d.%d", t < 0 ? "-" : "", std::abs(t) / 10, std::abs(t) % 10);
   return b;
 }
+std::string GainText() { return DbText(g_star.theme_gain, -20.0f, 6.0f); }
+std::string CallGainText() { return DbText(g_star.call_gain, -20.0f, 12.0f); }
 
 // the theme's measured loudness (a worker measures; the page shows it)
 std::wstring g_lufs_for;
@@ -850,6 +1099,28 @@ void ThemeGainRow() {
   ImGui::Unindent();
 }
 
+// call_gain=: the mod's own name recording (voice=) plays at the game's call level (-7 dB) plus this
+int g_test_scroll_call = 0;  // (--star-call-gain: the row scrolled into view for a screenshot, a few frames)
+void CallGainRow() {
+  if (g_test_scroll_call > 0 && --g_test_scroll_call < 20) ImGui::SetScrollHereY(0.5f);
+  ImGui::Indent();
+  ImGui::BeginDisabled(g_star.voice.empty());
+  ImGui::SetNextItemWidth(236 * g_scale);
+  if (ImGui::SliderFloat("##callgain", &g_star.call_gain, -20.0f, 12.0f, "%+.1f dB")) Touch();
+  ImGui::SameLine(0, 4 * g_scale);
+  ImGui::SetNextItemWidth(80 * g_scale);
+  if (ImGui::InputFloat("Ring announcer volume", &g_star.call_gain, 0, 0, "%.1f")) Touch();
+  g_star.call_gain = std::clamp(std::round(g_star.call_gain * 10) / 10, -20.0f, 12.0f);
+  ImGui::EndDisabled();
+  Hint("0 = as loud as the game's own announcer calls. It sets how loud the name recording (below) plays when the "
+       "ring announcer calls the superstar.");
+  if (g_star.voice.empty()) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(for a name recording, below)");
+  }
+  ImGui::Unindent();
+}
+
 // height= as written (2 decimals), "" at 1.00 (the key left out)
 std::string HeightText() {
   const int c = int(std::lround(std::clamp(g_star.height, 0.8f, 1.25f) * 100));
@@ -866,15 +1137,25 @@ bool PrepareJob(Job& j) {
     g_star.ratings_set = true;
   }
   j.id = StarId();
+  j.project = ModProjectText(PageId::kStar);
+  {  // (a model over the old 192 pages: newer games only)
+    int worst = 0;
+    if (!g_star.model.empty())
+      for (const auto& p : ModelBudget(g_star.model)) worst = std::max(worst, p.pages);
+    j.needs = worst > kModelPagesOld ? kNeedsVersion : "";
+  }
   j.manifest = "type=superstar\nid=" + j.id + "\nname=" + g_star.name + "\nshort=" +
                (g_star.short_name[0] ? g_star.short_name : g_star.name) + "\nbase=" + std::to_string(st.template_id) +
                "\nstyle=" + st.name + "\nauthor=" + g_star.author + "\nversion=" + g_star.version + "\n" + MadeWith();
+  if (!j.needs.empty()) j.manifest += "needs=" + j.needs + "\n";
   j.manifest += "ratings=";
   for (int k = 0; k < 7; ++k) j.manifest += std::to_string(g_star.ratings[k]) + (k < 6 ? "," : "\n");
   if (g_star.call >= 0) j.manifest += "call=" + std::to_string(g_star.call) + "\n";
   if (const std::string h = HeightText(); !h.empty()) j.manifest += "height=" + h + "\n";
   if (const std::string g = GainText(); !g.empty() && !g_star.song.empty()) j.manifest += "theme_gain=" + g + "\n";
+  if (const std::string g = CallGainText(); !g.empty() && !g_star.voice.empty()) j.manifest += "call_gain=" + g + "\n";
   if (g_star.entrance >= 0) j.manifest += "entrance=" + std::to_string(g_star.entrance) + "\n";
+  if (g_star.victory > 0) j.manifest += "victory=" + std::to_string(g_star.victory) + "\n";
   if (g_star.song.empty() && g_star.music > 0) j.manifest += "music=" + std::to_string(g_star.music) + "\n";
   for (int a = 1; a < 4; ++a)
     if (g_star.attire_entrance[a] > 0)
@@ -890,11 +1171,13 @@ bool PrepareJob(Job& j) {
   }
   if (!g_star.moves.empty() || !g_star.moveset.empty()) j.manifest += "moves=moves.txt\n";
   j.moves = g_star.moves, j.pack = g_star.pack, j.moveset = g_star.moveset;
-  j.model = g_star.model, j.song = g_star.song, j.movie = g_star.movie, j.voice = g_star.voice;
+  j.model = g_star.model, j.song = g_star.song, j.movie = g_star.movie, j.voice = g_star.voice, j.cae = g_star.cae;
+  j.threads = g_star.threads;
   j.gear = g_star.gear;
   j.mats = g_star.mats;
   for (int a = 1; a < 4; ++a) j.attires[a] = g_star.attires[a], j.attire_names[a] = g_star.attire_names[a];
   j.picture = g_star.picture.image, j.picture_small = g_star.picture_small, j.picture_full = g_star.picture_full;
+  j.picture_load = g_star.picture_load;
   for (const auto& s : g_star.signs) j.signs.push_back(s.image);
   return true;
 }
@@ -969,14 +1252,24 @@ bool BuildFiles(Job& j, std::vector<ZipEntry>& files) {
     if (!j.attire_names[a].empty()) man += "attire" + std::to_string(a + 1) + "_name=" + j.attire_names[a] + "\n";
   }
   if (!add(j.voice, "voice", "voice", "name recording")) return false;
-  if (!j.movie.empty()) {
-    Bytes m;
-    if (!ReadFile(Utf8(j.movie), m) || m.size() < 4 || std::memcmp(m.data(), "BIK", 3)) {
-      Status("The entrance movie must be a Bink file (.bik): the launcher's Movies tab makes them.");
+  if (!j.movie.empty()) {  // (an .mp4: a Bink is shrunk to one; the Bink beside it with "Keep the Bink too")
+    std::string why;
+    const std::string name = ModMovieFiles(j.movie, "movie", files, &why);
+    if (name.empty()) {
+      Status("The entrance movie can't go in the mod: " + why + ".");
       return false;
     }
-    files.push_back({"movie.bik", std::move(m)});
-    man += "movie=movie.bik\n";
+    man += "movie=" + name + "\n";
+  }
+  if (!j.threads.empty()) files.push_back({"threads.txt", Bytes(j.threads.begin(), j.threads.end())});  // (Threads parts tab)
+  if (!j.cae.empty()) {  // (a created entrance: the game's block as it wrote it - superstar_mods.cpp cae=)
+    Bytes c;
+    if (!ReadFile(Utf8(j.cae), c) || c.size() != 284) {
+      Status("The created entrance's file is missing or damaged: pick it again (Created entrance).");
+      return false;
+    }
+    files.push_back({"cae.bin", std::move(c)});
+    man += "cae=cae.bin\n";
   }
   if (!j.moves.empty() || !j.moveset.empty()) {  // the file's lines, then the page's picks (later lines win)
     Bytes t;
@@ -1007,8 +1300,41 @@ bool BuildFiles(Job& j, std::vector<ZipEntry>& files) {
     files.push_back({"render_small.dds", DdsEncode(j.picture_small, DxtFormat::kDxt5, false)});
   }
   if (j.picture_full.w) files.push_back({"render_full.dds", DdsEncode(j.picture_full, DxtFormat::kDxt5, false)});
+  if (j.picture_load.w == 1024 && j.picture_load.h == 512)  // (the game takes exactly 1024 x 512 DXT5)
+    files.push_back({"load.dds", DdsEncode(j.picture_load, DxtFormat::kDxt5, false)});
   files.insert(files.begin(), ZipEntry{"manifest.txt", Bytes(man.begin(), man.end())});
+  AddModProject(files, j.project);
   return true;
+}
+
+// The project's own model (an FBX's, a converted one - not one of the game's pac\ch): it gets Superstar Threads parts
+// (threads.txt, tools/threads_parts.py) when the mod is saved or installed.
+bool OwnModel(const std::wstring& model) {
+  if (model.empty()) return false;
+  std::error_code ec;
+  const std::wstring stock = fs::absolute(fs::path(g_game) / L"pac" / L"ch", ec).wstring(), m = fs::absolute(model, ec).wstring();
+  return Lower(Utf8(m)).rfind(Lower(Utf8(stock)), 0) != 0;
+}
+
+// The mod's model files (manifest + .pac) into a work folder, threads_parts.py there, its threads.txt added to the
+// files; then `then` (in the background), with or without it.
+void WithThreadsParts(const std::string& id, std::vector<ZipEntry> files, std::function<void(std::vector<ZipEntry>&)> then) {
+  const fs::path work = fs::path(g_game) / L"Mods" / L".convert" / L"threads" / fs::u8path(id);
+  std::error_code ec;
+  fs::remove_all(work, ec);
+  fs::create_directories(work, ec);
+  for (const auto& f : files)
+    if (f.name == "manifest.txt" || (f.name.size() > 4 && f.name.compare(f.name.size() - 4, 4, ".pac") == 0 && f.name.find('/') == std::string::npos))
+      WriteFile(PathStr(work / fs::u8path(f.name)), f.data);
+  OnUiThread([work, files, then] {
+    WhenIdle([work, files, then] {
+      MakeThreadsParts(work, [work, files, then](int code, const std::string&) mutable {
+        Bytes t;
+        if (code == 0 && ReadFile(PathStr(work / L"threads.txt"), t)) files.push_back({"threads.txt", t});
+        RunInBackground([files, then]() mutable { then(files); });
+      });
+    });
+  });
 }
 
 void SaveMod() {
@@ -1020,8 +1346,12 @@ void SaveMod() {
   RunInBackground([j, out]() mutable {
     std::vector<ZipEntry> files;
     if (!BuildFiles(j, files)) return;
-    if (WriteFile(out, ZipWrite(files))) Status("Saved " + out + " (add it in the launcher's Mods tab with +).");
-    else Status("The mod could not be written: " + out);
+    auto write = [out](std::vector<ZipEntry>& files) {
+      if (WriteFile(out, ZipWrite(files))) Status("Saved " + out + " (add it in the launcher's Mods tab with +).");
+      else Status("The mod could not be written: " + out);
+    };
+    if (OwnModel(j.model) && j.threads.empty()) WithThreadsParts(j.id, std::move(files), write);  // (made in the tab: kept)
+    else write(files);
   });
 }
 
@@ -1041,8 +1371,14 @@ void Install(bool start) {
       Status("Not installed: " + why);
       return;
     }
-    Status("Installed: under the M tile of the character select from the next game start (" + PathStr(dir) + ")." + InstallReport("Superstars", dir));
-    if (start) StartGame();
+    auto done = [dir, start] {
+      Status("Installed: under the M tile of the character select from the next game start (" + PathStr(dir) + ")." + InstallReport("Superstars", dir));
+      if (start) StartGame();
+    };
+    if (!OwnModel(j.model) || !j.threads.empty()) return done();
+    OnUiThread([dir, done] {  // (its own model: its Superstar Threads parts first, then the doctor's report)
+      WhenIdle([dir, done] { MakeThreadsParts(dir, [done](int, const std::string&) { RunInBackground(done); }); });
+    });
   });
 }
 
@@ -1059,6 +1395,7 @@ struct FbxRig {
   std::vector<std::string> auto_map;  // MapRig's
   std::vector<int> depth;
   std::string rig, error;
+  std::vector<std::string> notes;  // what the matching decided on its own (a doubled eye bone)
   std::vector<FbxMeshInfo> meshes;
 };
 FbxRig g_fbx_rig;
@@ -1077,6 +1414,22 @@ const FbxRig& FbxSkeleton() {
   for (const auto& b : g_fbx_rig.bones) rb.push_back({b.name, b.parent});
   g_fbx_rig.auto_map = MapRig(rb);
   g_fbx_rig.rig = DetectRig(rb);
+  // two bones for one eye (Eye_L and LeftEye): the one holding weights stays, the other moves with its parent
+  for (const char* eye : {"l_eye", "r_eye"}) {
+    std::vector<size_t> on;
+    for (size_t i = 0; i < g_fbx_rig.auto_map.size(); ++i)
+      if (g_fbx_rig.auto_map[i] == eye) on.push_back(i);
+    if (on.size() < 2) continue;
+    size_t keep = on[0];
+    for (size_t i : on)
+      if (g_fbx_rig.bones[i].skinned && !g_fbx_rig.bones[keep].skinned) keep = i;
+    std::string dropped;
+    for (size_t i : on)
+      if (i != keep) g_fbx_rig.auto_map[i].clear(), dropped += (dropped.empty() ? "" : ", ") + g_fbx_rig.bones[i].name;
+    g_fbx_rig.notes.push_back(std::string(eye[0] == 'l' ? "Two left eye bones: " : "Two right eye bones: ") + g_fbx_rig.bones[keep].name +
+                              (g_fbx_rig.bones[keep].skinned ? " (it holds the eye's weights)" : "") + " is the eye; " + dropped +
+                              " moves with its parent.");
+  }
   std::string merr;
   FbxListMeshes(Utf8(g_star.fbx), g_fbx_rig.meshes, merr);
   for (size_t i = 0; i < g_fbx_rig.bones.size(); ++i) {
@@ -1129,13 +1482,17 @@ FbxImportOptions FbxOptions() {
   FbxImportOptions opts;
   for (const auto& [k, v] : g_star.fbx_on) opts.include[k] = v == "1";
   opts.kind = g_star.fbx_kind, opts.picture = g_star.fbx_pic;
+  opts.max_vertices = g_star.fbx_reduce, opts.keep_face = g_star.fbx_keep_face;
+  opts.hair = g_star.fbx_hair;
+  for (const auto& [k, v] : g_star.fbx_cloth) opts.cloth[k] = v == "1";
   for (const auto& [name, e] : g_star.fbx_mat) {  // (the builder's per-mesh material)
     svrfmt::FbxMaterial f;
     if (e.has_spec) f.specular = e.spec;
     if (e.normal == 1) f.normal = Utf8(e.normal_file);
     if (e.has_tint) f.has_tint = true, std::copy(e.tint, e.tint + 3, f.tint);
-    f.cutout = e.cutout, f.double_sided = e.two_sided;
+    f.cutout = e.cutout, f.double_sided = e.two_sided, f.flip = e.flip;
     if (e.spec_alpha) f.specular_alpha = e.spec_alpha == 1 ? "texture" : e.spec_alpha == 2 ? "flat" : "brightness";
+    if (!e.shine_mask.empty()) f.shine_mask = Utf8(e.shine_mask);
     opts.material[name] = f;
   }
   return opts;
@@ -1156,11 +1513,12 @@ void IssueList(const std::vector<FbxIssue>& list) {
     ImGui::PopID();
   }
 }
-void FbxReportPanel(const FbxRig& r) {
+void FbxReportPanel(const FbxRig& r, bool show = true) {
   std::error_code ec;
   const auto t = fs::last_write_time(g_star.fbx, ec);
   const std::string key = Utf8(g_star.fbx) + "|" + std::to_string(t.time_since_epoch().count()) + "|" + FbxMapText() + "|" +
-                          PairsText(g_star.fbx_on) + "|" + PairsText(g_star.fbx_pic);
+                          PairsText(g_star.fbx_on) + "|" + PairsText(g_star.fbx_pic) + "|" + std::to_string(g_star.fbx_reduce) +
+                          (g_star.fbx_keep_face ? "f" : "") + "|" + std::to_string(g_star.fbx_hair) + "|" + PairsText(g_star.fbx_cloth);
   if (key != g_fbx_report_key && !g_fbx_report_busy && !Busy()) {
     g_fbx_report_busy = true;
     std::vector<std::string> targets;
@@ -1173,6 +1531,7 @@ void FbxReportPanel(const FbxRig& r) {
       OnUiThread([key, list] { g_fbx_report = list, g_fbx_report_key = key, g_fbx_report_busy = false; });
     });
   }
+  if (!show) return;
   int counts[3] = {};
   for (const auto& is : g_fbx_report) ++counts[std::clamp(is.level, 0, 2)];
   const std::string head = g_fbx_report_key.empty() ? std::string("Model check: reading ...")
@@ -1226,9 +1585,11 @@ void MakeFromFbx() {
         std::to_string(int(rep.height_cm + 0.5)) + " cm tall)");
     const double scale = rep.scale;
     std::vector<FbxIssue> after;
-    if (rep.reduced_from)
+    if (rep.reduced_from) {
       after.push_back({0, "Cut from " + std::to_string(rep.reduced_from) + " to " + std::to_string(rep.vertices) + " vertices to fit the game.",
                        "Look it over in the 3D view; reduce it yourself in Blender for full control."});
+      for (const auto& l : rep.reduced_lines) Log("  " + l);  // (each part's count: a part cut too far shows here)
+    }
     for (const auto& w : rep.warnings) after.push_back({1, w, ""});
     {
       const double back = 1.0 / std::max(0.01, rep.scale);
@@ -1254,16 +1615,16 @@ void MakeFromFbx() {
         if (code != 0 || !fs::exists(out)) {
           const std::string why = parsed ? j["error"].Str() : std::string();
           Status("The model could not be built from the FBX" + (why.empty() ? std::string(" (see the log).") : ": " + why));
-          g_fbx_after.push_back({2, "The model couldn't be built" + (why.empty() ? std::string(" (the log says why).") : ": " + why), "Turn off a mesh or two in Meshes, or reduce it in Blender, then Make again."});
+          g_fbx_after.push_back({2, "The model couldn't be built" + (why.empty() ? std::string(" (the log says why).") : ": " + why), "Leave out a part or two in the Outfit step, or reduce it in Blender, then Make again."});
           Log("svr11_build (" + std::to_string(code) + "): " + text);
           test_end();
           return;
         }
         if (parsed) {
           for (const auto& a : j["attires"].items) {
-            Log("FBX model: " + a["pages"].Str() + " of 192 memory pages" +
+            Log("FBX model: " + a["pages"].Str() + " of " + std::to_string(kModelPages) + " memory pages" +
                 (a["dropped"].items.empty() ? std::string() : ", " + std::to_string(a["dropped"].items.size()) + " blood layers left out to fit"));
-            g_fbx_after.push_back({a["dropped"].items.empty() ? 0 : 1, "Uses " + a["pages"].Str() + " of the 192 memory pages a wrestler gets" +
+            g_fbx_after.push_back({a["dropped"].items.empty() ? 0 : 1, "Uses " + a["pages"].Str() + " of the " + std::to_string(kModelPages) + " memory pages a wrestler gets" +
                                    (a["dropped"].items.empty() ? std::string(".") : "; its blood layers were left out to fit (no blood on it in matches)."), ""});
           }
           for (const auto& w : j["warnings"].items) g_fbx_after.push_back({0, w.Str(), ""});
@@ -1288,158 +1649,596 @@ void MakeFromFbx() {
 }
 
 bool FbxMaterialCell(const std::string& mesh, bool simple);
-void FbxRows(bool simple) {
-  FileRow(simple ? "Pick an FBX file..." : "Model from an FBX (optional)...", g_star.fbx, "none", kFbxFilter, 1,
-          "A rigged model (Unity / VRChat, Mixamo, Blender Rigify, 3ds Max Biped, UE Mannequin and rigs named like them):\n"
-          "its bones are matched to the 2011 skeleton by their names; the table below lets you change any of them.");
-  if (g_star.fbx.empty()) return;
-  const FbxRig& r = FbxSkeleton();
-  ImGui::Indent();
-  if (!r.error.empty()) {
-    ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "The FBX could not be read: %s", r.error.c_str());
-    ImGui::Unindent();
+
+// ---- the FBX import, step by step (the Simple Look step's "Import a 3D model", the full page's FBX row): 1 the
+// file, 2 its skeleton, 3 its materials, 4 the outfit (which parts), 5 the check and Make - one step shown at a time
+int g_fbx_step = 0;
+const char* const kFbxSteps[] = {"Model", "Skeleton", "Materials", "Outfit", "Check and make"};
+constexpr int kFbxStepCount = 5;
+
+// A mesh's material ("node / material": the part after the slash; with none, the node's name).
+std::string FbxMaterialOf(const std::string& mesh) {
+  const size_t s = mesh.find(" / ");
+  return s == std::string::npos ? mesh : mesh.substr(s + 3);
+}
+bool FbxMeshOn(const FbxMeshInfo& m) {
+  const auto on = g_star.fbx_on.find(m.name);
+  return on != g_star.fbx_on.end() ? on->second == "1" : !m.hidden;
+}
+
+// Thumbnails: each mesh's picture as its material has it (FbxMeshPictures, read off the UI thread once per file),
+// a picture picked for it instead (by path).
+struct FbxThumbs {
+  std::wstring fbx;
+  fs::file_time_type time{};
+  bool busy = false;
+  std::map<std::string, Picture> pics;
+};
+FbxThumbs g_fbx_thumbs;
+std::map<std::string, Picture> g_file_thumbs;
+Picture* FileThumb(const std::string& path) {
+  auto it = g_file_thumbs.find(path);
+  if (it == g_file_thumbs.end()) {
+    Image img;
+    Picture p;
+    if (LoadPicture(Wide(path), img) && img.w > 0 && img.h > 0) {
+      const double f = std::min(1.0, 96.0 / std::max(img.w, img.h));
+      p.Set(Resize(img, std::max(1, int(img.w * f)), std::max(1, int(img.h * f))));
+    }
+    it = g_file_thumbs.emplace(path, std::move(p)).first;
+  }
+  return &it->second;
+}
+Picture* FbxThumb(const std::string& mesh) {
+  if (const auto p = g_star.fbx_pic.find(mesh); p != g_star.fbx_pic.end()) return FileThumb(p->second);
+  std::error_code ec;
+  const auto t = fs::last_write_time(g_star.fbx, ec);
+  if ((g_fbx_thumbs.fbx != g_star.fbx || g_fbx_thumbs.time != t) && !g_fbx_thumbs.busy) {
+    g_fbx_thumbs = FbxThumbs();
+    g_fbx_thumbs.fbx = g_star.fbx, g_fbx_thumbs.time = t, g_fbx_thumbs.busy = true;
+    const std::wstring fbx = g_star.fbx;
+    std::thread([fbx, t] {
+      auto got = std::make_shared<std::map<std::string, Image>>();
+      FbxMeshPictures(Utf8(fbx), 96, *got);
+      OnUiThread([fbx, t, got] {
+        if (g_fbx_thumbs.fbx != fbx || g_fbx_thumbs.time != t) return;
+        for (auto& [k, img] : *got) g_fbx_thumbs.pics[k].Set(std::move(img));
+        g_fbx_thumbs.busy = false;
+      });
+    }).detach();
+  }
+  const auto it = g_fbx_thumbs.pics.find(mesh);
+  return it == g_fbx_thumbs.pics.end() ? nullptr : &it->second;
+}
+// A thumbnail in a side x side box (a grey box saying so when there's none).
+void Thumb(Picture* p, float side, const char* none) {
+  if (p && !p->Empty()) {
+    p->Draw(side, side);
     return;
   }
-  int mapped = 0;
-  std::set<std::string> have;
-  for (size_t i = 0; i < r.bones.size(); ++i)
-    if (std::string t = FbxTarget(r, i); !t.empty()) ++mapped, have.insert(t);
-  int missing = 0;
-  for (const char* c : kFbxCore) missing += !have.count(c);
-  ImGui::TextDisabled("%s: %d of %d bones mapped%s, %d edited by hand", r.rig.c_str(), mapped, int(r.bones.size()),
-                      missing ? (", " + std::to_string(missing) + " of the main 2011 bones missing").c_str() : "",
-                      int(g_star.fbx_map.size()));
+  const ImVec2 a = ImGui::GetCursorScreenPos(), b(a.x + side, a.y + side);
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(a, b, IM_COL32(70, 70, 76, 255), 4 * g_scale);
+  const ImVec2 ts = ImGui::CalcTextSize(none);
+  dl->AddText(ImVec2(a.x + (side - ts.x) / 2, a.y + (side - ts.y) / 2), IM_COL32(170, 170, 180, 255), none);
+  ImGui::Dummy(ImVec2(side, side));
+}
+// Has the picture see-through places (an alpha below 255 somewhere)?
+bool HasClearPlaces(Picture* p) {
+  if (!p || p->Empty()) return false;
+  for (size_t q = 3; q < p->image.rgba.size(); q += 4)
+    if (p->image.rgba[q] < 200) return true;
+  return false;
+}
 
-  FbxReportPanel(r);
-  if (ImGui::TreeNode("bonemap", "%s", simple ? (missing ? "Fix the matching (some main bones are missing)" : "Bone matching") : "Bone mapping")) {
-    ImGui::BeginDisabled(g_star.fbx_map.empty());
-    if (ImGui::SmallButton("Back to the automatic mapping")) g_star.fbx_map.clear(), Touch();
-    ImGui::EndDisabled();
+// A picture choice in a row: its label, the file's name (or `none`), Pick... and x. True when it changed.
+bool PictureChoice(const char* label, std::string& file, const char* none, const char* tip, const wchar_t* title) {
+  bool ch = false;
+  ImGui::PushID(label);
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted(label);
+  if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+  ImGui::SameLine(150 * g_scale);
+  if (file.empty()) ImGui::TextDisabled("%s", none);
+  else ImGui::TextUnformatted(FileName(Wide(file)).c_str());
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Pick...")) {
+    const std::wstring f = PickFile(false, title, kPictureFilter, 1);
+    if (!f.empty()) file = Utf8(f), ch = true;
+  }
+  if (!file.empty()) {
     ImGui::SameLine();
-    ImGui::TextDisabled("(an unmapped bone's weights go to its nearest mapped parent)");
-    const auto& targets = TargetBones();
-    if (ImGui::BeginTable("fbxmap", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
-                          ImVec2(0, 340 * g_scale))) {
-      ImGui::TableSetupScrollFreeze(0, 1);
-      ImGui::TableSetupColumn("FBX bone");
-      ImGui::TableSetupColumn("SvR 2011 bone");
-      ImGui::TableSetupColumn("Its weights go to");
-      ImGui::TableHeadersRow();
-      for (size_t i = 0; i < r.bones.size(); ++i) {
-        const auto& b = r.bones[i];
-        const std::string cur = FbxTarget(r, i);
-        const bool edited = g_star.fbx_map.count(b.name) > 0;
-        ImGui::PushID(int(i));
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::Indent(float(std::min(r.depth[i], 12)) * 8 * g_scale + 0.001f);
-        if (b.skinned) ImGui::TextUnformatted(b.name.c_str());
-        else ImGui::TextDisabled("%s", b.name.c_str());
-        if (!b.skinned && ImGui::IsItemHovered()) ImGui::SetTooltip("No vertices use this bone.");
-        ImGui::Unindent(float(std::min(r.depth[i], 12)) * 8 * g_scale + 0.001f);
-        ImGui::TableNextColumn();
-        ImGui::SetNextItemWidth(-1);
-        if (edited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.8f, 0.35f, 1));
-        const std::string shown = cur.empty() ? std::string("(folds into its parent)") : cur;
-        if (ImGui::BeginCombo("##t", shown.c_str(), ImGuiComboFlags_HeightLarge)) {
-          if (edited) ImGui::PopStyleColor();
-          auto pick = [&](const std::string& t) {
-            if (t == r.auto_map[i]) g_star.fbx_map.erase(b.name);
-            else g_star.fbx_map[b.name] = t;
-            Touch();
-          };
-          if (ImGui::Selectable("(folds into its parent)", cur.empty())) pick("");
-          for (const auto& t : targets)
-            if (ImGui::Selectable(t.c_str(), t == cur)) pick(t);
-          ImGui::EndCombo();
-        } else if (edited) {
-          ImGui::PopStyleColor();
-        }
-        if (edited && ImGui::IsItemHovered())
-          ImGui::SetTooltip("Edited (the automatic choice: %s)", r.auto_map[i].empty() ? "folds into its parent" : r.auto_map[i].c_str());
-        ImGui::TableNextColumn();
-        const std::string to = FbxWeightsTo(r, i);
-        if (cur.empty()) ImGui::TextDisabled("%s", to.empty() ? "nowhere (above the hips)" : to.c_str());
+    if (ImGui::SmallButton("x")) file.clear(), ch = true;
+  }
+  ImGui::PopID();
+  return ch;
+}
+
+// The materials of the FBX (step 3, and the Simple Look step's Materials tab): one row per material - its picture,
+// the pictures for its colour, bumps and shine, both sides / flip faces / see-through - for every part that uses it
+// (each part on its own below). Used when the model is made. True when something changed.
+bool FbxMaterials(bool simple, bool intro) {
+  const FbxRig& r = FbxSkeleton();
+  if (g_star.fbx.empty() || !r.error.empty() || r.meshes.empty()) {
+    ImGui::TextDisabled("Pick an FBX first (step 1).");
+    return false;
+  }
+  std::vector<std::pair<std::string, std::vector<const FbxMeshInfo*>>> groups;  // (the FBX's order)
+  for (const auto& m : r.meshes) {
+    const std::string mat = FbxMaterialOf(m.name);
+    auto g = std::find_if(groups.begin(), groups.end(), [&](const auto& x) { return x.first == mat; });
+    if (g == groups.end()) groups.push_back({mat, {}}), g = groups.end() - 1;
+    g->second.push_back(&m);
+  }
+  if (intro) {
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("Each material of your model with its picture. What you choose here is used when the model is made, "
+                        "for every part that uses the material.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+  }
+  bool changed = false;
+  const float side = 76 * g_scale;
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const auto& [mat, parts] = groups[gi];
+    ImGui::PushID(int(gi));
+    auto edit_of = [&](const std::string& mesh) {
+      const auto it = g_star.fbx_mat.find(mesh);
+      return it == g_star.fbx_mat.end() ? MatEdit() : it->second;
+    };
+    auto pic_of = [&](const std::string& mesh) {
+      const auto it = g_star.fbx_pic.find(mesh);
+      return it == g_star.fbx_pic.end() ? std::string() : it->second;
+    };
+    const std::string first = parts.front()->name;
+    MatEdit e = edit_of(first);
+    bool mixed = false;
+    for (const auto* p : parts) {
+      const MatEdit o = edit_of(p->name);
+      mixed |= o.cutout != e.cutout || o.two_sided != e.two_sided || o.flip != e.flip || o.normal_file != e.normal_file ||
+               o.shine_mask != e.shine_mask || pic_of(p->name) != pic_of(first);
+    }
+    // (an edit for the whole material: on each of its parts)
+    auto apply = [&](const std::function<void(MatEdit&)>& fn) {
+      for (const auto* p : parts) {
+        MatEdit x = edit_of(p->name);
+        fn(x);
+        if (x.Empty()) g_star.fbx_mat.erase(p->name);
+        else g_star.fbx_mat[p->name] = x;
+      }
+      changed = true;
+    };
+    Picture* pic = FbxThumb(first);
+    ImGui::BeginGroup();
+    Thumb(pic, side, parts.front()->has_texture || g_star.fbx_pic.count(first) ? "..." : "none");
+    ImGui::EndGroup();
+    ImGui::SameLine(0, 14 * g_scale);
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted(mat.c_str());
+    ImGui::SameLine();
+    int on = 0;
+    for (const auto* p : parts) on += FbxMeshOn(*p);
+    ImGui::TextDisabled("%d part%s%s%s", int(parts.size()), parts.size() == 1 ? "" : "s", on < int(parts.size()) ? (", " + std::to_string(parts.size() - on) + " left out").c_str() : "",
+                        mixed ? ", set apart" : "");
+    if (ImGui::IsItemHovered()) {
+      std::string names;
+      for (const auto* p : parts) names += p->name + (FbxMeshOn(*p) ? "" : "  (left out in step 4)") + "\n";
+      ImGui::SetTooltip("%s", names.c_str());
+    }
+    std::string colour = pic_of(first);
+    if (PictureChoice("Colour picture", colour, parts.front()->has_texture ? "its own (from the FBX)" : "none - plain grey",
+                      "The picture painted on it. Pick one when the FBX has none, or to use another.", L"The material's colour picture")) {
+      for (const auto* p : parts) {
+        if (colour.empty()) g_star.fbx_pic.erase(p->name);
+        else g_star.fbx_pic[p->name] = colour;
+      }
+      changed = true;
+    }
+    std::string bumps = e.normal == 1 ? Utf8(e.normal_file) : "";
+    if (PictureChoice(simple ? "Bumps picture" : "Normal map", bumps, "its own (or none)",
+                      "A normal map (the blue-purple picture) for small bumps: folds, seams, muscles.", L"The material's normal map (PNG)"))
+      apply([&](MatEdit& x) { x.normal = bumps.empty() ? 0 : 1, x.normal_file = Wide(bumps); });
+    std::string shine = Utf8(e.shine_mask);
+    if (PictureChoice("Shine picture", shine, "none - the same shine all over",
+                      "A grey picture of where it shines: white shines most, black not at all (wet skin, leather, metal parts).\n"
+                      "It goes where the game reads it - on skin parts that's the bumps picture's alpha.", L"Where it shines (a grey picture)"))
+      apply([&](MatEdit& x) { x.shine_mask = Wide(shine); });
+    // the faces
+    bool both = e.two_sided == 1, flip = e.flip == 1, cut = e.cutout == 1;
+    if (ImGui::Checkbox("Draw both sides", &both)) apply([&](MatEdit& x) { x.two_sided = both ? 1 : -1; });
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("The game draws its back too (its flag 0x2 off): capes, open jackets, skirts, hair cards, single-layer\n"
+                        "cloth - anything you can see the inside of. Off: only its front, as the game's bodies.\n"
+                        "On a skin part the game then uses its plain shader: no sweat in matches.");
+    ImGui::SameLine(0, 16 * g_scale);
+    if (ImGui::Checkbox("Flip faces", &flip)) apply([&](MatEdit& x) { x.flip = flip ? 1 : -1; });
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Turns its faces the other way round. The import already turns every part to the game's way, so use\n"
+                        "this only for a part that still shows inside out (its faces point inward in the FBX).");
+    ImGui::SameLine(0, 16 * g_scale);
+    if (ImGui::Checkbox(simple ? "See-through where clear" : "See-through cut-out", &cut)) apply([&](MatEdit& x) { x.cutout = cut ? 1 : -1; });
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Where the colour picture is transparent the game doesn't draw it: lace, mesh, torn cloth, hair cards.\n"
+                        "The cut is at an alpha of about 0.2-0.3 (50-80 of 255): fainter than that is a hole, the rest is solid -\n"
+                        "the game has no half see-through on superstars. Needs a picture with transparency (PNG).\n"
+                        "On a skin part its sweat is turned off (the game's skin shader can't cut).");
+    {  // (the flat look: no shine, no bumps - the game's superstar shaders have no unlit / self-lit setting)
+      bool flat = e.has_spec && e.spec <= 0.0f && e.spec_alpha == 2;
+      if (ImGui::Checkbox("Flat look", &flat))
+        apply([&](MatEdit& x) {
+          if (flat) x.has_spec = true, x.spec = 0, x.spec_alpha = 2, x.normal = 0, x.normal_file.clear(), x.shine_mask.clear();
+          else x.has_spec = false, x.spec_alpha = 0;
+        });
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Flat, cartoon-like shading: no shine (specular 0, even) and no bumps (a flat normal map) - the closest the\n"
+                          "game's superstar shaders get to unlit: they have no self-lit setting, so the arena's lights still shade it.");
+    }
+    if (cut && pic && !pic->Empty() && !HasClearPlaces(pic))
+      ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Its picture has no transparent places: nothing will be cut.");
+    if (ImGui::TreeNode("more", "More: shine level, colour")) {
+      bool hs = e.has_spec;
+      if (ImGui::Checkbox(simple ? "My own shine level" : "Shine (specular level)", &hs)) apply([&](MatEdit& x) { x.has_spec = hs; });
+      if (e.has_spec) {
+        ImGui::SameLine();
+        float v = e.spec;
+        ImGui::SetNextItemWidth(160 * g_scale);
+        if (ImGui::SliderFloat("##spec", &v, 0, 4, "%.2f", ImGuiSliderFlags_Logarithmic)) apply([&](MatEdit& x) { x.has_spec = true, x.spec = v; });
+      }
+      static const char* kAlpha[] = {"as the builder does", "the picture's alpha", "even (flat)", "the picture's brightness"};
+      int sa = e.spec_alpha;
+      ImGui::SetNextItemWidth(200 * g_scale);
+      if (ImGui::Combo(simple ? "Where it shines" : "Shine pattern", &sa, kAlpha, 4)) apply([&](MatEdit& x) { x.spec_alpha = sa; });
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Without a shine picture: which places shine more.");
+      bool ht = e.has_tint;
+      float tint[3] = {e.tint[0], e.tint[1], e.tint[2]};
+      if (ImGui::Checkbox(simple ? "Colour it" : "Colour (multiplier)", &ht)) apply([&](MatEdit& x) { x.has_tint = ht; });
+      if (e.has_tint) {
+        ImGui::SameLine();
+        if (ImGui::ColorEdit3("##tint", tint, ImGuiColorEditFlags_NoInputs)) apply([&](MatEdit& x) { x.has_tint = true, std::copy(tint, tint + 3, x.tint); });
+      }
+      ImGui::TreePop();
+    }
+    if (parts.size() > 1 && ImGui::TreeNode("each", "Set each part on its own")) {
+      for (const auto* p : parts) {
+        ImGui::PushID(p->name.c_str());
+        changed |= FbxMaterialCell(p->name, simple);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(p->name.c_str());
         ImGui::PopID();
       }
-      ImGui::EndTable();
+      ImGui::TreePop();
     }
-    ImGui::TreePop();
+    ImGui::EndGroup();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PopID();
   }
-  if (g_fbx_open_once) ImGui::SetScrollHereY(0.3f), ImGui::SetNextItemOpen(true), g_fbx_open_once = false;  // (test aid)
-  if (ImGui::TreeNode("meshes", "%s", simple ? "Clothes and parts" : "Meshes")) {
-    ImGui::TextDisabled("(hidden ones - an avatar's toggled-off clothes - start off)");
-    if (ImGui::BeginTable("fbxmeshes", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
-                          ImVec2(0, std::min(260.0f, 34.0f + 30.0f * float(r.meshes.size())) * g_scale))) {
-      ImGui::TableSetupScrollFreeze(0, 1);
-      ImGui::TableSetupColumn("Mesh");
-      ImGui::TableSetupColumn("Triangles", ImGuiTableColumnFlags_WidthFixed, 80 * g_scale);
-      ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 110 * g_scale);
-      ImGui::TableSetupColumn("Picture");
-      ImGui::TableSetupColumn(simple ? "Shine, bumps, colour" : "Material");
-      ImGui::TableHeadersRow();
-      static const char* kKinds[] = {"skin", "eye", "hair", "lash"};
-      for (size_t i = 0; i < r.meshes.size(); ++i) {
-        const FbxMeshInfo& m = r.meshes[i];
-        ImGui::PushID(int(i));
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        const auto on_it = g_star.fbx_on.find(m.name);
-        bool on = on_it != g_star.fbx_on.end() ? on_it->second == "1" : !m.hidden;
-        if (ImGui::Checkbox(m.name.c_str(), &on)) {
-          if (on == !m.hidden) g_star.fbx_on.erase(m.name);
-          else g_star.fbx_on[m.name] = on ? "1" : "0";
-          Touch();
-        }
-        if (m.hidden && ImGui::IsItemHovered()) ImGui::SetTooltip("Hidden in the FBX.");
-        ImGui::TableNextColumn();
-        ImGui::Text("%d", m.triangles);
-        ImGui::TableNextColumn();
-        const auto k_it = g_star.fbx_kind.find(m.name);
-        const std::string kind = k_it != g_star.fbx_kind.end() ? k_it->second : m.kind;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::BeginCombo("##kind", kind.c_str())) {
-          for (const char* k : kKinds)
-            if (ImGui::Selectable(k, kind == k)) {
-              if (m.kind == k) g_star.fbx_kind.erase(m.name);
-              else g_star.fbx_kind[m.name] = k;
-              Touch();
-            }
-          ImGui::EndCombo();
-        }
-        ImGui::TableNextColumn();
-        const auto p_it = g_star.fbx_pic.find(m.name);
-        if (p_it != g_star.fbx_pic.end()) {
-          ImGui::TextUnformatted(FileName(Wide(p_it->second)).c_str());
-          ImGui::SameLine();
-          if (ImGui::SmallButton("x")) g_star.fbx_pic.erase(m.name), Touch();
-        } else {
-          if (!m.has_texture) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "none"), ImGui::SameLine();
-          else ImGui::TextDisabled("its material's"), ImGui::SameLine();
-          if (ImGui::SmallButton("Pick...")) {
-            const std::wstring f = PickFile(false, L"The mesh's colour picture", kPictureFilter, 1);
-            if (!f.empty()) g_star.fbx_pic[m.name] = Utf8(f), Touch();
-          }
-        }
-        ImGui::TableNextColumn();
-        if (FbxMaterialCell(m.name, simple)) Touch();
-        ImGui::PopID();
-      }
-      ImGui::EndTable();
-    }
-    ImGui::TreePop();
-  }
-  ImGui::BeginDisabled(Busy() || !r.error.empty());
-  if (ImGui::Button("Make the model from the FBX", ImVec2(260 * g_scale, 0))) MakeFromFbx();
+  if (changed) Touch();
+  return changed;
+}
+
+// The Make button (step 5; the Materials tab's "Make it again").
+void FbxMakeButton(const char* label, float width) {
+  const FbxRig& r = FbxSkeleton();
+  ImGui::BeginDisabled(Busy() || !r.error.empty() || r.bones.empty());
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.78f, 0.12f, 0.2f, 1));
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.88f, 0.2f, 0.28f, 1));
+  if (ImGui::Button(label, ImVec2(width * g_scale, 34 * g_scale))) MakeFromFbx();
+  ImGui::PopStyleColor(2);
   ImGui::EndDisabled();
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-    ImGui::SetTooltip("Poses it into the game's stance with the mapping above, moves its weights to the 2011 bones, packs its\n"
-                      "pictures into one sheet and builds a ch.pac on the fighting style's superstar (the model above then uses it).");
-  if (!g_fbx_after.empty()) {
-    ImGui::TextUnformatted("After Make");
-    IssueList(g_fbx_after);
+    ImGui::SetTooltip("Poses it into the game's stance with the skeleton matching, moves its weights to the 2011 bones, packs its\n"
+                      "pictures into one sheet and builds the game's model file on the fighting style's superstar.");
+}
+
+void FbxRows(bool simple) {
+  if (!simple && g_star.fbx.empty()) {  // (the full page: one row until an FBX is picked)
+    FileRow("Model from an FBX (optional)...", g_star.fbx, "none", kFbxFilter, 1,
+            "A rigged model (Unity / VRChat, Mixamo, Blender Rigify, 3ds Max Biped, UE Mannequin and rigs named like them):\n"
+            "its bones are matched to the 2011 skeleton by their names, then it's made into the game's model in five steps.");
+    return;
   }
-  ImGui::Unindent();
+  const FbxRig& r = FbxSkeleton();
+  const bool picked = !g_star.fbx.empty(), readable = picked && r.error.empty();
+  int mapped = 0;
+  std::set<std::string> have;
+  if (readable)
+    for (size_t i = 0; i < r.bones.size(); ++i)
+      if (std::string t = FbxTarget(r, i); !t.empty()) ++mapped, have.insert(t);
+  std::string missing_list;
+  for (const char* c : kFbxCore)
+    if (!have.count(c)) missing_list += (missing_list.empty() ? "" : ", ") + std::string(c);
+  int on = 0, tris = 0;
+  for (const auto& m : r.meshes)
+    if (FbxMeshOn(m)) ++on, tris += m.triangles;
+  if (readable) FbxReportPanel(r, false);  // (the model check keeps up in the background)
+  int counts[3] = {};
+  for (const auto& is : g_fbx_report) ++counts[std::clamp(is.level, 0, 2)];
+  bool made = false;
+  for (const auto& is : g_fbx_after) made |= is.level < 2;
+  const bool done[kFbxStepCount] = {readable, readable && missing_list.empty(), readable, readable && on > 0, made};
+  if (!readable) g_fbx_step = 0;
+  g_fbx_step = std::clamp(g_fbx_step, 0, kFbxStepCount - 1);
+  if (!simple) ImGui::TextUnformatted("Model from an FBX"), ImGui::Indent();  // (the full page: under the Files rows)
+
+  // the steps, a row of buttons (wrapped to the card's width)
+  {
+    const float avail = ImGui::GetContentRegionAvail().x, gap = 6 * g_scale;
+    float x = 0;
+    for (int i = 0; i < kFbxStepCount; ++i) {
+      char label[64];
+      std::snprintf(label, sizeof label, "%d  %s##fbxstep%d", i + 1, kFbxSteps[i], i);
+      const float w = ImGui::CalcTextSize(label, nullptr, true).x + ImGui::GetStyle().FramePadding.x * 2 + 4 * g_scale;
+      if (i && x + gap + w <= avail) ImGui::SameLine(0, gap), x += gap;
+      else if (i) x = 0;
+      x += w;
+      const bool cur = i == g_fbx_step;
+      int pushed = 0;
+      if (cur) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.78f, 0.12f, 0.2f, 1)), ++pushed;
+      else if (done[i]) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.85f, 0.55f, 1)), ++pushed;
+      ImGui::BeginDisabled(i > 0 && !readable);
+      if (ImGui::Button(label, ImVec2(w, 0))) g_fbx_step = i;
+      ImGui::EndDisabled();
+      ImGui::PopStyleColor(pushed);
+    }
+  }
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  auto heading = [&](const char* line) {
+    ImGui::Text("%d. %s", g_fbx_step + 1, kFbxSteps[g_fbx_step]);
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", line);
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+  };
+
+  switch (g_fbx_step) {
+    case 0: {
+      heading("A rigged model (one with a skeleton) from Blender, Unity / VRChat, Mixamo, 3ds Max or UE: its bones are "
+              "matched to the game's by their names.");
+      FileRow("Pick an FBX file...", g_star.fbx, "none yet", kFbxFilter, 1, "An .fbx with a skeleton and its skin weights.");
+      if (!picked) break;
+      ImGui::Spacing();
+      if (!r.error.empty()) {
+        ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "It could not be read: %s", r.error.c_str());
+        break;
+      }
+      int pics = 0;
+      for (const auto& m : r.meshes) pics += m.has_texture || g_star.fbx_pic.count(m.name);
+      ImGui::Text("Skeleton:");
+      ImGui::SameLine(110 * g_scale);
+      ImGui::TextDisabled("%s, %d bones", r.rig.c_str(), int(r.bones.size()));
+      ImGui::Text("Parts:");
+      ImGui::SameLine(110 * g_scale);
+      ImGui::TextDisabled("%d (%d in the outfit, %d triangles)", int(r.meshes.size()), on, tris);
+      ImGui::Text("Pictures:");
+      ImGui::SameLine(110 * g_scale);
+      if (pics < int(r.meshes.size())) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "%d of %d parts have one (pick the rest in step 3)", pics, int(r.meshes.size()));
+      else ImGui::TextDisabled("every part has one");
+      break;
+    }
+    case 1: {
+      heading("Each of your model's bones is matched to one of the game's, so the game's moves move it. Most rigs match "
+              "by themselves: change a bone only when it's wrong.");
+      if (missing_list.empty()) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1), "All the main bones are matched (%d of %d bones).", mapped, int(r.bones.size()));
+      else {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Not matched yet: %s - those body parts won't move in the game.", missing_list.c_str());
+        ImGui::PopTextWrapPos();
+      }
+      for (const auto& n : r.notes) ImGui::TextDisabled("%s", n.c_str());
+      ImGui::BeginDisabled(g_star.fbx_map.empty());
+      if (ImGui::SmallButton("Back to the automatic matching")) g_star.fbx_map.clear(), Touch();
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+      ImGui::TextDisabled("(%d changed by hand; a bone left unmatched moves with its parent)", int(g_star.fbx_map.size()));
+      // moving hair and cloth: the game's spring chains
+      std::vector<std::string> cur_targets;
+      for (size_t i = 0; i < r.bones.size(); ++i) cur_targets.push_back(FbxTarget(r, i));
+      std::map<std::string, bool> cloth_ticks;
+      for (const auto& [k, v] : g_star.fbx_cloth) cloth_ticks[k] = v == "1";
+      const FbxChains chains = FindFbxChains(r.bones, cur_targets, g_star.fbx_hair, cloth_ticks);
+      std::vector<int> chain_of(r.bones.size(), -1);  // (the bone's chain: 0 hair, 1 cloth)
+      for (const auto& c : chains.hair)
+        for (int b : c) chain_of[size_t(b)] = 0;
+      for (const auto& c : chains.cloth)
+        for (int b : c) chain_of[size_t(b)] = 1;
+      {
+        static const char* kHair[] = {"its hair bones, not VRChat's secondary (J_Sec_*) ones", "none (the hair moves with the head)", "every hair bone"};
+        int h = g_star.fbx_hair < 0 ? 0 : g_star.fbx_hair == 0 ? 1 : 2;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Moving hair:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(320 * g_scale);
+        if (ImGui::Combo("##hair", &h, kHair, 3)) g_star.fbx_hair = h == 0 ? -1 : h == 1 ? 0 : 1, Touch();
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("The game moves up to 16 chains of hair or cloth with springs (4 bones or more each). Bones left out move\n"
+                            "with the head: VRChat's secondary hair bones aren't needed for that.");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d strand(s)%s", int(chains.hair.size()), chains.secondary ? (", " + std::to_string(chains.secondary) + " J_Sec_* left out").c_str() : "");
+        ImGui::TextDisabled("Moving cloth: %d chain(s) from the bones ticked in the Cloth column (jacket, coat, skirt, cape... ticked by their name).",
+                            int(chains.cloth.size()));
+        if (chains.over) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "%d chain(s) past the 16 the game moves: they ride on their bone.", chains.over);
+      }
+      ImGui::Spacing();
+      const auto& targets = TargetBones();
+      const float h = std::max(260.0f * g_scale, ImGui::GetContentRegionAvail().y - 60 * g_scale);
+      if (ImGui::BeginTable("fbxmap", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, ImVec2(0, h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Your model's bone");
+        ImGui::TableSetupColumn("The game's bone");
+        ImGui::TableSetupColumn("Moves with");
+        ImGui::TableSetupColumn("Cloth", ImGuiTableColumnFlags_WidthFixed, 56 * g_scale);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < r.bones.size(); ++i) {
+          const auto& b = r.bones[i];
+          const std::string cur = FbxTarget(r, i);
+          const bool edited = g_star.fbx_map.count(b.name) > 0;
+          ImGui::PushID(int(i));
+          ImGui::TableNextRow();
+          ImGui::TableNextColumn();
+          ImGui::Indent(float(std::min(r.depth[i], 12)) * 8 * g_scale + 0.001f);
+          if (b.skinned) ImGui::TextUnformatted(b.name.c_str());
+          else ImGui::TextDisabled("%s", b.name.c_str());
+          if (!b.skinned && ImGui::IsItemHovered()) ImGui::SetTooltip("No vertices use this bone.");
+          ImGui::Unindent(float(std::min(r.depth[i], 12)) * 8 * g_scale + 0.001f);
+          ImGui::TableNextColumn();
+          ImGui::SetNextItemWidth(-1);
+          if (edited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.8f, 0.35f, 1));
+          const std::string shown = cur.empty() ? std::string("(moves with its parent)") : cur;
+          if (ImGui::BeginCombo("##t", shown.c_str(), ImGuiComboFlags_HeightLarge)) {
+            if (edited) ImGui::PopStyleColor();
+            auto pick = [&](const std::string& t) {
+              if (t == r.auto_map[i]) g_star.fbx_map.erase(b.name);
+              else g_star.fbx_map[b.name] = t;
+              Touch();
+            };
+            if (ImGui::Selectable("(moves with its parent)", cur.empty())) pick("");
+            for (const auto& t : targets)
+              if (ImGui::Selectable(t.c_str(), t == cur)) pick(t);
+            ImGui::EndCombo();
+          } else if (edited) {
+            ImGui::PopStyleColor();
+          }
+          if (edited && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Changed (the automatic choice: %s)", r.auto_map[i].empty() ? "moves with its parent" : r.auto_map[i].c_str());
+          ImGui::TableNextColumn();
+          const std::string to = FbxWeightsTo(r, i);
+          if (chain_of[i] == 0) ImGui::TextColored(ImVec4(0.55f, 0.75f, 1, 1), "moving hair");
+          else if (chain_of[i] == 1) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1), "moving cloth");
+          else if (cur.empty()) ImGui::TextDisabled("%s", to.empty() ? "nothing (above the hips)" : to.c_str());
+          ImGui::TableNextColumn();
+          if (cur.empty()) {  // (only an unmatched bone can be cloth)
+            const auto ov = g_star.fbx_cloth.find(b.name);
+            bool tick = ov != g_star.fbx_cloth.end() ? ov->second == "1" : IsClothBoneName(b.name);
+            if (ImGui::Checkbox("##cloth", &tick)) {
+              if (tick == IsClothBoneName(b.name)) g_star.fbx_cloth.erase(b.name);
+              else g_star.fbx_cloth[b.name] = tick ? "1" : "0";
+              Touch();
+            }
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Loose cloth (a jacket's tail, a skirt, a cape, a ribbon): the game swings it with a spring chain - 3 bones\n"
+                                "in a row or more. Unticked: it moves stiffly with its parent bone.");
+          }
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+      }
+      break;
+    }
+    case 2:
+      heading("Each material of your model with its picture, and how the game draws it - for every part that uses it. "
+              "Used when the model is made (step 5).");
+      FbxMaterials(simple, false);
+      break;
+    case 3: {
+      heading("The parts your superstar wears. Hidden parts (an avatar's toggled-off clothes) start left out. This outfit "
+              "becomes attire 1; more attires come in the Attires step.");
+      static const char* kKinds[] = {"skin", "eye", "hair", "lash"};
+      static const char* kKindNames[] = {"body / clothes", "eye", "hair", "eyelashes"};
+      const float h = std::min(std::max(200.0f * g_scale, ImGui::GetContentRegionAvail().y - 60 * g_scale), (40.0f + 32.0f * float(r.meshes.size())) * g_scale);
+      if (ImGui::BeginTable("fbxmeshes", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, ImVec2(0, h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Part");
+        ImGui::TableSetupColumn("Triangles", ImGuiTableColumnFlags_WidthFixed, 84 * g_scale);
+        ImGui::TableSetupColumn("It is", ImGuiTableColumnFlags_WidthFixed, 140 * g_scale);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < r.meshes.size(); ++i) {
+          const FbxMeshInfo& m = r.meshes[i];
+          ImGui::PushID(int(i));
+          ImGui::TableNextRow();
+          ImGui::TableNextColumn();
+          bool o = FbxMeshOn(m);
+          if (ImGui::Checkbox(m.name.c_str(), &o)) {
+            if (o == !m.hidden) g_star.fbx_on.erase(m.name);
+            else g_star.fbx_on[m.name] = o ? "1" : "0";
+            Touch();
+          }
+          if (m.hidden && ImGui::IsItemHovered()) ImGui::SetTooltip("Hidden in the FBX.");
+          ImGui::TableNextColumn();
+          ImGui::Text("%d", m.triangles);
+          ImGui::TableNextColumn();
+          const auto k_it = g_star.fbx_kind.find(m.name);
+          const std::string kind = k_it != g_star.fbx_kind.end() ? k_it->second : m.kind;
+          int ki = 0;
+          for (int k = 0; k < 4; ++k)
+            if (kind == kKinds[k]) ki = k;
+          ImGui::SetNextItemWidth(-1);
+          if (ImGui::BeginCombo("##kind", kKindNames[ki])) {
+            for (int k = 0; k < 4; ++k)
+              if (ImGui::Selectable(kKindNames[k], ki == k)) {
+                if (m.kind == kKinds[k]) g_star.fbx_kind.erase(m.name);
+                else g_star.fbx_kind[m.name] = kKinds[k];
+                Touch();
+              }
+            ImGui::EndCombo();
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the game draws it: skin and clothes, an eye (shiny, it looks around), hair, eyelashes.");
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+      }
+      ImGui::TextDisabled("%d of %d parts, %d triangles (the game takes up to about 32,000 vertices - step 5 checks it)", on, int(r.meshes.size()), tris);
+      break;
+    }
+    default: {
+      heading("The model checked, then made into the game's model file. Make it again after any change.");
+      for (const auto& n : r.notes) ImGui::TextColored(ImVec4(0.6f, 0.75f, 1, 1), "Note:"), ImGui::SameLine(), ImGui::TextWrapped("%s", n.c_str());
+      if (g_fbx_report_key.empty()) ImGui::TextDisabled("Checking the model ...");
+      else if (g_fbx_report.empty()) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1), "Nothing wrong found.");
+      else {
+        ImGui::Text("Found: %d must fix, %d warnings, %d tips", counts[2], counts[1], counts[0]);
+        ImGui::Indent();
+        IssueList(g_fbx_report);
+        ImGui::Unindent();
+      }
+      ImGui::Spacing();
+      {  // Reduce detail: only when asked (it used to cut every big model, a face too)
+        bool reduce = g_star.fbx_reduce > 0;
+        if (ImGui::Checkbox("Reduce detail", &reduce)) g_star.fbx_reduce = reduce ? 10000 : 0, Touch();
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Fewer vertices so it fits the game (up to about 32,000 for a wrestler). Off: the model as it is - Make says\n"
+                            "when it's too big. For full control reduce it in Blender instead (Decimate modifier).");
+        if (reduce) {
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(200 * g_scale);
+          int v = g_star.fbx_reduce;
+          if (ImGui::SliderInt("vertices##reduce", &v, 4000, kReduceMax, "to about %d")) g_star.fbx_reduce = std::clamp(v, 4000, kReduceMax), Touch();
+          ImGui::SameLine();
+          if (ImGui::Checkbox("Keep the face", &g_star.fbx_keep_face)) Touch();
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("The head and its hair left as they are: only the rest of the model is reduced.");
+        }
+      }
+      ImGui::Spacing();
+      FbxMakeButton(made ? "Make the model again" : "Make the model", 260);
+      if (!g_fbx_after.empty()) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("After Make");
+        ImGui::Indent();
+        IssueList(g_fbx_after);
+        ImGui::Unindent();
+        if (made) ImGui::TextDisabled("The 3D view shows it. Save or install the superstar in the Finish step.");
+      }
+      break;
+    }
+  }
+  // Back / Next
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::BeginDisabled(g_fbx_step == 0);
+  if (ImGui::Button("< Back##fbx", ImVec2(110 * g_scale, 0))) --g_fbx_step;
+  ImGui::EndDisabled();
+  if (g_fbx_step + 1 < kFbxStepCount) {
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 10 * g_scale, ImGui::GetContentRegionMax().x - 150 * g_scale));
+    ImGui::BeginDisabled(!readable);
+    char next[64];
+    std::snprintf(next, sizeof next, "Next: %s >##fbx", kFbxSteps[g_fbx_step + 1]);
+    if (ImGui::Button(next, ImVec2(150 * g_scale, 0))) ++g_fbx_step;
+    ImGui::EndDisabled();
+  }
+  if (!simple) ImGui::Unindent();
 }
 
 void FbxProblems(std::vector<Problem>& p) {
@@ -1458,7 +2257,7 @@ void FbxProblems(std::vector<Problem>& p) {
     if (!have.count(c)) miss += (miss.empty() ? "" : ", ") + std::string(c);
   if (!miss.empty())
     p.push_back(Warning("Some of the FBX's bones aren't matched to the game's skeleton (" + miss + "): those body parts won't move in the game.")
-                    .With("Match them...", [] { GoStep(kStepLook); }, "the bone list is open"));
+                    .With("Match them...", [] { g_fbx_step = 1, GoStep(kStepLook); }, "the bone list is open"));
 }
 
 // ---- entrance gear (EMD kind 4: the whole wrestler in the outfit worn for the entrance) per attire
@@ -1510,7 +2309,7 @@ void OpenFullPreview(int n, int start_part) {
   full_preview::Request r;
   r.entrance = n;
   r.star = kStyles[g_star.style].template_id;
-  const int gear = GearShown(g_view_attire);
+  const int gear = n >= 6000 ? 0 : GearShown(g_view_attire);  // (a victory scene: in the attire, as after a match)
   const auto [pac, in] = AttireSource(gear ? gear : g_view_attire);
   r.model = !pac.empty() ? pac : StyleChPac();
   r.attire = !pac.empty() ? in : 1;
@@ -1541,6 +2340,37 @@ const std::vector<int>& GearDonors() {
   return v;
 }
 
+// Entrance gear another superstar mod installed in the game has (its ch.pac's kind-4 entries): one row per attire.
+struct ModGear {
+  std::string label;
+  std::wstring pac;
+  int attire = 1;
+};
+const std::vector<ModGear>& ModGearDonors() {
+  static std::vector<ModGear> v;
+  static double when = -100;
+  if (ImGui::GetTime() - when < 5) return v;
+  when = ImGui::GetTime();
+  v.clear();
+  std::error_code ec;
+  for (const auto& e : fs::directory_iterator(fs::path(g_game) / L"Mods" / L"Superstars", ec)) {
+    const fs::path pac = e.path() / L"ch.pac";
+    if (!e.is_directory(ec) || !fs::exists(pac, ec)) continue;
+    Bytes man;
+    std::string name = Utf8(e.path().filename().wstring());
+    if (ReadFile(PathStr(e.path() / L"manifest.txt"), man)) {
+      const std::string n = Value(std::string(man.begin(), man.end()), "name");
+      if (!n.empty()) name = n;
+    }
+    for (int a : GearOf(pac.wstring())) v.push_back({name + " (mod), attire " + std::to_string(a), pac.wstring(), a});
+  }
+  return v;
+}
+
+int g_gear_disc_attire = 0;  // "From my game discs": the attire the converted superstar's gear goes to (0: closed)
+ModGear g_gear_mod_pick;     // (GearDonorPopup: a mod's gear picked)
+
+// picked: a 2011 superstar's id; or -1 with g_gear_mod_pick a mod's; or -2 "From my game discs".
 bool GearDonorPopup(const char* id, int& picked) {
   bool hit = false;
   if (ImGui::BeginPopup(id)) {
@@ -1549,6 +2379,12 @@ bool GearDonorPopup(const char* id, int& picked) {
       const StarInfo* s = StarById(d);
       if (ImGui::Selectable(((s ? s->name : std::to_string(d)) + "##gd" + std::to_string(d)).c_str())) picked = d, hit = true, ImGui::CloseCurrentPopup();
     }
+    const auto& mods = ModGearDonors();
+    if (!mods.empty()) ImGui::Separator(), ImGui::TextDisabled("Your superstar mods");
+    for (size_t k = 0; k < mods.size(); ++k)
+      if (ImGui::Selectable((mods[k].label + "##gm" + std::to_string(k)).c_str())) g_gear_mod_pick = mods[k], picked = -1, hit = true, ImGui::CloseCurrentPopup();
+    ImGui::Separator();
+    if (ImGui::Selectable("From my game discs... (a superstar of another game)")) picked = -2, hit = true, ImGui::CloseCurrentPopup();
     ImGui::Separator();
     ImGui::PushTextWrapPos(300 * g_scale);
     ImGui::TextDisabled("Coats, jackets, hats and robes carry over. A shirt painted on the skin (Cena's) doesn't.");
@@ -1558,18 +2394,22 @@ bool GearDonorPopup(const char* id, int& picked) {
   return hit;
 }
 
-void GearTransplant(const std::wstring& target, int attire, int donor, std::function<void(const std::wstring&)> done) {
+// The entrance gear of attire `donor_attire` of `donor_pac` (any wrestler pac with a kind-4 entry: the game's, a
+// mod's, a superstar converted from another game) fitted onto this attire's body (svr11_build --gear-from).
+void GearTransplantFrom(const std::wstring& target, int attire, const std::wstring& donor_pac, int donor_attire, const std::string& name,
+                        std::function<void(const std::wstring&)> done) {
   const fs::path work = fs::path(g_game) / L"Mods" / L".convert" / L"gear";
   std::error_code ec;
   fs::create_directories(work, ec);
-  const std::wstring stem = fs::path(target).stem().wstring() + L"_a" + std::to_wstring(attire) + L"_gear" + std::to_wstring(donor);
+  uint32_t h = 2166136261u;
+  for (wchar_t c : donor_pac) h = (h ^ uint32_t(c)) * 16777619u;
+  const std::wstring stem = fs::path(target).stem().wstring() + L"_a" + std::to_wstring(attire) + L"_gear" + std::to_wstring(h % 100000) +
+                            L"_" + std::to_wstring(donor_attire);
   const std::wstring out = (work / (stem + L".pac")).wstring(), report = (work / (stem + L".json")).wstring();
-  const std::wstring donor_pac = (fs::path(g_game) / L"pac" / L"ch" / (L"ch" + std::to_wstring(donor) + L".pac")).wstring();
   fs::remove(out, ec);
-  const StarInfo* who = StarById(donor);
-  const std::string name = who ? who->name : std::to_string(donor);
   Status("Fitting " + name + "'s entrance gear ...");
-  const bool started = RunToolJson(L"svr11_build.py", {L"--gear-from", donor_pac + L",1", L"--onto", target + L"," + std::to_wstring(attire), out, report},
+  Log("gear: " + name + " (" + Utf8(donor_pac) + ", attire " + std::to_string(donor_attire) + ") onto attire " + std::to_string(attire));
+  const bool started = RunToolJson(L"svr11_build.py", {L"--gear-from", donor_pac + L"," + std::to_wstring(donor_attire), L"--onto", target + L"," + std::to_wstring(attire), out, report},
                                    [out, name, done](int code, const std::string& text) {
     Json j;
     const bool parsed = ParseJson(text, j);
@@ -1582,10 +2422,15 @@ void GearTransplant(const std::wstring& target, int attire, int donor, std::func
     for (const char* list : {"notes", "warnings"})
       for (const auto& w : j[list].items) Log("  gear: " + w.Str());
     Status(name + "'s entrance gear fitted: " + j["gear_meshes"].Str() + " pieces, " + j["extra_bones"].Str() + " extra bones, " + j["pages"].Str() +
-           " of 192 memory pages.");
+           " of " + std::to_string(kModelPages) + " memory pages.");
     done(out);
   });
   if (!started) Status("Fitting gear needs the Mod Maker tools (Python): see the log.");
+}
+void GearTransplant(const std::wstring& target, int attire, int donor, std::function<void(const std::wstring&)> done) {
+  const StarInfo* who = StarById(donor);
+  GearTransplantFrom(target, attire, (fs::path(g_game) / L"pac" / L"ch" / (L"ch" + std::to_wstring(donor) + L".pac")).wstring(), 1,
+                     who ? who->name : std::to_string(donor), std::move(done));
 }
 
 // Entrance gear from an FBX: the pieces (a coat or hat skinned to a humanoid rig) posed onto this model's body
@@ -1627,7 +2472,7 @@ void GearFromFbx(const std::wstring& target, int attire, const std::wstring& fbx
         }
         for (const char* list : {"notes", "warnings"})
           for (const auto& w : j[list].items) Log("  gear: " + w.Str());
-        Status("The gear is fitted: " + j["gear_meshes"].Str() + " pieces, " + j["pages"].Str() + " of 192 memory pages.");
+        Status("The gear is fitted: " + j["gear_meshes"].Str() + " pieces, " + j["pages"].Str() + " of " + std::to_string(kModelPages) + " memory pages.");
         done(out);
       });
       if (!started) Status("Fitting gear needs the Mod Maker tools (Python): see the log.");
@@ -1679,6 +2524,18 @@ bool FbxMaterialCell(const std::string& mesh, bool simple) {
     if (ImGui::Combo(simple ? "See-through where clear" : "See-through cut-out", &cut, kTri, 3)) e.cutout = cut - 1, ch = true;
     ImGui::SetNextItemWidth(160 * g_scale);
     if (ImGui::Combo(simple ? "Both sides" : "Double-sided", &both, kTri, 3)) e.two_sided = both - 1, ch = true;
+    bool flip = e.flip == 1;
+    if (ImGui::Checkbox("Flip faces", &flip)) e.flip = flip ? 1 : -1, ch = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turns its faces the other way round: for a part that still shows inside out in the game.");
+    ImGui::TextUnformatted("Shine picture:");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", e.shine_mask.empty() ? "none" : Utf8(fs::path(e.shine_mask).filename().wstring()).c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Pick...##shine")) {
+      const std::wstring f = PickFile(false, L"Where it shines (a grey picture)", kPictureFilter, 1);
+      if (!f.empty()) e.shine_mask = f, ch = true;
+    }
+    if (!e.shine_mask.empty()) ImGui::SameLine(), (ImGui::SmallButton("x##shine") ? (e.shine_mask.clear(), ch = true) : false);
     if (!e.Empty() && ImGui::Button("As built")) e = MatEdit(), ch = true;
     ImGui::EndPopup();
   }
@@ -1689,8 +2546,11 @@ bool FbxMaterialCell(const std::string& mesh, bool simple) {
   return ch;
 }
 
-void MaterialsSection(bool simple) {
-  if (g_star.model.empty()) return;
+void MaterialsSection(bool simple, bool header, bool show_list) {
+  if (g_star.model.empty()) {
+    if (!header) ImGui::TextDisabled("Pick a look first (the Model tab).");
+    return;
+  }
   ApplyTestMaterials();
   const bool gear = char_preview::Gear() && char_preview::HasGear();
   const auto [pac, in] = AttireSource(g_view_attire);
@@ -1699,7 +2559,7 @@ void MaterialsSection(bool simple) {
   const std::string head = std::string(simple ? "Shine, bumps and colour" : "Materials") + (n ? " (" + std::to_string(n) + " changed)" : "") +
                            "###materials";
   if (g_test_open_mats) ImGui::SetNextItemOpen(true, ImGuiCond_Always), g_test_open_mats = false;
-  if (!ImGui::CollapsingHeader(head.c_str())) {
+  if (header ? !ImGui::CollapsingHeader(head.c_str()) : !show_list) {
     std::map<std::pair<uint32_t, int>, MatEdit> preview;  // (still shown while folded)
     for (const auto& [k, e] : g_star.mats)
       if (std::get<0>(k) == g_view_attire && std::get<1>(k) == gear) preview[{std::get<2>(k), std::get<3>(k)}] = e;
@@ -1709,16 +2569,15 @@ void MaterialsSection(bool simple) {
   if (MaterialPanel(pac, in, gear, g_view_attire, g_star.mats, simple)) Touch();
 }
 
+void GearFromDisc();
 void GearRows(bool simple) {
   if (g_star.model.empty()) return;
   const std::vector<int> own_gear = GearOf(g_star.model);
   bool any = !own_gear.empty();
   for (int a = 2; a <= 4; ++a)
     if (!g_star.attires[a - 1].empty() && !GearOf(g_star.attires[a - 1]).empty()) any = true;
-  if (!any && g_star.gear.empty()) {
-    ImGui::TextDisabled("Entrance gear: none (they walk out in their attire).");
-    return;
-  }
+  if (!any && g_star.gear.empty())
+    ImGui::TextDisabled("Entrance gear: none yet (they walk out in their attire) - a coat, hat or robe can come from another superstar:");
   ImGui::TextUnformatted("Entrance gear");
   ImGui::SameLine();
   ImGui::TextDisabled(simple ? "(a coat, hat or shirt worn only for the entrance)" : "(EMD kind 4: the outfit worn for the entrance, per attire)");
@@ -1781,14 +2640,17 @@ void GearRows(bool simple) {
       if (GearDonorPopup("gear_donor", donor)) {
         const int at = a;
         const bool own = pac == g_star.model;
-        GearTransplant(pac, in, donor, [at, own](const std::wstring& made) {
+        auto put = [at, own](const std::wstring& made) {
           if (own) g_star.model = made;
           else g_star.attires[at - 1] = made;
           g_star.gear.erase(at);
           g_view_attire = at;
           char_preview::SetGear(true);
           Touch();
-        });
+        };
+        if (donor > 0) GearTransplant(pac, in, donor, put);
+        else if (donor == -1) GearTransplantFrom(pac, in, g_gear_mod_pick.pac, g_gear_mod_pick.attire, g_gear_mod_pick.label, put);
+        else if (donor == -2) g_gear_disc_attire = a;
       }
     }
     if (pac == g_star.model) {  // (the same model: another of its attires' gear)
@@ -1804,6 +2666,44 @@ void GearRows(bool simple) {
     }
     ImGui::PopID();
   }
+  GearFromDisc();
+}
+
+// "From my game discs": a superstar of another game converted (its look: the Simple import list), then its entrance
+// gear (the converters keep kind 4: WWE '12-2K15, SvR 2008-2010, PS2) fitted onto the attire picked.
+void GearFromDisc() {
+  if (!g_gear_disc_attire) return;
+  ImGui::Separator();
+  ImGui::Text("Entrance gear for attire %d from another game's superstar", g_gear_disc_attire);
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Close##geardisc")) {
+    g_gear_disc_attire = 0;
+    return;
+  }
+  std::wstring mod;
+  bool all = false;
+  if (!simple_port::SuperstarImport(mod, all, false)) return;
+  const int at = g_gear_disc_attire;
+  g_gear_disc_attire = 0;
+  Bytes z;
+  std::vector<ZipEntry> files;
+  const fs::path work = fs::path(g_game) / L"Mods" / L".convert" / L"gear" / (fs::path(mod).stem().wstring() + L"_donor.pac");
+  if (!ReadFile(PathStr(mod), z) || !ZipRead(z, files)) return Status("The converted superstar couldn't be read (see the log).");
+  for (const auto& f : files)
+    if (f.name == "ch.pac") WriteFile(PathStr(work), f.data);
+  const std::vector<int> g = GearOf(work.wstring());
+  const std::string name = Utf8(fs::path(mod).stem().wstring());
+  if (g.empty()) return Status(name + " has no entrance gear in that game (no coat or hat model): pick another superstar.");
+  const auto [pac, in] = AttireSource(at);
+  const bool own = pac == g_star.model;
+  GearTransplantFrom(pac, in, work.wstring(), g[0], name, [at, own](const std::wstring& made) {
+    if (own) g_star.model = made;
+    else g_star.attires[at - 1] = made;
+    g_star.gear.erase(at);
+    g_view_attire = at;
+    char_preview::SetGear(true);
+    Touch();
+  });
 }
 
 // The superstar's name for messages ("Your superstar" until it has one).
@@ -1817,6 +2717,35 @@ void GoStep(int step) {  // (a fix that needs a choice: its step in Simple mode)
 std::string GameName(const std::string& key) {
   const disc_list::Game* g = disc_list::GameByKey(key);
   return g ? g->name : key;
+}
+
+// A converted pack (<work>\pack) into this mod's moves: it becomes the project's pack, or its files and pack.txt
+// lines join the one it has.
+void JoinPack(const fs::path& pack) {
+  std::error_code ec;
+  if (g_star.pack.empty()) {
+    g_star.pack = pack.wstring();
+  } else {  // (the mod's own moves: the entrance's files and pack.txt lines join them)
+    for (const auto& e : fs::recursive_directory_iterator(pack, ec)) {
+      if (!e.is_regular_file(ec) || e.path().filename() == L"pack.txt") continue;
+      const fs::path to = fs::path(g_star.pack) / fs::relative(e.path(), pack, ec);
+      fs::create_directories(to.parent_path(), ec);
+      fs::copy_file(e.path(), to, fs::copy_options::overwrite_existing, ec);
+    }
+    Bytes a, b;
+    ReadFile(PathStr(fs::path(g_star.pack) / L"pack.txt"), a);
+    ReadFile(PathStr(pack / L"pack.txt"), b);
+    std::string have(a.begin(), a.end());
+    if (!have.empty() && have.back() != '\n') have += "\n";
+    for (size_t at = 0; at < b.size();) {
+      size_t e = std::string(b.begin(), b.end()).find('\n', at);
+      if (e == std::string::npos) e = b.size();
+      const std::string line(b.begin() + long(at), b.begin() + long(e));
+      if (!line.empty() && have.find(line) == std::string::npos) have += line + "\n";
+      at = e + 1;
+    }
+    WriteFile(PathStr(fs::path(g_star.pack) / L"pack.txt"), Bytes(have.begin(), have.end()));
+  }
 }
 
 // A ported superstar's own entrance, converted again from the disc in My game discs and carried in this mod (as
@@ -1855,29 +2784,7 @@ void PortEntrance() {
           Status("The entrance didn't convert" + (ParseJson(out, e) && !e["error"].Str().empty() ? ": " + e["error"].Str() : std::string(" (see the log).")));
           return;
         }
-        if (g_star.pack.empty()) {
-          g_star.pack = pack.wstring();
-        } else {  // (the mod's own moves: the entrance's files and pack.txt lines join them)
-          for (const auto& e : fs::recursive_directory_iterator(pack, ec)) {
-            if (!e.is_regular_file(ec) || e.path().filename() == L"pack.txt") continue;
-            const fs::path to = fs::path(g_star.pack) / fs::relative(e.path(), pack, ec);
-            fs::create_directories(to.parent_path(), ec);
-            fs::copy_file(e.path(), to, fs::copy_options::overwrite_existing, ec);
-          }
-          Bytes a, b;
-          ReadFile(PathStr(fs::path(g_star.pack) / L"pack.txt"), a);
-          ReadFile(PathStr(pack / L"pack.txt"), b);
-          std::string have(a.begin(), a.end());
-          if (!have.empty() && have.back() != '\n') have += "\n";
-          for (size_t at = 0; at < b.size();) {
-            size_t e = std::string(b.begin(), b.end()).find('\n', at);
-            if (e == std::string::npos) e = b.size();
-            const std::string line(b.begin() + long(at), b.begin() + long(e));
-            if (!line.empty() && have.find(line) == std::string::npos) have += line + "\n";
-            at = e + 1;
-          }
-          WriteFile(PathStr(fs::path(g_star.pack) / L"pack.txt"), Bytes(have.begin(), have.end()));
-        }
+        JoinPack(pack);
         g_star.entrance = number;
         g_star.entrance_note.clear();
         Touch();
@@ -1885,6 +2792,137 @@ void PortEntrance() {
       });
     });
   });
+}
+
+// ---- victory (victory=; docs/VICTORY_SCENES.md)
+
+// Other games' singles victory scenes (entrance_port.py list --kind victory) on the discs in My game discs: SvR
+// 2008-2010 and Legends of WrestleMania keep them as 2011 does (pac\evt\Winning*.pac). Read once, a disc at a time.
+struct OtherVictory {
+  std::string game, game_name;  // (entrance_port's id, the disc's name)
+  std::wstring disc;
+  int number = 0;
+  std::string name;
+};
+std::vector<OtherVictory> g_other_victories;
+int g_other_victories_state = 0;  // 0 not read, 1 reading, 2 read
+bool g_victory_converting = false;
+constexpr std::pair<const char*, const char*> kVictoryGames[] = {
+    {"svr2008", "svr08"}, {"svr2009", "svr09"}, {"svr2010", "svr10"}, {"low", "low"}};
+
+void ReadOtherVictories(size_t k = 0) {
+  g_other_victories_state = 1;
+  for (; k < std::size(kVictoryGames) && disc_list::PathFor(kVictoryGames[k].first).empty(); ++k) {}
+  if (k >= std::size(kVictoryGames)) {
+    g_other_victories_state = 2;
+    return;
+  }
+  const std::wstring disc = disc_list::PathFor(kVictoryGames[k].first);
+  const std::string game = kVictoryGames[k].second, name = GameName(kVictoryGames[k].first);
+  WhenIdle([k, disc, game, name] {
+    const bool started = RunToolJson(L"entrance_port.py", {L"list", L"--kind", L"victory", L"--game", Wide(game), L"--src", disc,
+                                                          L"--game-pac", (fs::path(g_game) / L"pac").wstring()},
+                                     [k, disc, game, name](int code, const std::string& out) {
+      Json j;
+      if (code == 0 && ParseJson(out, j))
+        for (const auto& r : j.items)
+          g_other_victories.push_back({game, name, disc, int(r["number"].Int()), r["name"].Str()});
+      ReadOtherVictories(k + 1);
+    });
+    if (!started) ReadOtherVictories(k + 1);
+  });
+}
+
+// One of them into this mod: converted to a free 6300+ number, its pack joins the mod's moves, victory= set.
+void PortVictory(const OtherVictory& v) {
+  const std::wstring pac11 = (fs::path(g_game) / L"pac").wstring(), mods = (fs::path(g_game) / L"Mods").wstring();
+  const std::wstring work = (fs::path(g_game) / L"Mods" / L".convert" / L"victory" / Wide(v.game + "_" + std::to_string(v.number))).wstring();
+  std::set<int> own;  // (numbers this mod's pack has already)
+  if (!g_star.pack.empty())
+    for (const auto& e : PackEntrances(g_star.pack)) own.insert(e.number);
+  g_victory_converting = true;
+  Status("Converting " + v.name + " from " + v.game_name + " ...");
+  RunToolJson(L"entrance_port.py", {L"free-numbers", L"--kind", L"victory", L"--game-pac", pac11, L"--mods", mods},
+              [v, pac11, work, own](int code, const std::string& out) {
+    Json j;
+    int number = 0;
+    if (code == 0 && ParseJson(out, j))
+      for (const auto& x : j.items)
+        if (!own.count(int(x.Int()))) { number = int(x.Int()); break; }
+    if (!number) {
+      g_victory_converting = false;
+      Status("No free victory number left (6300-6999): remove an installed victory pack first.");
+      return;
+    }
+    const std::vector<std::wstring> args = {L"convert", L"--kind", L"victory", L"--game", Wide(v.game), L"--src", v.disc,
+                                            L"--entrance", std::to_wstring(v.number), L"--number", std::to_wstring(number),
+                                            L"--out", work, L"--name", Wide(v.name.substr(0, 29)), L"--game-pac", pac11};
+    WhenIdle([args, work, number, v] {
+      RunToolJson(L"entrance_port.py", args, [work, number, v](int code, const std::string& out) {
+        g_victory_converting = false;
+        const fs::path pack = fs::path(work) / L"pack";
+        std::error_code ec;
+        if (code != 0 || !fs::exists(pack / L"pack.txt", ec)) {
+          Json e;
+          Status("The victory didn't convert" + (ParseJson(out, e) && !e["error"].Str().empty() ? ": " + e["error"].Str() : std::string(" (see the log).")));
+          return;
+        }
+        JoinPack(pack);
+        g_star.victory = number;
+        Touch();
+        Status(v.name + " (" + v.game_name + ") is " + Who() + "'s victory now (scene " + std::to_string(number) + ").");
+      });
+    });
+  });
+}
+
+// The Victory row: the game's scenes, installed packs' and this mod's own (Victories(), the mod's pack), and other
+// games' (converted when picked); "Preview" plays the chosen one in the Full preview.
+bool g_test_victory_open = false;
+std::string g_test_victory_port;  // (--star-victory-port <game>,<number>: that scene converted once the list is read)
+void VictoryRow() {
+  std::vector<EntranceInfo> mine;
+  if (!g_star.pack.empty())
+    for (auto& e : PackEntrances(g_star.pack))
+      if (IsVictoryNumber(e.number)) e.from = "this mod", mine.push_back(std::move(e));
+  auto label = [](const EntranceInfo& v) { return std::to_string(v.number) + "  " + v.name + (v.from.empty() ? "" : "  [" + v.from + "]"); };
+  std::string cur = "The game's (a generic one)";
+  for (const std::vector<EntranceInfo>* list : {&Victories(), static_cast<const std::vector<EntranceInfo>*>(&mine)})
+    for (const auto& v : *list)
+      if (v.number == g_star.victory) cur = label(v);
+  if (g_star.victory > 0 && cur[0] == 'T') cur = std::to_string(g_star.victory) + "  (not installed)";
+  if (!g_test_victory_port.empty() && g_other_victories_state == 0) ReadOtherVictories();
+  if (!g_test_victory_port.empty() && g_other_victories_state == 2 && !g_victory_converting) {
+    for (const auto& v : g_other_victories)
+      if (g_test_victory_port == v.game + "," + std::to_string(v.number)) PortVictory(v);
+    g_test_victory_port.clear();
+  }
+  ImGui::SetNextItemWidth(320 * g_scale);
+  ImGui::BeginDisabled(g_victory_converting);
+  if (ImGui::BeginCombo("Victory", g_victory_converting ? "Converting ..." : cur.c_str(), ImGuiComboFlags_HeightLarge)) {
+    if (g_other_victories_state == 0) ReadOtherVictories();
+    if (ImGui::Selectable("The game's (a generic one)", g_star.victory <= 0)) g_star.victory = -1, Touch();
+    for (const std::vector<EntranceInfo>* list : {static_cast<const std::vector<EntranceInfo>*>(&mine), &Victories()})
+      for (const auto& v : *list)
+        if (ImGui::Selectable((label(v) + "##v" + v.from).c_str(), g_star.victory == v.number)) g_star.victory = v.number, Touch();
+    ImGui::SeparatorText("From another game (converted into this mod)");
+    if (g_other_victories_state != 2) ImGui::TextDisabled("Reading your game discs ...");
+    else if (g_other_victories.empty())
+      ImGui::TextDisabled("None: add SvR 2008, 2009, 2010 or Legends of WrestleMania in My game discs.");
+    for (const auto& v : g_other_victories)
+      if (ImGui::Selectable((v.name + "  [" + v.game_name + " " + std::to_string(v.number) + "]##o" + v.game).c_str(), false))
+        PortVictory(v);
+    ImGui::EndCombo();
+  }
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  ImGui::BeginDisabled(g_star.victory <= 0 || g_victory_converting);
+  if (ImGui::Button("Preview##victory")) OpenFullPreview(g_star.victory);
+  ImGui::EndDisabled();
+  Hint("What the superstar does after winning a singles match: another superstar's celebration (The Rock, Cena, "
+       "Kofi ...), one of the game's generic ones, one a move pack adds (EVP scripts numbered 6000-7999), or one "
+       "from SvR 2008-2010 / Legends of WrestleMania (My game discs), converted into this mod when picked. Tag, "
+       "title and match-type celebrations stay the game's.");
 }
 
 void GearProblems(std::vector<Problem>& p) {
@@ -1972,7 +3010,7 @@ void Problems(std::vector<Problem>& p) {
     else if (!c.ok)
       p.push_back(Error("The big screen video isn't a video the game can play (" + c.note + ").")
                       .With("Pick another video...", [] { GoStep(kStepEntrance); }).With("Play no video of my own", drop, "the video is left out"));
-    else if (c.w != 320 || c.h != 320)
+    else if (c.w && (c.w != 320 || c.h != 320))
       p.push_back(Warning("The big screen video is " + std::to_string(c.w) + " x " + std::to_string(c.h) +
                           ": the big screen is square, so it plays stretched.").Note());
   }
@@ -2071,6 +3109,22 @@ void Problems(std::vector<Problem>& p) {
     if (!fs::exists(fs::path(g_star.pack) / L"pack.txt", ec))
       p.push_back(Error("The folder of extra moves (" + FileName(g_star.pack) + ") is broken: it has no list of its moves, so none of them would play.")
                       .With("Leave the extra moves out", [] { g_star.pack.clear(); Touch(); }));
+  }
+  {  // (picked, imported or from a test: moves the game can't play - in a match those slots get the base's)
+    std::vector<int> bad;
+    for (const auto& [slot, id] : g_star.moveset)
+      if (!MoveUsable(id, g_star.pack)) bad.push_back(slot);
+    if (!bad.empty()) {
+      std::string list;
+      for (size_t k = 0; k < bad.size() && k < 4; ++k)
+        list += (k ? ", " : "") + SlotLabel(bad[k]) + " (move " + std::to_string(g_star.moveset[bad[k]]) + ")";
+      p.push_back(Warning(std::to_string(bad.size()) + " move(s) in the moveset the game can't play: " + list +
+                          (bad.size() > 4 ? ", ..." : "") + ". In a match those slots would do the base superstar's moves.")
+                      .With("Use the style's moves there", [bad] {
+                        for (int s : bad) g_star.moveset.erase(s), g_star.moveset_note.erase(s);
+                        Touch();
+                      }, "the style's moves are back in those slots"));
+    }
   }
   tag(kStepMoves);
   auto clean = [](char* s) {  // letters and digits only, capitals (the announcer's clip names)
@@ -2212,8 +3266,15 @@ void Draw() {
         WriteLogTo((fs::path(g_game) / L"Mods" / L".convert" / L"gear" / L"gear.log").wstring());
         PostMessageW(g_wnd, WM_CLOSE, 0, 0);
       };
-      WhenIdle([at, donor, finish] {
-        GearTransplant(g_star.model, at, donor, [finish](const std::wstring& made) { g_star.model = made, Log("test: gear fitted " + Utf8(made)), finish(); });
+      const std::string spec = g_test_gear_from.substr(c + 1);  // (<id>, or pac=<path>,<attire>: any pac's gear)
+      WhenIdle([at, donor, finish, spec] {
+        auto put = [finish](const std::wstring& made) { g_star.model = made, Log("test: gear fitted " + Utf8(made)), finish(); };
+        if (spec.rfind("pac=", 0) == 0) {
+          const size_t k = spec.rfind(',');
+          GearTransplantFrom(g_star.model, at, Wide(spec.substr(4, k - 4)), std::atoi(spec.c_str() + k + 1), "test", put);
+        } else {
+          GearTransplant(g_star.model, at, donor, put);
+        }
       });
       // (a failure closes too: after the tool, Busy() is false and the model unchanged)
     }
@@ -2235,18 +3296,28 @@ void Draw() {
       if (LoadPicture(g_test_picture, img)) SetPicture(img);
     }
     if (Image img; !g_test_full.empty() && LoadPicture(g_test_full, img)) g_star.picture_full = FitFigure(img, 512);
+    if (Image img; !g_test_load.empty() && LoadPicture(g_test_load, img)) g_star.picture_load = FitLoading(img);
     if (g_test_pose >= 0) g_star.pose = g_test_pose;  // (previewed once the model is in: below)
     if (const size_t c = g_test_hometown.find(','); !g_test_hometown.empty()) {
       std::snprintf(g_star.hometown_city, sizeof g_star.hometown_city, "%s", g_test_hometown.substr(0, c).c_str());
       std::snprintf(g_star.hometown_state, sizeof g_star.hometown_state, "%s", c == std::string::npos ? "" : g_test_hometown.substr(c + 1).c_str());
     }
+    if (!g_test_import.empty()) RunTestImport(g_test_import);  // (after the style: the import is set against it)
+    if (!g_test_cae.empty())
+      for (const auto& m : MadeEntrances())
+        if (std::to_string(m.id) == g_test_cae) UseMadeEntrance(m.id, m.name);
     ApplyTestMaterials();  // (--star-mat before the test save)
-    if (!g_test_save.empty()) {
+    if (!g_test_save.empty() && g_test_import.rfind("game:", 0) != 0) {  // (game: saves once the port is done)
       Job j;
       PrepareJob(j);
       std::vector<ZipEntry> files;
-      if (BuildFiles(j, files) && WriteFile(Utf8(g_test_save), ZipWrite(files))) Log("test: saved " + Utf8(g_test_save));
-      PostMessageW(g_wnd, WM_CLOSE, 0, 0);
+      auto write = [](std::vector<ZipEntry>& files) {
+        if (WriteFile(Utf8(g_test_save), ZipWrite(files))) Log("test: saved " + Utf8(g_test_save));
+        PostMessageW(g_wnd, WM_CLOSE, 0, 0);
+      };
+      if (!BuildFiles(j, files)) PostMessageW(g_wnd, WM_CLOSE, 0, 0);
+      else if (OwnModel(j.model) && j.threads.empty()) WithThreadsParts(j.id, std::move(files), write);  // (as Save as mod)
+      else write(files);
     }
   }
   if (g_star.simple) return SimpleDraw();
@@ -2335,7 +3406,10 @@ void Draw() {
   TextField("Author (optional)", g_star.author, sizeof g_star.author);
   TextField("Version (optional)", g_star.version, sizeof g_star.version, "1.0");
   MovesetSection();
+  static bool more_once = false;  // (--star-victory: the section open, scrolled to)
+  if (g_test_victory_open) ImGui::SetNextItemOpen(true), more_once = true, g_test_victory_open = false;
   if (ImGui::CollapsingHeader("More: entrance, announcer, abilities, moves")) {
+    if (more_once) ImGui::SetScrollHereY(0.1f), more_once = false;
     ImGui::Indent();
     if (EntrancePicker("Entrance", g_star.entrance, "The style's")) Touch();
     ImGui::SameLine();
@@ -2344,6 +3418,8 @@ void Draw() {
     Hint("The entrance motions and pyro (the music and movie are the files above): any the game has - every "
          "superstar's, Jeff Hardy's from SvR 2010 it ships unused (535) - or one an installed move pack adds "
          "(the From another game tab makes them from other games). Attires 2-4 can have their own.");
+    CreatedEntranceRow();
+    VictoryRow();
     {
       ImGui::SetNextItemWidth(320 * g_scale);
       const std::string cur = g_star.pose < 0 ? "The style's" : PoseLabel(g_star.pose);
@@ -2432,10 +3508,12 @@ void Draw() {
   if (!g_star.song.empty() && g_star.music) g_star.music = 0;  // (a song file picked: it wins)
   StockThemeRow();
   ThemeGainRow();
+  CallGainRow();
   FileRow("Entrance movie (optional)...", g_star.movie, "the style's", kBinkFilter, 1,
-          "A 320 x 320 Bink movie: From a video... makes one here, the launcher's Movies tab too.");
+          "A 320 x 320 movie (.mp4, or a Bink .bik): From a video... makes one here, the launcher's Movies tab too. Mods carry it as an mp4.");
   ImGui::SameLine();
   BinkFromVideoButton("From a video...", g_star.movie, g_star.name);
+  MovieSizeRow(g_star.movie);
   const std::vector<int> own = g_star.model.empty() ? std::vector<int>() : ModelAttires(g_star.model);
   auto in_model = [&](int n) {  // (the game counts them contiguous from 1)
     for (int k = 1; k <= n; ++k)
@@ -2550,6 +3628,30 @@ void Draw() {
   } else ImGui::TextDisabled(g_star.picture.Empty() ? "none" : "the select picture");
   Hint("The full-body render (512 x 512, the game's SSFB: the screens that show the whole superstar). Without one "
        "the select picture is used, as the game's own superstars mostly do. Framed like the game's.");
+  static int scroll_to_load = 40;  // (--star-load: the row scrolled into view for a screenshot, a few frames)
+  if (!g_test_load.empty() && scroll_to_load > 0 && --scroll_to_load < 20) ImGui::SetScrollHereY(0.5f);
+  if (ImGui::Button(g_star.picture_load.w ? "Replace the loading picture..." : "Loading picture (optional)...", ImVec2(204 * g_scale, 0))) {
+    const std::wstring f = PickFile(false, L"Loading screen picture (fitted to 1024 x 512)", kPictureFilter, 1);
+    Image img;
+    if (!f.empty() && LoadPicture(f, img)) {
+      g_star.picture_load = FitLoading(img), Touch();
+      Log("Loading picture set from " + Utf8(f));
+    }
+  }
+  ImGui::SameLine();
+  if (g_star.picture_load.w) {
+    static Picture load_view;
+    if (load_view.image.rgba != g_star.picture_load.rgba) load_view.Set(g_star.picture_load);
+    load_view.Draw(96 * g_scale, 48 * g_scale);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The NOW LOADING picture (load.dds)");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Remove##load")) g_star.picture_load = Image(), Touch();
+  } else {
+    ImGui::TextDisabled("none: the arena's or the game's");
+  }
+  Hint("The picture on the NOW LOADING screen before a match (1024 x 512). In a match the first player's superstar's "
+       "picture shows, else the next one's that has one; it wins over a custom arena's own. Any picture is fitted: a "
+       "wide one fills it, a square or tall one sits on the right over a blurred copy of itself."); 
   ImGui::TextDisabled("Bust:");
   Hint("The small render (256 x 256, the game's SSFC) and the model's own portrait. Made from the top of the select "
        "picture unless you give one; a head-and-shoulders picture, cropped and framed like the game's.");
@@ -2591,7 +3693,7 @@ std::string StateText() {
   std::string s = std::string("name=") + g_star.name + "\nshort=" + g_star.short_name + "\nstyle=" +
                   std::to_string(g_star.style) + "\ncall=" + std::to_string(g_star.call) + "\nauthor=" + g_star.author +
                   "\nversion=" + g_star.version + "\nheight=" + HeightText() + "\ngain=" + GainText() + "\nmodel=" + Utf8(g_star.model) + "\nsong=" + Utf8(g_star.song) + "\nmusic=" + std::to_string(g_star.music) + "\nmats=" + MaterialsText(g_star.mats) +
-                  "\nmovie=" + Utf8(g_star.movie) + "\nvoice=" + Utf8(g_star.voice) + "\nratings=";
+                  "\nmovie=" + Utf8(g_star.movie) + "\nvoice=" + Utf8(g_star.voice) + "\ncall_gain=" + CallGainText() + "\nloading=" + std::to_string(g_star.picture_load.rgba.size()) + "\nratings=";
   // (the style's own attributes, filled in when the page is first drawn, aren't a change: a new project stays clean)
   bool style_ratings = true;
   for (int k = 0; k < 7; ++k) style_ratings &= g_star.ratings[k] == StarRating(kStyles[g_star.style].template_id, k);
@@ -2601,8 +3703,8 @@ std::string StateText() {
   for (int a = 1; a < 4; ++a)
     s += "\nattire" + std::to_string(a + 1) + "=" + Utf8(g_star.attires[a]) + "|" + g_star.attire_names[a] + "|" +
          std::to_string(g_star.attire_entrance[a]);
-  s += "\nmoveset=" + MovesetText();
-  s += "\nentrance=" + std::to_string(g_star.entrance) + "\npose=" + std::to_string(g_star.pose) + "\nannouncer=" + g_star.announcer + "\nhometown=" + g_star.hometown_city + "," + g_star.hometown_state + "\nmoves=" + Utf8(g_star.moves) +
+  s += "\nmoveset=" + MovesetText() + "\ncae=" + Utf8(g_star.cae) + "\nthreads=" + g_star.threads;
+  s += "\nentrance=" + std::to_string(g_star.entrance) + "\nvictory=" + std::to_string(g_star.victory) + "\npose=" + std::to_string(g_star.pose) + "\nannouncer=" + g_star.announcer + "\nhometown=" + g_star.hometown_city + "," + g_star.hometown_state + "\nmoves=" + Utf8(g_star.moves) +
        "\npack=" + Utf8(g_star.pack) + "\nabil=" + std::to_string(g_star.own_abilities);
   for (int a : g_star.abilities) s += "," + std::to_string(a);
   for (const auto& [a, op] : g_star.gear) s += "\ngear" + std::to_string(a) + "=" + op;
@@ -2612,6 +3714,65 @@ std::string StateText() {
 }
 
 void Reset() { g_star = StarProject(); }
+
+// "Made in the game": the created entrances the game found in its profiles at its last start (superstar_mods.cpp
+// ExportCreatedEntrances: <game>\Mods\.cae\<id>.bin + list.txt) - built in the game's own CREATE AN ENTRANCE (ADVANCED
+// CREATION: a motion, pyro and the rest per scene, with its preview), then given to this mod (cae=).
+std::vector<MadeEntrance> MadeEntrances() {
+  static std::vector<MadeEntrance> v;
+  static double when = -100;
+  if (ImGui::GetTime() - when < 3) return v;
+  when = ImGui::GetTime();
+  v.clear();
+  Bytes t;
+  if (!ReadFile(PathStr(fs::path(g_game) / L"Mods" / L".cae" / L"list.txt"), t)) return v;
+  const std::string s(t.begin(), t.end());
+  for (size_t at = 0; at < s.size();) {
+    size_t e = s.find('\n', at);
+    if (e == std::string::npos) e = s.size();
+    const std::string l = s.substr(at, e - at);
+    at = e + 1;
+    if (const size_t tab = l.find('\t'); tab != std::string::npos) v.push_back({std::atoi(l.c_str()), l.substr(tab + 1)});
+  }
+  return v;
+}
+
+// A created entrance into the project: a copy (the game rewrites its folder at every start).
+bool UseMadeEntrance(int id, const std::string& name) {
+  const fs::path from = fs::path(g_game) / L"Mods" / L".cae" / (std::to_wstring(id) + L".bin");
+  Bytes b;
+  if (!ReadFile(PathStr(from), b) || b.size() != 284) return Status("That created entrance's file is gone: start the game once to list them again."), false;
+  const fs::path to = fs::path(g_game) / L"Mods" / L".convert" / L"cae" / (std::to_wstring(id) + L"_" + std::to_wstring(std::time(nullptr)) + L".bin");
+  std::error_code ec;
+  fs::create_directories(to.parent_path(), ec);
+  if (!WriteFile(PathStr(to), b)) return Status("The created entrance couldn't be copied (" + PathStr(to) + ")."), false;
+  g_star.cae = to.wstring(), g_star.cae_name = name;
+  Touch();
+  Log("created entrance: " + name + " (" + std::to_string(id) + ") -> " + PathStr(to));
+  Status(Who() + " walks out with " + name + "'s created entrance now (made in CREATE AN ENTRANCE).");
+  return true;
+}
+
+void CreatedEntranceRow() {
+  const auto made = MadeEntrances();
+  ImGui::SetNextItemWidth(320 * g_scale);
+  const std::string cur = g_star.cae.empty() ? std::string("None (the entrance above)") : g_star.cae_name + " (made in the game)";
+  if (ImGui::BeginCombo("Created entrance", cur.c_str(), ImGuiComboFlags_HeightLarge)) {
+    if (ImGui::Selectable("None (the entrance above)", g_star.cae.empty())) g_star.cae.clear(), g_star.cae_name.clear(), Touch();
+    for (const auto& m : made)
+      if (ImGui::Selectable((m.name + " (made in the game)##" + std::to_string(m.id)).c_str(), false)) UseMadeEntrance(m.id, m.name);
+    if (made.empty()) ImGui::TextDisabled("None yet: make one in the game (below), then start the game once.");
+    ImGui::EndCombo();
+  }
+  Hint("An entrance built in the game's own CREATE AN ENTRANCE (ADVANCED CREATION: a motion, pyro and the rest for each "
+       "scene, with its preview): give it to any superstar or Created Superstar there, start the game once, and pick "
+       "it here. The mod then walks out with it (the music and movie stay the files above) until the player makes "
+       "their own for it in the game.");
+}
+
+// Test aid --star-cae <id>: that created entrance (Mods\.cae) into the project.
+std::string g_test_cae;
+void TestCae(const std::string& id) { g_test_cae = id; }
 
 void WriteProject(ProjectOut& out) {
   out.Key("name", g_star.name);
@@ -2636,6 +3797,9 @@ void WriteProject(ProjectOut& out) {
   out.Key("fbx_on", PairsText(g_star.fbx_on));
   out.Key("fbx_kind", PairsText(g_star.fbx_kind));
   out.Key("fbx_pic", PairsText(g_star.fbx_pic));
+  if (g_star.fbx_reduce > 0) out.Key("fbx_reduce", std::to_string(g_star.fbx_reduce) + (g_star.fbx_keep_face ? "" : ",all"));
+  if (g_star.fbx_hair != -1) out.Key("fbx_hair", std::to_string(g_star.fbx_hair));
+  out.Key("fbx_cloth", PairsText(g_star.fbx_cloth));
   {
     std::string t;
     for (const auto& [name, e] : g_star.fbx_mat) {
@@ -2653,14 +3817,27 @@ void WriteProject(ProjectOut& out) {
   out.File("song", g_star.song, "star/theme");
   if (g_star.music > 0) out.Key("music", std::to_string(g_star.music));
   if (const std::string g = GainText(); !g.empty()) out.Key("theme_gain", g);
-  out.File("movie", g_star.movie, "star/movie");
+  out.File("movie", ProjectMovie(g_star.movie), "star/movie");
+  if (g_settings.keep_bik && !g_star.movie.empty()) {  // (the Bink kept beside the mp4)
+    const fs::path m = g_star.movie, b = Lower(PathStr(m.extension())) == ".bik" ? m : fs::path(m).replace_extension(L".bik");
+    std::error_code ec;
+    if (fs::exists(b, ec)) out.File("movie_bik", b.wstring(), "star/movie_bik");
+  }
+  out.File("cae", g_star.cae, "star/cae");
+  if (!g_star.threads.empty() && !out.keys_only) {
+    out.Key("threads", "star/threads.txt");
+    out.files.push_back({"star/threads.txt", Bytes(g_star.threads.begin(), g_star.threads.end())});
+  }
+  if (!g_star.cae_name.empty()) out.Key("cae_name", g_star.cae_name);
   out.File("voice", g_star.voice, "star/voice");
+  if (const std::string g = CallGainText(); !g.empty()) out.Key("call_gain", g);
   for (int a = 1; a < 4; ++a) {
     out.File("attire" + std::to_string(a + 1), g_star.attires[a], "star/attire" + std::to_string(a + 1));
     out.Key("attire" + std::to_string(a + 1) + "_name", g_star.attire_names[a]);
     if (g_star.attire_entrance[a] > 0) out.Key("attire" + std::to_string(a + 1) + "_entrance", g_star.attire_entrance[a]);
   }
   if (g_star.entrance >= 0) out.Key("entrance", g_star.entrance);
+  if (g_star.victory > 0) out.Key("victory", g_star.victory);
   if (!g_star.source_game.empty()) out.Key("source", g_star.source_game + (g_star.source_id >= 0 ? " " + std::to_string(g_star.source_id) : ""));
   if (g_star.source_entrance >= 0) out.Key("source_entrance", g_star.source_entrance);
   if (!g_star.entrance_note.empty()) out.Key("entrance_note", g_star.entrance_note);
@@ -2679,7 +3856,7 @@ void WriteProject(ProjectOut& out) {
     out.Key("pack", "moves");
     out.Key("pack.from", Utf8(g_star.pack));
     std::error_code ec;
-    for (const auto& e : fs::recursive_directory_iterator(g_star.pack, ec)) {
+    for (const auto& e : fs::recursive_directory_iterator(out.keys_only ? fs::path() : fs::path(g_star.pack), ec)) {
       if (!e.is_regular_file(ec)) continue;
       Bytes f;
       if (ReadFile(PathStr(e.path()), f)) out.files.push_back({"moves/" + fs::relative(e.path(), g_star.pack, ec).generic_string(), std::move(f)});
@@ -2688,6 +3865,7 @@ void WriteProject(ProjectOut& out) {
   out.Png("picture", g_star.picture.image, "star/picture");
   if (g_star.own_bust) out.Png("bust", g_star.picture_small, "star/bust");
   if (g_star.picture_full.w) out.Png("full", g_star.picture_full, "star/full");
+  if (g_star.picture_load.w) out.Png("loading", g_star.picture_load, "star/loading");
   if (g_star.game_look) out.Key("game_look", "1");
   for (size_t k = 0; k < g_star.signs.size(); ++k) out.Png("sign" + std::to_string(k + 1), g_star.signs[k].image, "star/sign" + std::to_string(k + 1));
 }
@@ -2718,6 +3896,7 @@ bool Read(const ProjectIn& in, bool mod) {
   g_star.call = in.GetInt("call", -1);
   if (const std::string h = in.Get("height"); !h.empty()) g_star.height = std::clamp(float(std::atof(h.c_str())), 0.8f, 1.25f);
   g_star.entrance = in.GetInt("entrance", -1);
+  g_star.victory = in.GetInt("victory", -1);
   {
     const std::string src = in.Get("source");  // "<game> <their id>" (a ported superstar)
     const size_t sp = src.find(' ');
@@ -2772,6 +3951,13 @@ bool Read(const ProjectIn& in, bool mod) {
   ParsePairs(in.Get("fbx_on"), g_star.fbx_on);
   ParsePairs(in.Get("fbx_kind"), g_star.fbx_kind);
   ParsePairs(in.Get("fbx_pic"), g_star.fbx_pic);
+  {  // (Reduce detail: "<vertices>[,all]"; none: off)
+    const std::string t = in.Get("fbx_reduce");
+    g_star.fbx_reduce = t.empty() ? 0 : std::clamp(std::atoi(t.c_str()), 0, kReduceMax);
+    g_star.fbx_keep_face = t.find(",all") == std::string::npos;
+  }
+  g_star.fbx_hair = in.Get("fbx_hair").empty() ? -1 : std::clamp(std::atoi(in.Get("fbx_hair").c_str()), -1, 1);
+  ParsePairs(in.Get("fbx_cloth"), g_star.fbx_cloth);
   {
     const std::string t = in.Get("fbx_mat");
     for (size_t at = 0; at < t.size();) {
@@ -2816,7 +4002,28 @@ bool Read(const ProjectIn& in, bool mod) {
   if (const int m = std::atoi(in.Get("music").c_str()); m >= 1 && m <= 253) g_star.music = m;
   if (const std::string g = in.Get("theme_gain"); !g.empty()) g_star.theme_gain = std::clamp(float(std::atof(g.c_str())), -20.0f, 6.0f);
   g_star.movie = file("movie", nullptr);
+  if (Lower(PathStr(fs::path(g_star.movie).extension())) == ".mp4") {  // (its Bink: put back beside it, same name)
+    std::wstring b;
+    if (mod) {
+      const std::string inner = PathStr(fs::path(in.Get("movie")).replace_extension(".bik"));
+      if (in.Find(inner)) b = in.Extract(inner);
+    } else {
+      b = file("movie_bik", nullptr);
+    }
+    const fs::path to = fs::path(g_star.movie).replace_extension(L".bik");
+    std::error_code ec;
+    if (!b.empty() && fs::path(b) != to) fs::copy_file(b, to, fs::copy_options::overwrite_existing, ec);
+  }
+  g_star.cae = file("cae", nullptr);
+  {  // (threads.txt: the project's own, or a mod's)
+    const std::string tf = mod ? std::string("threads.txt") : in.Get("threads");
+    for (const auto& f : in.files)
+      if (!tf.empty() && f.name == tf) g_star.threads.assign(f.data.begin(), f.data.end());
+  }
+  g_star.cae_name = in.Get("cae_name");
+  if (!g_star.cae.empty() && g_star.cae_name.empty()) g_star.cae_name = "this mod's";
   g_star.voice = file("voice", nullptr);
+  if (const std::string g = in.Get("call_gain"); !g.empty()) g_star.call_gain = std::clamp(float(std::atof(g.c_str())), -20.0f, 12.0f);
   for (int a = 1; a < 4; ++a) {
     g_star.attires[a] = file(("attire" + std::to_string(a + 1)).c_str(), nullptr);
     std::snprintf(g_star.attire_names[a], sizeof g_star.attire_names[a], "%s",
@@ -2833,6 +4040,11 @@ bool Read(const ProjectIn& in, bool mod) {
       }
     }
     if (const ZipEntry* f = in.Find("render_full.dds"); f) DdsDecode(f->data, g_star.picture_full);
+    {  // the NOW LOADING picture: load.dds, or the file the manifest's loading= names (converters write both)
+      const std::string named = in.Get("loading");
+      const ZipEntry* l = in.Find(named.empty() ? std::string("load.dds") : named);
+      if (Image li; l && DdsDecode(l->data, li)) g_star.picture_load = FitLoading(li);
+    }
     for (int k = 1; k <= 4; ++k)
       if (const ZipEntry* s = in.Find("sign" + std::to_string(k) + ".dds"); s && DdsDecode(s->data, img)) {
         Picture p;
@@ -2843,6 +4055,7 @@ bool Read(const ProjectIn& in, bool mod) {
     g_star.game_look = false;  // (the saved picture has it already)
     if (in.Png("bust", img)) g_star.picture_small = img, g_star.own_bust = true;
     if (in.Png("full", img)) g_star.picture_full = img;
+    if (in.Png("loading", img)) g_star.picture_load = FitLoading(img);
     if (in.Png("picture", img)) SetPicture(img);
     g_star.game_look = in.GetInt("game_look", 0) != 0;
     for (int k = 1; k <= 4; ++k)
@@ -2866,6 +4079,7 @@ void TestMaterials(const std::string& spec, bool open) {
   if (open) g_test_open_mats = true;
 }
 void ApplyTestMaterials() {
+  if (const auto [pac, in] = AttireSource(g_view_attire); MaterialTestApply(pac, in, false, g_view_attire, g_star.mats)) Touch();
   if (g_test_mats.empty()) return;
   std::string all = g_test_mats;
   g_test_mats.clear();
@@ -2892,6 +4106,7 @@ void ApplyTestMaterials() {
       if (k == "tint" && std::sscanf(v.c_str(), "%f/%f/%f", &m.tint[0], &m.tint[1], &m.tint[2]) == 3) m.has_tint = true;
       if (k == "cut") m.cutout = std::atoi(v.c_str());
       if (k == "both") m.two_sided = std::atoi(v.c_str());
+      if (k == "flip") m.flip = std::atoi(v.c_str());
       if (k == "normal") m.normal = v == "flat" ? 2 : v == "asis" ? 0 : 1, m.normal_file = m.normal == 1 ? Wide(v) : std::wstring();
     }
     Log("test: material " + one);
@@ -2910,10 +4125,13 @@ void SetModel(const std::wstring& ch_pac) {
 }
 
 void TestEntrance(int n) { g_star.entrance = n; }
+void TestVictory(int n) { g_star.victory = n, g_test_victory_open = true; }
+void TestVictoryPort(const std::string& spec) { g_test_victory_port = spec, g_test_victory_open = true; }
 void TestInstall() { Install(false); }
 bool PickEntrance(const char* label, int& value, const char* none, float width) { return EntrancePicker(label, value, none, width); }
 bool EntranceOutfit(const std::wstring& pac) { return HasEntranceOutfit(pac); }
 void TestFull(const std::wstring& png) { g_test_full = png; }
+void TestLoad(const std::wstring& png) { g_test_load = png; }
 void ShowPose(int motion) { PreviewPose(motion); }
 const std::vector<std::string>& AnnouncerNames() { return AnnouncerCalls().names; }
 bool PickClip(const char* label, char* buf, size_t size, const std::vector<std::string>& clips, const char* none, float width) {
@@ -2926,6 +4144,21 @@ void TestWatchSlot(int off) { g_watch_slot_test = off / 2, g_moveset_open_once =
 void TestMoveset(const std::string& spec) {
   ParseMoveset(spec, ',');
   g_moveset_open_once = true;
+}
+
+// --star-import-moveset star:<id> | mod:<folder in Mods\Superstars>: that whole moveset into the project; open:<0-2>: the
+// import shown with that source; game:<game>:<item>: the Another game source, Use once ready (then --test-star-save).
+std::string g_test_import;
+void TestImportMoveset(const std::string& spec) { g_test_import = spec, g_moveset_open_once = true; }
+void RunTestImport(const std::string& spec) {
+  if (spec.rfind("star:", 0) == 0) ImportFromStar(std::atoi(spec.c_str() + 5));
+  else if (spec.rfind("open:", 0) == 0) g_imp_src = std::clamp(std::atoi(spec.c_str() + 5), 0, 2), g_imp_src == 1 ? ReadImportMods() : void();
+  else if (spec.rfind("game:", 0) == 0 && spec.find(':', 5) != std::string::npos) {  // (then saved when done)
+    const size_t c = spec.find(':', 5);
+    g_imp_src = 2, g_imp_test_save = !g_test_save.empty();
+    simple_port::ForStarTest(simple_port::kMoves, spec.substr(5, c - 5), spec.substr(c + 1));
+  } else if (spec.rfind("mod:", 0) == 0) ImportFromMod(fs::path(g_game) / L"Mods" / L"Superstars" / fs::u8path(spec.substr(4)));
+  else Log("import moveset test: star:<id> or mod:<folder>, not " + spec);
 }
 
 void TestFbx(const std::wstring& fbx, const std::string& map) { g_test_fbx = fbx, g_test_fbx_map = map; }
@@ -2985,6 +4218,7 @@ bool TakePartFromMod(const std::wstring& svrmod, StarPart part, int slot) {
     case StarPart::kPictures:  // (their select picture, bust and full picture - the converter makes them from their renders)
       g_star.picture = got.picture, g_star.picture_small = got.picture_small, g_star.own_bust = got.own_bust;
       g_star.picture_full = got.picture_full, g_star.picture_src = got.picture_src, g_star.game_look = got.game_look;
+      if (got.picture_load.w) g_star.picture_load = got.picture_load;
       Status(got.picture.Empty() ? who + " came without pictures: the converter found none." : "The pictures are " + who + "'s now.");
       break;
     case StarPart::kMusic:  // (their theme and titantron video)
@@ -3022,11 +4256,13 @@ void TestGearFrom(const std::string& spec) { g_test_gear_from = spec; }
 void TestGearFbx(const std::string& spec) { g_test_gear_fbx = spec; }
 void TestSimpleTake(const std::wstring& svrmod, bool everything) { g_test_take = svrmod, g_test_take_all = everything; }
 void TestFbxMake() { g_test_fbx_make = true; }
+void TestFbxStep(int step) { g_fbx_step = step; }
 void TestFbxReport(const std::wstring& out) {  // with --star-fbx: the import report to <out> (automatic mapping), quit
   g_test_fbx_report = out;
 }
 
 void TestHeight(float scale) { g_star.height = std::clamp(scale, 0.8f, 1.25f); }
+void TestCallGain(float db) { g_star.call_gain = std::clamp(db, -20.0f, 12.0f), g_test_scroll_call = 40; }
 
 void TestFiles(const std::wstring& song, const std::wstring& movie, const std::wstring& voice, int call) {
   if (!song.empty()) g_star.song = song;

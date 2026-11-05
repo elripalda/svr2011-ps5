@@ -20,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
@@ -31,6 +32,7 @@
 #define STBI_ONLY_PNG
 #define STBI_NO_STDIO
 #include "stb_image.h"
+#include "../util.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -141,10 +143,7 @@ bool HashOfStem(const std::string& stem, uint64_t* hash) {
   return true;
 }
 
-std::string Lower(std::string s) {
-  for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
-  return s;
-}
+using svr2011::Lower;
 
 std::string Safe(const std::string& s) {
   std::string o;
@@ -379,6 +378,7 @@ bool DecodeDds(const std::vector<uint8_t>& d, Replacement& r) {
 }
 
 void LoaderThread() {
+  rex::thread::set_current_thread_name("texture pack loader");
   LowPriority();
   for (;;) {
     uint64_t hash;
@@ -497,6 +497,7 @@ std::vector<fs::path> PacFiles() {
 }
 
 void NamesThread() {
+  rex::thread::set_current_thread_name("texture pack names");
   LowPriority();
   const auto t0 = std::chrono::steady_clock::now();
   const std::vector<fs::path> files = PacFiles();
@@ -552,6 +553,7 @@ fs::path DumpPath(uint64_t hash, uint32_t w, uint32_t h, const std::string& form
 }
 
 void DumpThread() {
+  rex::thread::set_current_thread_name("texture dump");
   LowPriority();
   uint32_t written = 0;
   for (;;) {

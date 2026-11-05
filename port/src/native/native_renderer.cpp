@@ -6,6 +6,7 @@
 // (textures.cpp loads the rest from guest memory), and the front buffer is
 // shown at Present.
 
+#include "android_perf.h"
 #include "frame_rate.h"
 #include "native/native_renderer.h"
 
@@ -14,6 +15,7 @@
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
+#include <cctype>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -27,6 +29,8 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -34,6 +38,7 @@
 #include <vector>
 #if defined(_WIN32)
 #include <windows.h>
+#include <dxgi.h>  // (VideoMemoryBytes)
 #else
 #include <sys/resource.h>
 #endif
@@ -66,8 +71,20 @@
 #include "crash_report.h"
 #include "native/gpu.h"
 #include "native/recording_list.h"
+#if SVR2011_FSR2
+#include "native/fsr2.h"
+#if SVR2011_DLSS
+#include "native/dlss.h"
+#endif
+#endif
 #include "native/guest_d3d.h"
 #include "native/textures.h"
+#include "free_cam.h"
+#include "gpu_probe.h"
+#include "../util.h"
+#if SVR2011_DEBUG_SUITE
+#include "debug_suite/debug_suite.h"
+#endif
 
 // Default "main" (as the launcher): settings files without the key use it.
 #if defined(__ANDROID__)
@@ -128,14 +145,32 @@ REXCVAR_DEFINE_INT32(native_scene_height, 0, "GPU",
                      "Native renderer: the scene's height in pixels, between the 720p steps (900 / 1080: "
                      "2x scaled down to it). 0: native_max_scale and native_render_scale decide.");
 
+REXCVAR_DEFINE_STRING(native_upscale, "off", "GPU",
+                      "Native renderer upscaling: off (the scene at the window's resolution or above, averaged "
+                      "down), fsr1 (AMD FSR 1: the scene rendered smaller - native_upscale_quality - and "
+                      "scaled up to the window edge-adaptively, then sharpened; the HUD scaled with it) or fsr2 "
+                      "(experimental, Direct3D 12 / Vulkan: AMD FSR 2 - the match scene gathered over frames from "
+                      "its depth, motion and native_jitter; FSR 1 where it can't run).");
+
+REXCVAR_DEFINE_BOOL(native_jitter, false, "GPU",
+                    "Native renderer (temporal upscaling groundwork, experimental): the match scene's 3D draws "
+                    "moved by a sub-pixel offset each frame (Halton 2,3; 8 frames). On its own it only shakes "
+                    "the picture by under a pixel - for a temporal upscaler (FSR 2 / DLSS) to gather.");
+
+REXCVAR_DEFINE_INT32(native_upscale_quality, 1, "GPU",
+                     "FSR 1's render size: 0 Ultra Quality (77% of the window's height), 1 Quality (67%), "
+                     "2 Balanced (59%), 3 Performance (50%)");
+
+REXCVAR_DEFINE_DOUBLE(native_upscale_sharpness, 0.8, "GPU", "FSR 1's sharpening, 0 (none) - 1 (the most)");
+
 #if defined(__PROSPERO__)
-#define SVR2011_DEFAULT_MAX_SCALE 3  // [ps5 port] 2160P: the TV's own 4K (AUTO's 4x supersamples 2880p)
+#define SVR2011_DEFAULT_MAX_SCALE 3  // [ps5 port] 2160P: the TV's own 4K
 #else
-#define SVR2011_DEFAULT_MAX_SCALE 4
+#define SVR2011_DEFAULT_MAX_SCALE 8
 #endif
 REXCVAR_DEFINE_INT32(native_max_scale, SVR2011_DEFAULT_MAX_SCALE, "GPU",
-                     "Native renderer: the largest render scale (1 = the Xbox 360's 720p, up to 4). "
-                     "The scale follows the window; phones start at 1.");
+                     "Native renderer: the largest render scale (1 = the Xbox 360's 720p, up to 8 = 5760 lines; "
+                     "4, AUTO before 8K, counts as 8). The scale follows the window; phones start at 1.");
 
 REXCVAR_DEFINE_STRING(native_texture_quality, "high", "GPU",
                       "Native renderer texture quality: high - as the game has them; medium / low - big "
@@ -554,6 +589,8 @@ struct ResolvedTexture {
   RenderFormat format = RenderFormat::UNKNOWN;
   uint32_t width = 0, height = 0;
   uint32_t scale = 1;  // (the resolved target's)
+  bool swap_rb = false;  // (red and blue swapped in the copy: its texture view swaps them back)
+  RenderFormat view_format = RenderFormat::UNKNOWN;  // (colour: the format it is read as - `format` is typeless)
 };
 
 // A DrawVerticesUP waiting for its vertices (the game writes them into the
@@ -619,6 +656,90 @@ struct Renderer {
   std::unique_ptr<plume::RenderSampler> default_sampler;
   std::shared_ptr<plume::RenderTexture> outputs[kOutputs];
   std::unique_ptr<plume::RenderFramebuffer> output_framebuffers[kOutputs];
+  // FSR 1's intermediate (the frame's size: EASU's result, RCAS's source), in the 2D table at kFsrSrv.
+  std::shared_ptr<plume::RenderTexture> fsr_image;
+  std::unique_ptr<plume::RenderTextureView> fsr_view;
+  std::unique_ptr<plume::RenderFramebuffer> fsr_framebuffer;
+  bool fsr_image_fresh = true;  // (not drawn into since it was made)
+#if SVR2011_FSR2
+  // FSR 2 (experimental): its backend (made at the first use, again when the sizes change), the scene depth copied
+  // at the scene's resolve (fsr2_depth_frame: the frame it was), the motion vectors (zero: the camera's come with
+  // step 4).
+  std::unique_ptr<svr2011::fsr2::Upscaler> fsr2;
+  bool fsr2_failed = false;
+  std::shared_ptr<plume::RenderTexture> fsr2_depth, fsr2_motion;
+  std::shared_ptr<plume::RenderTexture> fsr2_depth32;  // (the depth as R32_FLOAT, from the motion pass: DLSS's)
+#if SVR2011_DLSS
+  // DLSS (native_upscale dlss, experimental): FSR 2's inputs into NVIDIA's upscaler instead of FSR 2's.
+  std::unique_ptr<svr2011::dlss::Upscaler> dlss;
+  bool dlss_failed = false;
+#endif
+  RenderTextureLayout fsr2_depth_layout = RenderTextureLayout::UNKNOWN, fsr2_motion_layout = RenderTextureLayout::UNKNOWN;
+  uint32_t fsr2_depth_w = 0, fsr2_depth_h = 0;
+  uint64_t fsr2_depth_frame = ~0ull, fsr2_last_frame = ~0ull;
+  // (the scene camera's view x projection at the scene's resolve: this frame's [0], the one before [1])
+  float fsr2_vp[2][16] = {};
+  uint64_t fsr2_vp_frame[2] = {~0ull, ~0ull};
+  // (test aid SVR2011_TEST_FSR2_DUMP: FSR 2's inputs read back this frame, written once it is done)
+  struct Fsr2Dump {
+    std::shared_ptr<plume::RenderBuffer> buffer;
+    std::string file;
+    uint32_t w = 0, h = 0, row = 0, bytes = 4;  // (row: pixels, `bytes` each)
+  };
+  std::vector<Fsr2Dump> fsr2_dumps;
+  // FSR 2's masks: the scene draws that move without motion vectors or blend over others (the wrestlers, the
+  // blended crowd / particles, the HUD) noted as drawn and drawn again at the scene's resolve, depth tested, into
+  // the reactive (R8: trust the history less) and transparency / composition (R8) targets - fsr2_mask.ps.
+  struct Fsr2MaskDraw {
+    const plume::RenderPipeline* pso = nullptr;
+    RenderBufferReference constants[4];
+    plume::RenderVertexBufferView views[16] = {};
+    plume::RenderInputSlot slots[16] = {};
+    uint32_t view_count = 0;
+    plume::RenderIndexBufferView ibv = {};
+    bool indexed = false;
+    uint32_t count = 0, start = 0;
+    int32_t base = 0;
+    plume::RenderViewport viewport;
+    plume::RenderRect scissor;
+    uint32_t stencil_ref = 0;
+    bool hud = false;  // (no depth test: kept only after the frame's last 3D draw - not a background)
+    // (a skinned draw: its own motion too - fsr2_skin: its key across frames, its bones a vertex, its NDC scale /
+    // offset as drawn; 0: none)
+    uint64_t skin_key = 0;
+    uint32_t skin_bones = 0;
+    float skin_ndc[4] = {};
+    const plume::RenderPipeline* skin_pso = nullptr;
+  };
+  std::vector<Fsr2MaskDraw> fsr2_mask_draws;
+  size_t fsr2_mask_after_3d = 0;  // (the noted draws before the frame's last 3D scene draw)
+  uint64_t fsr2_mask_draws_frame = ~0ull, fsr2_mask_frame = ~0ull;  // (noted in / drawn in)
+  std::shared_ptr<plume::RenderTexture> fsr2_reactive, fsr2_composition;
+  RenderTextureLayout fsr2_reactive_layout = RenderTextureLayout::UNKNOWN,
+                      fsr2_composition_layout = RenderTextureLayout::UNKNOWN;
+  uint32_t fsr2_mask_w = 0, fsr2_mask_h = 0;
+  struct Fsr2MaskFramebuffer {
+    std::shared_ptr<plume::RenderTexture> depth;  // (kept: the key)
+    std::unique_ptr<plume::RenderFramebuffer> framebuffer;
+  };
+  std::vector<Fsr2MaskFramebuffer> fsr2_mask_framebuffers;
+  std::unordered_map<uint64_t, std::unique_ptr<plume::RenderPipeline>> fsr2_mask_pipelines;
+  std::vector<uint8_t> fsr2_mask_code;
+  std::unique_ptr<plume::RenderShader> fsr2_mask_ps;
+  // FSR 2 / DLSS: the skinned draws' own motion (fsr2_skin.vs / .ps): each one's view x projection and bones
+  // (c54-c57, c74-c137) this frame and the last, by draw key.
+  struct SkinRows {
+    float rows[(4 + 64) * 4];
+  };
+  std::unordered_map<uint64_t, SkinRows> fsr2_skin_now, fsr2_skin_prev;
+  uint64_t fsr2_skin_frame = ~0ull;
+  std::vector<uint8_t> fsr2_skin_vs_code, fsr2_skin_ps_code;
+  std::unique_ptr<plume::RenderShader> fsr2_skin_vs, fsr2_skin_ps;
+  std::unordered_map<uint64_t, std::unique_ptr<plume::RenderPipeline>> fsr2_skin_pipelines;
+  std::vector<Fsr2MaskFramebuffer> fsr2_skin_framebuffers;
+  bool fsr2_skin_off = false;
+  RenderTextureLayout fsr_image_layout = RenderTextureLayout::UNKNOWN;
+#endif
   uint32_t output_index = 0;
   std::unordered_map<uint64_t, ColorTarget> color_targets;
   std::unordered_map<uint64_t, DepthTarget> depth_targets;
@@ -720,6 +841,9 @@ bool g_main = false;
 // times the guest's pixels (the emulator's resolution_scale setting); sizes the
 // game sees and computes with stay the guest's.
 uint32_t g_scale = 1;
+// [svr2011] The render scale's ceiling after memory ran out (OutOfVideoMemory): a step lower each time a target or
+// the frame images can't be made above 1x.
+uint32_t g_memory_scale_cap = UINT32_MAX;
 // native_scale_effects off: only the main scene's targets (and their resolves
 // and the frame images) are scaled; the effect buffers (the 1120 x 1120 shadow
 // map, reflections, glow and blur chains) keep the guest's size.
@@ -731,9 +855,29 @@ bool g_shadows = true;
 // native_render_scale: the main scene's targets (and their resolves and the
 // frame images) have this fraction of the scale's pixels per side - weak GPUs.
 float g_res = 1.0f;
+// native_upscale fsr1, while the scene is smaller than the window: Present scales it up with FSR 1 (EASU into the
+// frame-size intermediate, RCAS into the frame image) - g_fsr_sharpness RCAS's strength (0-1).
+bool g_fsr = false;
+float g_fsr_sharpness = 0.8f;
+// native_jitter: this frame's sub-pixel offset of the match scene's 3D draws (scene pixels, -0.5 to 0.5; y down)
+// - what a temporal upscaler needs to undo; zero when off.
+float g_jitter[2] = {0.0f, 0.0f};
+// native_upscale fsr2 (experimental): FSR 2 wanted - Present uses it in frames whose scene depth was caught at the
+// scene's resolve (fsr2_depth_frame), FSR 1 otherwise; the jitter on while it is.
+bool g_fsr2 = false;
+// native_upscale dlss (experimental): FSR 2's path with DLSS's upscaler (g_fsr2 on with it).
+bool g_dlss = false;
+// The intermediate's place in the 2D texture table: after the three placeholders, before the texture cache's.
+constexpr uint32_t kFsrSrv = 3;
 
-// Whether a target of this guest size is the main scene (1280 x 720).
-bool SceneTarget(uint32_t width, uint32_t height) { return width >= 1152 && height >= 640; }
+// Whether a target of this guest size is the main scene (1280 x 720). Not Superstar Threads' attire bake
+// (2080 x 1024, read back by the game's CPU: WriteBackResolve): sized as the scene - native_render_scale /
+// native_scene_height's fraction, the wide factor, the upscalers' jitter - its write-back took the wrong host pixels
+// and every Threads attire came out with another superstar's face and parts (2.1.8 report b43b9e: render scale 2x,
+// scene at 87%).
+bool SceneTarget(uint32_t width, uint32_t height) {
+  return width >= 1152 && height >= 640 && !(width == 2080 && height == 1024);
+}
 
 // Host pixels per guest pixel for a target of this guest size.
 uint32_t TargetScale(uint32_t width, uint32_t height) {
@@ -755,10 +899,17 @@ float g_wide = 1.0f;
 float g_tall = 1.0f;
 std::atomic<float> g_fov_scale{1.0f};
 std::atomic<bool> g_match_scene{false};
+std::atomic<bool> g_capture_wanted{false};  // (RequestFrameCapture: the next shown frame into g_capture)
+std::atomic<int> g_capture_output{-1};      // (... or this frame image: the one shown before - previous)
+std::atomic<int> g_last_shown_output{-1};   // (the frame image last shown)
+std::mutex g_capture_mutex;
+std::vector<uint8_t> g_capture;  // (RGB)
+uint32_t g_capture_w = 0, g_capture_h = 0;
 // The last frame drew nothing in 3D (a pause menu, a loading or transition
 // screen): 2D art filling the screen - all of it goes in the 16:9 middle,
 // with black sides.
 bool g_frame_2d = false;
+bool g_flat_frame_seen = false;  // (a match frame without the scene came: SVR2011_TEST_FRAME_SHOT_ON_2D)
 constexpr uint32_t kAspectConstant = 0x82007724;
 constexpr float kAspect16x9 = 16.0f / 9.0f;
 constexpr float kMaxWide = 2.0f;  // (32:9)
@@ -818,15 +969,17 @@ void Fail(const char* reason = "it stopped working") {
 #endif
 }
 
-bool EnvFlag(const char* name) {
+using svr2011::EnvFlag;
+
+int EnvInt(const char* name, int fallback) {
   char* v = nullptr;
   size_t n = 0;
-  bool on = false;
+  int value = fallback;
   if (_dupenv_s(&v, &n, name) == 0 && v) {
-    on = v[0] == '1';
+    value = std::atoi(v);
     free(v);
   }
-  return on;
+  return value;
 }
 
 // Debug: SVR2011_NATIVE_NOCACHE=1 - buffers and textures re-checked at every use.
@@ -848,6 +1001,23 @@ bool g_no_depth = false;  // SVR2011_NATIVE_NO_DEPTH=1
 double g_pipeline_ms = 0;  // pipeline builds since the last perf line
 // Bytes hashed since the last perf line: static / dynamic vertex buffers, constants.
 uint64_t g_hash_vb_static = 0, g_hash_vb_dynamic = 0, g_hash_const = 0;
+// Test aid SVR2011_TEST_CONST_TIMES=1: the constants path's time a frame on the native perf line - SharedConstants
+// (its texture lookups, its sets), GpuConstants - and the textures looked up a draw.
+const bool g_const_times = std::getenv("SVR2011_TEST_CONST_TIMES") != nullptr;
+uint64_t g_ct_shared_ns = 0, g_ct_tex_ns = 0, g_ct_sets_ns = 0, g_ct_gpu_ns = 0, g_ct_textures = 0, g_ct_draws = 0;
+uint64_t g_ct_tex_same = 0, g_ct_memo_hits = 0;  // (a slot's fetch as its last draw's; SharedConstants' kept answers)
+uint32_t g_ct_last_fetch[2][32][6] = {};
+struct ConstTimer {
+  uint64_t& sum;
+  std::chrono::steady_clock::time_point t0;
+  explicit ConstTimer(uint64_t& s) : sum(s) {
+    if (g_const_times) t0 = std::chrono::steady_clock::now();
+  }
+  ~ConstTimer() {
+    if (g_const_times)
+      sum += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+  }
+};
 uint32_t g_vb_demotions = 0;
 uint64_t g_repeat_same = 0, g_repeat_changed = 0;  // (total) dynamic buffers seen changing within a frame after trusting them
 // Debug (SVR2011_NATIVE_VB_STATS=1): hashed uses per dynamic buffer (address << 32 | size).
@@ -879,6 +1049,16 @@ std::filesystem::path PipelineCacheFile() {
   return dir / "cache" /
          (backend::ActiveApi() == backend::Api::kVulkan ? "native_vulkan_pipelines.bin" : "native_d3d12_pipelines.bin");
 }
+#if SVR2011_DLSS
+svr2011::dlss::Host DlssHost(Renderer* r) {
+  svr2011::dlss::Host h;
+  h.device = r->device.get();
+  h.vulkan = backend::ActiveApi() == backend::Api::kVulkan;
+  h.dll_dir = rex::filesystem::GetExecutableFolder().wstring();
+  h.data_path = (PipelineCacheFile().parent_path()).wstring();
+  return h;
+}
+#endif
 bool g_no_blend = false;  // SVR2011_NATIVE_NO_BLEND=1
 // SVR2011_NATIVE_DUMP_FRAME=<frame>: describe the first 40 draws of that
 // native frame in native_draws.txt (next to the log).
@@ -1270,28 +1450,84 @@ bool CreatePipelineLayout(Renderer* r) {
   return r->texture_sets[0] && r->texture_sets[1] && r->texture_sets[2] && r->sampler_set;
 }
 
+// A target that can't be made is asked for again at each draw: the first 16 logged, then every 1000th (the GT 710
+// report's log would have been all of them - the start rotated away).
+bool TargetFailureLogged() {
+  static std::atomic<uint64_t> n{0};
+  const uint64_t i = n++;
+  return i < 16 || i % 1000 == 0;
+}
+
+// createTexture, with a C++ out-of-memory as no texture: Direct3D 11 fills a new target from a buffer of zeros
+// (plume) - a 2.1.8 report (GeForce GT 710, the PC's memory full) crashed there making a 2x depth target.
+// (test: SVR2011_TEST_TEXTURE_LIMIT=<pixels> - a target or frame image bigger fails as out of memory)
+std::unique_ptr<plume::RenderTexture> TryCreateTexture(Renderer* r, const plume::RenderTextureDesc& d) {
+  static const uint64_t test_limit = uint64_t(EnvInt("SVR2011_TEST_TEXTURE_LIMIT", 0));
+  if (test_limit && uint64_t(d.width) * d.height > test_limit) {
+    if (TargetFailureLogged()) REXLOG_WARN("native renderer: test texture limit - {}x{} not made", d.width, d.height);
+    return nullptr;
+  }
+  try {
+    return r->device->createTexture(d);
+  } catch (const std::bad_alloc&) {
+    REXLOG_ERROR("native renderer: out of memory making a {}x{} texture", d.width, d.height);
+    return nullptr;
+  }
+}
+
+void OutOfVideoMemory(Renderer* r, const char* what);
+
 // The frame images, g_out_w x g_out_h, handed to the emulator's presentation
 // (committed, so the reference the presentation holds keeps one alive).
+// False (out of memory): none are left - BeginFrame draws nothing until they're made.
 bool CreateOutputs(Renderer* r) {
   for (uint32_t i = 0; i < kOutputs; ++i) {
     plume::RenderTextureDesc d = plume::RenderTextureDesc::Texture2D(
         g_out_w, g_out_h, 1, RenderFormat::R8G8B8A8_UNORM, plume::RenderTextureFlag::RENDER_TARGET);
     d.committed = true;
     r->output_framebuffers[i].reset();
-    r->outputs[i] = r->device->createTexture(d);
+    r->outputs[i] = TryCreateTexture(r, d);
     if (!r->outputs[i]) {
-      REXLOG_ERROR("native renderer: could not create the frame images");
+      REXLOG_ERROR("native renderer: could not create the frame images ({}x{})", g_out_w, g_out_h);
+      for (uint32_t j = 0; j < kOutputs; ++j) r->output_framebuffers[j].reset(), r->outputs[j].reset();
       return false;
     }
     r->outputs[i]->setName(fmt::format("frame image {}", i));
     const plume::RenderTexture* color = r->outputs[i].get();
     r->output_framebuffers[i] = r->device->createFramebuffer(plume::RenderFramebufferDesc(&color, 1));
   }
+  // FSR 1's intermediate, the frames' size (made with them: the GPU is idle), sampled from the 2D table at kFsrSrv.
+  r->fsr_framebuffer.reset();
+  r->fsr_view.reset();
+  // (FSR 2 writes it too: a storage texture where there is compute - not Direct3D 11)
+  r->fsr_image = TryCreateTexture(r, plume::RenderTextureDesc::Texture2D(
+      g_out_w, g_out_h, 1, RenderFormat::R8G8B8A8_UNORM,
+      plume::RenderTextureFlag::RENDER_TARGET |
+          (SlotTables() ? 0u : plume::RenderTextureFlag::STORAGE | plume::RenderTextureFlag::UNORDERED_ACCESS)));
+  r->fsr_image_fresh = true;
+#if SVR2011_FSR2
+  r->fsr_image_layout = RenderTextureLayout::UNKNOWN;
+  r->fsr2.reset();  // (its output size changed)
+#endif
+  if (r->fsr_image) {
+    r->fsr_image->setName("FSR 1 intermediate");
+    const plume::RenderTexture* color = r->fsr_image.get();
+    r->fsr_framebuffer = r->device->createFramebuffer(plume::RenderFramebufferDesc(&color, 1));
+    plume::RenderTextureViewDesc vd;
+    vd.format = RenderFormat::R8G8B8A8_UNORM;
+    vd.dimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+    vd.mipLevels = 1;
+    r->fsr_view = r->fsr_image->createTextureView(vd);
+    if (r->fsr_view)
+      r->texture_set[0]->setTexture(r->texture_base[0] + kFsrSrv, r->fsr_image.get(), RenderTextureLayout::SHADER_READ,
+                                    r->fsr_view.get());
+  }
   return true;
 }
 
 void ReportDeviceRemoved(Renderer* r);
 void StartPrebuildingPipelines(Renderer* r);
+uint64_t VideoMemoryBytes();
 
 bool Initialize() {
   if (!g_memory) {
@@ -1332,6 +1568,15 @@ bool Initialize() {
     return false;
   }
   REXLOG_INFO("native renderer: GPU {}", r->device->getDescription().name);
+#if defined(_WIN32)
+  {  // (for reports: what a GPU that runs out of memory had)
+    MEMORYSTATUSEX m = {sizeof(m)};
+    GlobalMemoryStatusEx(&m);
+    REXLOG_INFO("native renderer: video memory {} MB; system memory {} MB free of {} MB, page file {} MB free of {} MB",
+                VideoMemoryBytes() >> 20, m.ullAvailPhys >> 20, m.ullTotalPhys >> 20, m.ullAvailPageFile >> 20,
+                m.ullTotalPageFile >> 20);
+  }
+#endif
   backend::LoadPipelineCache(r->device.get(), PipelineCacheFile());
   if (g_debug_solid) g_debug_ps = ReadShader("debug_solid.ps");
   r->queue = r->device->createCommandQueue(plume::RenderCommandListType::DIRECT);
@@ -1370,8 +1615,14 @@ bool Initialize() {
   std::memset(r->zero_buffer->map(), 0, 256);
   r->zero_buffer->unmap();
 
-  textures::Initialize(g_memory, 3, kSrvHeapSize - 3, 1, kSamplerHeapSize - 1);
+  // (the texture cache's places: after the three placeholders and FSR 1's intermediate - kFsrSrv)
+  textures::Initialize(g_memory, kFsrSrv + 1, kSrvHeapSize - (kFsrSrv + 1), 1, kSamplerHeapSize - 1);
   g_r = r;
+#if SVR2011_DLSS
+  // (DLSS where it can run: NGX started on this device once - the GRAPHICS page asks UpscalerAvailable)
+  if (backend::ActiveApi() == backend::Api::kD3D12 || backend::ActiveApi() == backend::Api::kVulkan)
+    svr2011::dlss::Probe(DlssHost(r), nullptr);
+#endif
   if (REXCVAR_GET(native_record_thread)) {
     r->recorder = std::make_unique<RecordingList>();
     REXLOG_INFO("native renderer: GPU commands recorded on a second thread");
@@ -1384,13 +1635,56 @@ bool Initialize() {
   {
     std::error_code ec;
     if (!ShaderExists("present.vs")) {
-      REXLOG_ERROR("native renderer: its shaders are missing ({} has no present.vs{}) - reinstall "
-                   "with the launcher to get the native_shaders folder",
-                   ShaderDirectory().string(), backend::ShaderExtension());
-      Fail("its shaders are missing - reinstall the game");
+      // (what is there: a missing folder, an empty one or one without the pack tells copying apart from
+      // something removing files - a 2.1.3 player had the game in Pictures and no pack)
+      auto utf8 = [](const std::filesystem::path& p) {  // (string() throws on names outside the code page)
+        const auto u = p.u8string();
+        return std::string(u.begin(), u.end());
+      };
+      const std::filesystem::path dir = ShaderDirectory();
+      const std::filesystem::path pack = dir / (std::string("shaders") + backend::ShaderExtension() + ".pak");
+      uint32_t files = 0;
+      for (const auto& e : std::filesystem::directory_iterator(dir, ec)) files += e.is_regular_file() ? 1 : 0;
+      const bool pack_there = std::filesystem::exists(pack, ec);
+      REXLOG_ERROR("native renderer: its shaders are missing ({} has no present.vs{}; folder {}, {} files, {} {}) - "
+                   "reinstall with the launcher to get the native_shaders folder",
+                   utf8(dir), backend::ShaderExtension(), std::filesystem::exists(dir, ec) ? "there" : "missing",
+                   files, utf8(pack.filename()),
+                   pack_there ? std::to_string(std::filesystem::file_size(pack, ec)) + " bytes (unreadable)"
+                              : std::string("missing"));
+      std::string reason = "its shaders are missing (" + utf8(dir) + ")";
+#ifdef _WIN32
+      // A game folder in the user's Pictures / Documents / Desktop or OneDrive: Windows Controlled folder access
+      // blocks programs writing there and OneDrive can keep files online-only or move them.
+      std::string lower = utf8(rex::filesystem::GetExecutableFolder());
+      for (char& c : lower) c = char(std::tolower(static_cast<unsigned char>(c)));
+      for (const char* place : {"\\pictures", "\\documents", "\\desktop", "\\onedrive"}) {
+        if (lower.find(place) != std::string::npos) {
+          reason += " - the game is in " + utf8(rex::filesystem::GetExecutableFolder()) +
+                    ", where Windows Controlled folder access or OneDrive can block or remove its files";
+          break;
+        }
+      }
+#endif
+      Fail(reason.c_str());
     }
   }
   return true;
+}
+
+// The device lost: in the first minute on the API gpu_backend "any" picked (a 2.1.8 report: GeForce GT 710, driver
+// 456.71, Direct3D 12 removed - DXGI_ERROR_DRIVER_INTERNAL_ERROR - before the first frame, every start), the next
+// start uses the next one (gpu_probe.h), and the message says so.
+std::string DeviceLostReason(Renderer* r) {
+  std::string reason = "the GPU stopped (device lost)";
+  if (r->frames < 3600) {
+    if (const std::string next = svr2011::AvoidPickedGraphicsApi(fmt::format("device lost at frame {}", r->frames));
+        !next.empty()) {
+      reason += " - restart the game: it will use " + next + " on this GPU; updating the graphics driver can also help";
+      REXLOG_WARN("native renderer: the next start uses {} (gpu_backend any)", next);
+    }
+  }
+  return reason;
 }
 
 // The GPU faulted (device removed): logs why (and the faulting allocation,
@@ -1398,7 +1692,7 @@ bool Initialize() {
 // the run.
 void ReportDeviceRemoved(Renderer* r) {
   backend::ReportDeviceLost(r->device.get());
-  Fail("the GPU stopped (device lost)");
+  Fail(DeviceLostReason(r).c_str());
 }
 
 // Waits (CPU) for frame slot `slot`'s last submission. A GPU that stops
@@ -1417,7 +1711,7 @@ bool WaitForFrame(Renderer* r, uint32_t slot, const char* what) {
   REXLOG_ERROR("native renderer: GPU did not finish ({}) in {} ms{}", what, kGpuTimeoutMs,
                lost ? " - device lost" : "");
   if (lost) backend::ReportDeviceLost(r->device.get());
-  Fail(lost ? "the GPU stopped (device lost)" : "the GPU stopped answering");
+  Fail(lost ? DeviceLostReason(r).c_str() : "the GPU stopped answering");
   // Releases the emulator's waits for the frames in flight (each slot's).
   for (auto& fence : r->fences) backend::ReleaseFence(fence.get());
   return false;
@@ -1483,12 +1777,105 @@ textures::Context TextureContext(Renderer* r) {
 // 16:9 area) and the render scale is the smallest that covers them - twice
 // over with anti-aliasing (supersampling, averaged down by Present), at
 // most 4x. A change rebuilds the scaled resources once the GPU is idle.
+// [svr2011] Render scales above 4 (5K / 8K screens): the largest scaled
+// target must stay within 16384 a side (D3D11 / D3D12 / Vulkan alike), and
+// the scaled targets' memory within half the GPU's own memory.
+constexpr uint32_t kMaxRenderScale = 8;
+constexpr float kMaxTargetSide = 16384.0f;
+// (bytes a scene pixel costs at a scale: the scene's colour and depth
+// targets, their resolve copies and the frame images - measured: see the
+// 8K commit)
+constexpr uint64_t kBytesPerScenePixel = 48;
+
+// The GPU's own memory (the largest hardware adapter's; 0: unknown - no guard).
+uint64_t VideoMemoryBytes() {
+#if defined(_WIN32)
+  static const uint64_t bytes = [] {
+    uint64_t best = 0;
+    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    using Create = HRESULT(WINAPI*)(REFIID, void**);
+    auto create = dxgi ? reinterpret_cast<Create>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    IDXGIFactory1* factory = nullptr;
+    if (create && SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
+      IDXGIAdapter1* adapter = nullptr;
+      for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+          best = std::max<uint64_t>(best, desc.DedicatedVideoMemory);
+        adapter->Release();
+      }
+      factory->Release();
+    }
+    return best;
+  }();
+  return bytes;
+#elif defined(__ANDROID__)
+  // (phones: the memory the driver gives the GPU - VK_EXT_memory_budget, shared with the game - at the start)
+  static const uint64_t bytes = [] {
+    uint64_t used = 0, budget = 0;
+    return backend::VideoMemory(&used, &budget) ? budget : uint64_t(0);
+  }();
+  return bytes;
+#else
+  return 0;
+#endif
+}
+
+// The highest scale up to `s` that fits (`why`: what lowered it).
+// [svr2011] Phones (supersampling above the screen): the GPU's own image limit
+// (Mali / Adreno: 8192-16384) and a quarter of the GPU memory budget - the
+// game's own textures and buffers share it - from 2x up.
+uint32_t FitRenderScale(uint32_t s, float wide, float tall, const char*& why) {
+  const float tw = float(kWidth) * wide, th = float(kHeight) * tall;
+  float side = kMaxTargetSide;
+  if (const uint32_t gpu_side = backend::VulkanMaxImageSide()) side = std::min(side, float(gpu_side));
+  while (s > 1 && (tw * float(s) > side || th * float(s) > side)) --s, why = "the GPU's texture size limit";
+  if (s > g_memory_scale_cap) s = g_memory_scale_cap, why = "video memory full";
+#if defined(__ANDROID__)
+  constexpr uint32_t kMemoryFrom = 1, kShare = 4;
+#else
+  constexpr uint32_t kMemoryFrom = 4, kShare = 2;
+#endif
+  if (const uint64_t vram = VideoMemoryBytes())
+    while (s > kMemoryFrom && uint64_t(tw * float(s)) * uint64_t(th * float(s)) * kBytesPerScenePixel > vram / kShare)
+      --s, why = "video memory";
+  return s;
+}
+
+// A target or the frame images couldn't be made (out of memory - a 2.1.8 report, GeForce GT 710: the 2x targets of
+// a 1366x768 window, then a crash): above 1x the next frame lowers the render scale a step and makes them again; the
+// frame images at 1x: nothing can be shown - the message says why instead of a crash.
+void OutOfVideoMemory(Renderer* r, const char* what) {
+  if (g_failed) return;
+  if (g_scale > 1) {
+    if (g_memory_scale_cap < g_scale) return;  // (lowered already: the next frame)
+    g_memory_scale_cap = g_scale - 1;
+    REXLOG_WARN("native renderer: {} could not be made at render scale {}x (out of memory; video memory {} MB) - "
+                "lowered to {}x", what, g_scale, VideoMemoryBytes() >> 20, g_memory_scale_cap);
+    return;
+  }
+  if (std::strcmp(what, "the frame images") != 0) return;  // (a target at 1x: its draws skipped, as before)
+  Fail(fmt::format("not enough memory for the frame images on {} ({} MB video memory) - close other programs, play "
+                   "in a smaller window, set texture quality to low or update the graphics driver",
+                   r->device->getDescription().name, VideoMemoryBytes() >> 20)
+           .c_str());
+}
+
 void ApplyOutputSettings(Renderer* r) {
   uint32_t win_w = kWidth, win_h = kHeight;
   if (g_window_size) {
     const auto [w, h] = g_window_size();
     if (w >= 64 && h >= 64) win_w = w, win_h = h;
   }
+  // (test: SVR2011_TEST_OUTPUT_SIZE=7680x4320 - render for a window that size
+  // on any screen: Windows keeps a window within about the desktop's size)
+  static const std::pair<uint32_t, uint32_t> test_size = [] {
+    unsigned w = 0, h = 0;
+    const char* v = std::getenv("SVR2011_TEST_OUTPUT_SIZE");
+    return v && std::sscanf(v, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64 ? std::pair<uint32_t, uint32_t>{w, h}
+                                                                         : std::pair<uint32_t, uint32_t>{0, 0};
+  }();
+  if (test_size.first) win_w = test_size.first, win_h = test_size.second;
   static bool widescreen = REXCVAR_GET(native_widescreen);
   // A match on a window wider than 16:9: as wide as the window.
   float wide = 1.0f;
@@ -1502,6 +1889,12 @@ void ApplyOutputSettings(Renderer* r) {
   if (out_h > win_h) out_h = win_h, out_w = win_h * 16 / 9;
   if (wide > 1.0f) out_h = win_h, out_w = std::min(win_w, uint32_t(std::lround(win_h * kAspect16x9 * wide)));
   if (tall > 1.0f) out_w = win_w, out_h = std::min(win_h, uint32_t(std::lround(win_w / kAspect16x9 * tall)));
+  // (the frame images too stay within 16384 a side: a bigger window - wider
+  // than any screen - gets them that size, the same shape, scaled up)
+  if (float(out_w) > kMaxTargetSide || float(out_h) > kMaxTargetSide) {
+    const float k = kMaxTargetSide / float(std::max(out_w, out_h));
+    out_w = uint32_t(float(out_w) * k), out_h = uint32_t(float(out_h) * k);
+  }
   out_w = std::max(out_w & ~1u, 64u);
   out_h = std::max(out_h & ~1u, 36u);
   // Anti-aliasing: native_aa, else the older on / off setting (on = 2x).
@@ -1517,8 +1910,17 @@ void ApplyOutputSettings(Renderer* r) {
   (void)shadows_once;
   static float res = float(REXCVAR_GET(native_render_scale));
   static int32_t scene_height = REXCVAR_GET(native_scene_height);
+  static bool fsr = REXCVAR_GET(native_upscale) != "off";
+  static bool fsr2 = REXCVAR_GET(native_upscale) == "fsr2" || REXCVAR_GET(native_upscale) == "dlss";
+  static bool dlss = REXCVAR_GET(native_upscale) == "dlss";
+  static int32_t fsr_quality = REXCVAR_GET(native_upscale_quality);
   static uint64_t aa_checked = 0;
   if (r->frames >= aa_checked + 30) {  // a cvar query isn't free: twice a second
+    fsr = REXCVAR_GET(native_upscale) != "off";
+    fsr2 = REXCVAR_GET(native_upscale) == "fsr2" || REXCVAR_GET(native_upscale) == "dlss";
+    dlss = REXCVAR_GET(native_upscale) == "dlss";
+    fsr_quality = REXCVAR_GET(native_upscale_quality);
+    g_fsr_sharpness = float(std::clamp(REXCVAR_GET(native_upscale_sharpness), 0.0, 1.0));
     aa = aa_level();
     max_scale = REXCVAR_GET(native_max_scale);
     effects = REXCVAR_GET(native_scale_effects);
@@ -1543,20 +1945,52 @@ void ApplyOutputSettings(Renderer* r) {
     }
   }
   const uint32_t need = out_h * aa;
-  const uint32_t limit = d3d11_auto ? 1u : uint32_t(std::clamp<int32_t>(max_scale, 1, 4));
+  // (4 was AUTO before 8K: the same now. Above 4 only for the window's own
+  // lines - a 5K / 8K screen - never more supersampling than before.)
+  const int32_t asked = max_scale == 4 ? int32_t(kMaxRenderScale) : max_scale;
+  const uint32_t window_scale = (out_h + kHeight - 1) / kHeight;
+  const uint32_t limit = d3d11_auto ? 1u
+                                    : std::min<uint32_t>(uint32_t(std::clamp<int32_t>(asked, 1, int32_t(kMaxRenderScale))),
+                                                         std::max<uint32_t>(4u, window_scale));
   uint32_t scale = std::clamp<uint32_t>((need + kHeight - 1) / kHeight, 1, limit);
   const bool wide_changed = std::fabs(wide - g_wide) > 0.002f || std::fabs(tall - g_tall) > 0.002f;
   res = std::clamp(res, 0.25f, 1.0f);
   if (scale > 1) res = 1.0f;  // (only below the Xbox 360's own resolution)
-  // A chosen height (1080P): the 720p step above it, the scene scaled down to it.
-  if (scene_height > 0) {
-    const uint32_t h = uint32_t(std::clamp<int32_t>(scene_height, int32_t(kHeight / 4), int32_t(kHeight * 4)));
+  // FSR 1: the scene at the quality's share of the window's height (the 720p step above it, scaled down to it), no
+  // supersampling; Present scales it up (EASU) and sharpens it (RCAS).
+  g_fsr = false;
+  if (fsr) {
+    constexpr float kShare[4] = {1.0f / 1.3f, 1.0f / 1.5f, 1.0f / 1.7f, 1.0f / 2.0f};
+    const uint32_t h = std::clamp<uint32_t>(uint32_t(std::lround(float(out_h) * kShare[std::clamp(fsr_quality, 0, 3)])),
+                                            kHeight / 4, kHeight * kMaxRenderScale);
+    scale = std::min<uint32_t>((h + kHeight - 1) / kHeight, kMaxRenderScale);
+    res = std::clamp(float(h) / float(kHeight * scale), 0.25f, 1.0f);
+    g_fsr = h < out_h;
+  } else if (scene_height > 0) {  // A chosen height (1080P): the 720p step above it, the scene scaled down to it.
+    // (anti-aliasing multiplies the chosen height - 1080P at 2X draws 2160 lines and Present averages them down -
+    // up to AUTO's most, 4x or the window's own; it used to be ignored here: 900P / 1080P / 2880P had no AA at all)
+    const uint64_t with_aa = uint64_t(scene_height) * aa;
+    const uint64_t cap = std::max<uint64_t>(uint64_t(kHeight) * std::max<uint32_t>(4u, window_scale), uint64_t(scene_height));
+    const uint32_t h = uint32_t(std::clamp<uint64_t>(std::min(with_aa, cap), kHeight / 4, uint64_t(kHeight) * kMaxRenderScale));
     scale = (h + kHeight - 1) / kHeight;
     res = std::clamp(float(h) / float(kHeight * scale), 0.25f, 1.0f);
   }
+  // Large scales (5K / 8K): what the GPU can hold; the window is filled by
+  // scaling the scene up (or FSR, when it's on).
+  const char* fit_why = nullptr;
+  const uint32_t wanted_scale = scale;
+  scale = FitRenderScale(scale, wide, tall, fit_why);
+  if (scale != wanted_scale) res = 1.0f;  // (the whole of the lower scale)
+  // (FSR 2: Direct3D 12 / Vulkan - compute; not with the commands recorded on a second thread)
+#if SVR2011_FSR2
+  g_fsr2 = fsr2 && g_fsr && !SlotTables() && !r->recorder && !r->fsr2_failed;
+#if SVR2011_DLSS
+  g_dlss = g_fsr2 && dlss && !r->dlss_failed;
+#endif
+#endif
   const bool res_changed = std::fabs(res - g_res) > 0.001f;
   if (scale == g_scale && effects == g_scale_effects && out_w == g_out_w && out_h == g_out_h &&
-      !wide_changed && !res_changed) {
+      !wide_changed && !res_changed && r->outputs[0]) {
     return;
   }
 
@@ -1578,14 +2012,19 @@ void ApplyOutputSettings(Renderer* r) {
     SetCameraAspect(kAspect16x9 * wide / tall);
     g_fov_scale = tall;
   }
-  if (out_w != g_out_w || out_h != g_out_h) {
+  if (out_w != g_out_w || out_h != g_out_h || !r->outputs[0]) {
     g_out_w = out_w;
     g_out_h = out_h;
-    CreateOutputs(r);
+    if (!CreateOutputs(r)) OutOfVideoMemory(r, "the frame images");
   }
   r->list_state = {};
-  REXLOG_INFO("native renderer: output {}x{}, render scale {}x{}{}{}{}", g_out_w, g_out_h, g_scale,
+  if (fit_why)
+    REXLOG_INFO("native renderer: render scale {} instead of {} for {}x{} ({}; video memory {} MB)", scale,
+                wanted_scale, g_out_w, g_out_h, fit_why, VideoMemoryBytes() >> 20);
+  REXLOG_INFO("native renderer: output {}x{}, render scale {}x{}{}{}{}{}", g_out_w, g_out_h, g_scale,
               g_res < 1.0f ? fmt::format(" (scene at {:.0f}%)", g_res * 100) : std::string(),
+              g_fsr ? fmt::format(", FSR {} from {}p", g_fsr2 ? 2 : 1, uint32_t(std::lround(kHeight * g_scale * g_res)))
+                    : std::string(),
               aa > 1 ? fmt::format(" (anti-aliasing {}x)", aa) : std::string(), g_scale_effects ? "" : ", effects unscaled",
               g_wide > 1.0f   ? fmt::format(", wide {:.3f} (aspect {:.3f})", g_wide, kAspect16x9 * g_wide)
               : g_tall > 1.0f ? fmt::format(", tall {:.3f} (aspect {:.3f})", g_tall, kAspect16x9 / g_tall)
@@ -1620,7 +2059,7 @@ bool BeginFrame(Renderer* r) {
   if (r->frame_open) return true;
   if (g_main) ApplyTextureQuality(r);
   if (g_main) ApplyOutputSettings(r);
-  if (g_failed) return false;
+  if (g_failed || !r->outputs[0]) return false;  // (no frame images: out of memory - made again at the next frame)
   r->back_index = uint32_t(r->frames % kFrames);
   r->output_index = uint32_t(r->frames % kOutputs);
   r->frame_begin = std::chrono::steady_clock::now();
@@ -1661,10 +2100,18 @@ bool BeginFrame(Renderer* r) {
 
 uint32_t g_write_backs = 0, g_write_back_w = 0, g_write_back_h = 0;  // (native perf line)
 double g_write_back_ms = 0;
+std::mutex g_costs_mutex;  // (LastFrameCosts: the overlay's)
+FrameCosts g_costs;
+double g_resident_mb = 0;  // (the textures' host memory at the last 5 s perf log)
 
 int BlankedSlot(Renderer* r);
 
+std::atomic<uint32_t> g_last_draws{0};
+std::atomic<uint64_t> g_frames_shown{0};
+
 void UpdateTitle(Renderer* r) {
+  g_last_draws = r->frame_stats.draws;
+  ++g_frames_shown;
   ++r->stat_frames;
   ++r->perf_frames;
   r->perf_draws += r->frame_stats.draws;
@@ -1681,6 +2128,24 @@ void UpdateTitle(Renderer* r) {
   const auto now = std::chrono::steady_clock::now();
   const double secs = std::chrono::duration<double>(now - r->stat_start).count();
   if (secs < 0.5) return;
+  {  // (the overlay's per-frame costs: the deltas since the last half second, the 5 s totals still counting)
+    static double last_draw = 0, last_wait = 0, last_submit = 0, last_draws = 0;
+    static uint32_t last_frames = 0;
+    if (r->perf_frames < last_frames) last_draw = last_wait = last_submit = last_draws = 0, last_frames = 0;  // (reset)
+    if (const uint32_t n = r->perf_frames - last_frames) {
+      FrameCosts c;
+      c.draw_ms = (r->perf_draw_ms - last_draw) / n, c.gpu_wait_ms = (r->perf_wait_ms - last_wait) / n;
+      c.submit_ms = (r->perf_submit_ms - last_submit) / n, c.draws = (double(r->perf_draws) - last_draws) / n;
+      c.texture_mb = textures::ResidentBytes() / 1048576.0;
+      c.textures = textures::ResidentCount();
+      for (const auto& [k, t] : r->color_targets) c.targets_mb += double(t.host_w) * t.host_h * 4 / 1048576.0;
+      for (const auto& [k, t] : r->depth_targets) c.targets_mb += double(t.host_w) * t.host_h * 4 / 1048576.0;
+      std::lock_guard lock(g_costs_mutex);
+      g_costs = c;
+    }
+    last_draw = r->perf_draw_ms, last_wait = r->perf_wait_ms, last_submit = r->perf_submit_ms;
+    last_draws = double(r->perf_draws), last_frames = r->perf_frames;
+  }
   const double psecs = std::chrono::duration<double>(now - r->perf_start).count();
   if (psecs >= 5.0 && r->perf_frames) {
     const double f = r->perf_frames;
@@ -1694,10 +2159,11 @@ void UpdateTitle(Renderer* r) {
     if (SlotTables()) {
       auto* d = static_cast<plume::D3D11Device*>(r->device.get());
       REXLOG_INFO("native perf: D3D11 per frame: uploads {:.2f} ms ({:.1f} MB), replay {:.2f} ms ({:.0f} draws), "
-                  "context lock wait {:.2f} ms, flush {:.2f} ms",
+                  "context lock wait {:.2f} ms, flush {:.2f} ms; frame waits {} ({} without the context lock)",
                   d->statUploadNs.exchange(0) / f / 1e6, d->statUploadBytes.exchange(0) / f / 1e6,
                   d->statReplayNs.exchange(0) / f / 1e6, d->statDraws.exchange(0) / f,
-                  d->statLockWaitNs.exchange(0) / f / 1e6, d->statFlushNs.exchange(0) / f / 1e6);
+                  d->statLockWaitNs.exchange(0) / f / 1e6, d->statFlushNs.exchange(0) / f / 1e6,
+                  d->statFenceWaits.exchange(0), d->statFenceLockFree.exchange(0));
     }
 #endif
     REXLOG_INFO("native perf: {:.1f} fps, per frame: draw {:.2f} ms, gpu wait {:.2f} ms, submit {:.2f} ms, "
@@ -1712,6 +2178,7 @@ void UpdateTitle(Renderer* r) {
     }
     {
       const textures::Stats ts = textures::TakePerf();
+      g_resident_mb = ts.resident_bytes / 1048576.0;
       REXLOG_INFO("native perf: textures: {} uploads ({:.1f} MB, {:.1f} ms, converting {:.1f} ms) in {:.1f} s; "
                   "{} resident ({:.1f} MB, {} with mip levels left out), table slots {} of {}",
                   ts.uploads_total, ts.upload_bytes / 1048576.0, ts.upload_ms, ts.convert_ms, psecs,
@@ -1738,6 +2205,17 @@ void UpdateTitle(Renderer* r) {
         g_vb_stats.clear();
       }
       r->perf_const_uploads = r->perf_const_reused = 0;
+      if (g_const_times && g_ct_draws) {
+        REXLOG_INFO("native perf: constants per frame: shared {:.3f} ms (texture lookups {:.3f}, sets {:.3f}), "
+                    "gpu constants {:.3f} ms; {:.2f} textures a draw ({:.0f} draws); a slot's texture as its last "
+                    "draw's {:.0f}%; kept answers {:.0f}%",
+                    g_ct_shared_ns / f / 1e6, g_ct_tex_ns / f / 1e6, g_ct_sets_ns / f / 1e6, g_ct_gpu_ns / f / 1e6,
+                    double(g_ct_textures) / double(g_ct_draws), g_ct_draws / f,
+                    g_ct_textures ? 100.0 * g_ct_tex_same / g_ct_textures : 0.0,
+                    g_ct_textures ? 100.0 * g_ct_memo_hits / g_ct_textures : 0.0);
+      }
+      g_ct_shared_ns = g_ct_tex_ns = g_ct_sets_ns = g_ct_gpu_ns = g_ct_textures = g_ct_draws = 0;
+      g_ct_tex_same = g_ct_memo_hits = 0;
     }
     g_pipeline_ms = 0;
     r->perf_draw_ms = r->perf_wait_ms = r->perf_span_ms = r->perf_submit_ms = 0;
@@ -1833,9 +2311,10 @@ ColorTarget* GetColorTarget(Renderer* r, uint32_t base, uint32_t pitch, uint32_t
   d.committed = true;
   const plume::RenderClearValue cv = plume::RenderClearValue::Color(plume::RenderColor(0, 0, 0, 0), f.rtv);
   d.optimizedClearValue = &cv;
-  std::shared_ptr<plume::RenderTexture> resource = r->device->createTexture(d);
+  std::shared_ptr<plume::RenderTexture> resource = TryCreateTexture(r, d);
   if (!resource) {
-    REXLOG_ERROR("native renderer: could not create a render target");
+    if (TargetFailureLogged()) REXLOG_ERROR("native renderer: could not create a render target ({}x{})", host_w, host_h);
+    OutOfVideoMemory(r, "a render target");
     return nullptr;
   }
   ColorTarget& t = r->color_targets[key];
@@ -1872,9 +2351,10 @@ DepthTarget* GetDepthTarget(Renderer* r, uint32_t base, uint32_t pitch, uint32_t
   const plume::RenderClearValue cv =
       plume::RenderClearValue::Depth(plume::RenderDepth(1.0f), backend::DepthFormat());
   d.optimizedClearValue = &cv;
-  std::shared_ptr<plume::RenderTexture> resource = r->device->createTexture(d);
+  std::shared_ptr<plume::RenderTexture> resource = TryCreateTexture(r, d);
   if (!resource) {
-    REXLOG_ERROR("native renderer: could not create a depth target");
+    if (TargetFailureLogged()) REXLOG_ERROR("native renderer: could not create a depth target ({}x{})", host_w, host_h);
+    OutOfVideoMemory(r, "a depth target");
     return nullptr;
   }
   DepthTarget& t = r->depth_targets[key];
@@ -2713,6 +3193,7 @@ RenderBufferReference Constants(Renderer* r, uint32_t device_offset, uint32_t by
 // the upload; the constants loaded from memory for this draw (so far only
 // the shaders' literal c252-c255) take precedence.
 RenderBufferReference GpuConstants(Renderer* r, uint32_t first, uint32_t bytes) {
+  ConstTimer timer(g_ct_gpu_ns);
   const uint32_t count = bytes / 16;
   const uint8_t* mirror = Device() + 0x780 + 16 * first;
   bool loaded_here = false;
@@ -2845,9 +3326,24 @@ uint32_t SlotSwizzle(Renderer* r, uint32_t index) {
 #endif
 }
 
+// Each shader stage's fetch slots' last answers (SharedConstants): most draws sample what the draw before them did
+// in the same slot (80% of the lookups in a 6-man match), and while the frame and textures::Generation stay the same
+// fetch constants get the same texture and sampler - the lookups (a key hash, two maps, the recheck rules) are
+// skipped. Debug: SVR2011_NATIVE_NO_SLOT_MEMO=1 looks every one up.
+struct SlotMemo {
+  uint32_t fetch[6] = {};
+  uint32_t dimension = UINT32_MAX;
+  uint64_t frame = ~0ull, generation = 0;
+  uint32_t srv = UINT32_MAX, sampler = UINT32_MAX;  // (sampler: UINT32_MAX until asked)
+};
+SlotMemo g_slot_memo[2][32];
+const bool g_slot_memo_on = std::getenv("SVR2011_NATIVE_NO_SLOT_MEMO") == nullptr;
+
 // `ndc`: g_NdcScale (x, y) and g_HalfPixelOffset (the NDC offset, z, w).
 RenderBufferReference SharedConstants(Renderer* r, bool alpha_test, const Shader* vs,
                                       const Shader* ps, const float ndc[4]) {
+  ConstTimer timer(g_ct_shared_ns);
+  ++g_ct_draws;
   auto [cpu, gpu] = Allocate(r, kSharedConstantsBytes);
   if (!cpu) return {};
   auto* u = reinterpret_cast<uint32_t*>(cpu);
@@ -2870,11 +3366,19 @@ RenderBufferReference SharedConstants(Renderer* r, bool alpha_test, const Shader
   }
   // The textures the shaders sample, from the fetch constants.
   const textures::Context& ctx = r->texture_context;
+  {
+  ConstTimer tex_timer(g_ct_tex_ns);
   for (const Shader* s : {vs, ps}) {
     for (const auto& [slot, dimension] : s->textures) {
+      ++g_ct_textures;
       const uint8_t* f = Device() + guest::RegisterOffset(0x4800) + slot * 24;
       uint32_t fetch[6];
       for (int k = 0; k < 6; ++k) fetch[k] = Be32(f + 4 * k);
+      if (g_const_times) {
+        uint32_t* lf = g_ct_last_fetch[s == ps ? 1 : 0][slot & 31];
+        if (!std::memcmp(lf, fetch, sizeof(fetch))) ++g_ct_tex_same;
+        std::memcpy(lf, fetch, sizeof(fetch));
+      }
       {
         // debug: SVR2011_NATIVE_BLANK_CYCLE slot gets the placeholder, or with
         // SVR2011_NATIVE_CYCLE_ALPHA=1 its alpha forced to 1 (=2: every other
@@ -2897,13 +3401,31 @@ RenderBufferReference SharedConstants(Renderer* r, bool alpha_test, const Shader
             fetch[3] = (fetch[3] & ~(7u << 10)) | (5u << 10);
         }
       }
-      const uint32_t srv = textures::Texture(ctx, fetch, dimension);
+      SlotMemo& memo = g_slot_memo[s == ps ? 1 : 0][slot & 31];
+      uint32_t srv;
+      if (g_slot_memo_on && memo.frame == ctx.frame && memo.dimension == dimension &&
+          memo.generation == textures::Generation() && !std::memcmp(memo.fetch, fetch, sizeof(fetch))) {
+        srv = memo.srv;
+        ++g_ct_memo_hits;
+      } else {
+        srv = textures::Texture(ctx, fetch, dimension);
+        std::memcpy(memo.fetch, fetch, sizeof(fetch));
+        memo.dimension = dimension;
+        memo.frame = ctx.frame;
+        memo.generation = textures::Generation();  // (after the lookup: its own upload counted)
+        memo.srv = srv;
+        memo.sampler = UINT32_MAX;
+      }
+      auto sampler_of = [&] {
+        if (memo.sampler == UINT32_MAX) memo.sampler = textures::Sampler(ctx, fetch);
+        return memo.sampler;
+      };
       if (slots) {
         if (dimension > 2 || slot >= kSlotCount[dimension] || srv == UINT32_MAX) continue;
         const uint32_t index = r->texture_base[dimension] + srv;
         places[0][kSlotFirst[dimension] + slot] = index;
         u[(dimension * 8 + slot / 4) * 4 + slot % 4] = SlotSwizzle(r, index);
-        places[1][SlotSampler(slot) & 15] = textures::Sampler(ctx, fetch);
+        places[1][SlotSampler(slot) & 15] = sampler_of();
         continue;
       }
       if (compact) {
@@ -2918,7 +3440,7 @@ RenderBufferReference SharedConstants(Renderer* r, bool alpha_test, const Shader
             srv == UINT32_MAX ? UINT32_MAX : r->texture_base[dimension] + srv;
         u[(dimension * 8 + slot / 4) * 4 + slot % 4] = place;
         if (srv == UINT32_MAX) continue;
-        const uint32_t sampler = textures::Sampler(ctx, fetch);
+        const uint32_t sampler = sampler_of();
         uint32_t s = 0;
         while (s < samplers && places[1][s] != sampler) ++s;  // (shared)
         if (s == samplers && samplers < kCompactSamplers) places[1][samplers++] = sampler;
@@ -2927,10 +3449,12 @@ RenderBufferReference SharedConstants(Renderer* r, bool alpha_test, const Shader
       }
       if (srv == UINT32_MAX) continue;
       u[(dimension * 8 + slot / 4) * 4 + slot % 4] = srv;
-      u[(3 * 8 + slot / 4) * 4 + slot % 4] = textures::Sampler(ctx, fetch);
+      u[(3 * 8 + slot / 4) * 4 + slot % 4] = sampler_of();
     }
   }
+  }
   if (compact || slots) {
+    ConstTimer sets_timer(g_ct_sets_ns);
     r->draw_sets[0] = CompactSet(r, 0, places[0]);
     r->draw_sets[1] = CompactSet(r, 1, places[1]);
   }
@@ -3101,6 +3625,302 @@ bool FlatPixels(const std::vector<Element>& decl, const PendingUP* up, bool inde
 }
 
 // `up`: a DrawVerticesUP (stream 0 is the game's vertex data, not a buffer).
+#if SVR2011_FSR2
+// FSR 2's mask values (reactive) for the HUD, blended draws, skinned ones and the crowd; composition 1 for all.
+// (Test aid: SVR2011_TEST_FSR2_MASK=<hud>,<blended>,<skinned>,<crowd>; 0,0,0,0 = no masks.)
+float g_fsr2_mask_values[4] = {1.0f, 0.5f, 0.35f, 0.5f};
+bool g_fsr2_masks_off = false;
+
+// This draw's frame noted (the list started again in a new frame); false without the mask shader.
+bool Fsr2MaskWanted(Renderer* r) {
+  static const bool read = [] {
+    if (const char* v = std::getenv("SVR2011_TEST_FSR2_MASK")) {
+      std::sscanf(v, "%f,%f,%f,%f", &g_fsr2_mask_values[0], &g_fsr2_mask_values[1], &g_fsr2_mask_values[2],
+                  &g_fsr2_mask_values[3]);
+      g_fsr2_masks_off = g_fsr2_mask_values[0] <= 0 && g_fsr2_mask_values[1] <= 0 && g_fsr2_mask_values[2] <= 0 &&
+                         g_fsr2_mask_values[3] <= 0;
+    }
+    return true;
+  }();
+  (void)read;
+  if (g_fsr2_masks_off) return false;
+  if (r->fsr2_mask_code.empty()) {
+    r->fsr2_mask_code = ReadShader("fsr2_mask.ps");
+    if (r->fsr2_mask_code.empty()) {
+      REXLOG_WARN("native renderer: fsr2_mask.ps missing - FSR 2 without masks");
+      g_fsr2_masks_off = true;
+      return false;
+    }
+  }
+  if (r->fsr2_mask_draws_frame != r->frames) {
+    r->fsr2_mask_draws.clear();
+    r->fsr2_mask_after_3d = 0;
+    r->fsr2_mask_draws_frame = r->frames;
+  }
+  return true;
+}
+
+// The mask pipeline of a draw: its vertex shader and input layout, fsr2_mask.ps into the two R8 targets (the
+// largest value kept), depth tested as the draw (less-equal: drawn again over its own depth) without writing.
+const plume::RenderPipeline* Fsr2MaskPipeline(Renderer* r, Shader* vs, int vs_variant,
+                                              const std::vector<plume::RenderInputElement>& layout,
+                                              const plume::RenderInputSlot* slots, uint32_t layout_hash,
+                                              plume::RenderPrimitiveTopology topology, bool depth_test) {
+  const uint32_t cull = Reg(PA_SU_SC_MODE_CNTL) & 7;
+  const uint64_t parts[3] = {vs->hash,
+                             uint64_t(vs_variant) | uint64_t(topology) << 8 | uint64_t(cull) << 16 |
+                                 uint64_t(depth_test) << 24,
+                             layout_hash};
+  const uint64_t h = XXH3_64bits(parts, sizeof(parts));
+  auto& slot = r->fsr2_mask_pipelines[h];
+  if (slot) return slot.get();
+  if (!r->fsr2_mask_ps)
+    r->fsr2_mask_ps = r->device->createShader(r->fsr2_mask_code.data(), r->fsr2_mask_code.size(), "main",
+                                              backend::ShaderFormat());
+  plume::RenderGraphicsPipelineDesc d;
+  d.pipelineLayout = r->layout.get();
+  d.vertexShader = Compiled(r, vs, vs_variant);
+  d.pixelShader = r->fsr2_mask_ps.get();
+  for (int t = 0; t < 2; ++t) {
+    plume::RenderBlendDesc& b = d.renderTargetBlend[t];
+    b.blendEnabled = true;
+    b.srcBlend = b.dstBlend = b.srcBlendAlpha = b.dstBlendAlpha = plume::RenderBlend::ONE;
+    b.blendOp = b.blendOpAlpha = plume::RenderBlendOperation::MAX;
+    b.renderTargetWriteMask = uint8_t(plume::RenderColorWriteEnable::ALL);
+    d.renderTargetFormat[t] = RenderFormat::R8_UNORM;
+  }
+  d.renderTargetCount = 2;
+  d.cullMode = (cull & 1)   ? plume::RenderCullMode::FRONT
+               : (cull & 2) ? plume::RenderCullMode::BACK
+                            : plume::RenderCullMode::NONE;
+  d.frontFace = (cull & 4) ? plume::RenderFrontFace::CLOCKWISE : plume::RenderFrontFace::COUNTER_CLOCKWISE;
+  d.depthClipEnabled = true;
+  d.depthEnabled = depth_test;
+  d.depthWriteEnabled = false;
+  d.depthFunction = plume::RenderComparisonFunction::LESS_EQUAL;
+  d.stencilEnabled = false;
+  d.dynamicStencilReferenceEnabled = true;
+  d.dynamicBlendFactorEnabled = true;
+  d.inputElements = layout.data();
+  d.inputElementsCount = uint32_t(layout.size());
+  d.inputSlots = slots;
+  d.inputSlotsCount = 16;
+  d.primitiveTopology = topology;
+  d.depthTargetFormat = backend::DepthFormat();
+  if (d.vertexShader && d.pixelShader) slot = r->device->createGraphicsPipeline(d);
+  if (slot && !backend::PipelineCreated(slot.get())) slot.reset();
+  if (!slot) {
+    static int logged = 0;
+    if (logged++ < 3) REXLOG_WARN("native renderer: FSR 2 mask pipeline for vs {:016X} failed", vs->hash);
+  }
+  return slot.get();
+}
+
+// The frame's noted mask draws drawn again over the scene's depth (the scene being resolved: `depth`, `w` x `h`)
+// into the reactive and composition targets.
+void DrawFsr2Masks(Renderer* r, DepthTarget* depth, uint32_t w, uint32_t h) {
+  if (r->fsr2_mask_draws_frame != r->frames || r->fsr2_mask_draws.empty() || !depth || !depth->resource) return;
+  auto* list = r->list;
+  if (!r->fsr2_reactive || r->fsr2_mask_w != w || r->fsr2_mask_h != h) {
+    for (auto* t : {&r->fsr2_reactive, &r->fsr2_composition})
+      if (*t) Retire(r, std::move(*t));
+    r->fsr2_mask_framebuffers.clear();  // (they name the old textures)
+    for (auto* t : {&r->fsr2_reactive, &r->fsr2_composition}) {
+      *t = r->device->createTexture(plume::RenderTextureDesc::Texture2D(
+          w, h, 1, RenderFormat::R8_UNORM, plume::RenderTextureFlag::RENDER_TARGET));
+      if (!*t) return;
+    }
+    r->fsr2_reactive->setName("FSR 2 reactive");
+    r->fsr2_composition->setName("FSR 2 composition");
+    r->fsr2_reactive_layout = r->fsr2_composition_layout = RenderTextureLayout::UNKNOWN;
+    r->fsr2_mask_w = w, r->fsr2_mask_h = h;
+  }
+  plume::RenderFramebuffer* fb = nullptr;
+  for (auto& f : r->fsr2_mask_framebuffers)
+    if (f.depth == depth->resource) fb = f.framebuffer.get();
+  if (!fb) {
+    const plume::RenderTexture* colors[2] = {r->fsr2_reactive.get(), r->fsr2_composition.get()};
+    auto made = r->device->createFramebuffer(plume::RenderFramebufferDesc(colors, 2, depth->resource.get()));
+    if (!made) return;
+    fb = made.get();
+    if (r->fsr2_mask_framebuffers.size() > 4) r->fsr2_mask_framebuffers.erase(r->fsr2_mask_framebuffers.begin());
+    r->fsr2_mask_framebuffers.push_back({depth->resource, std::move(made)});
+  }
+  Transition(r, r->fsr2_reactive.get(), r->fsr2_reactive_layout, RenderTextureLayout::COLOR_WRITE);
+  Transition(r, r->fsr2_composition.get(), r->fsr2_composition_layout, RenderTextureLayout::COLOR_WRITE);
+  Transition(r, depth->resource.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+  list->setFramebuffer(fb);
+  list->clearColor(0, plume::RenderColor(0, 0, 0, 0));
+  list->clearColor(1, plume::RenderColor(0, 0, 0, 0));
+  list->setGraphicsPipelineLayout(r->layout.get());
+  r->list_state = {};
+  BindTables(r, list);
+  r->list_state.bound = true;
+  for (size_t i = 0; i < r->fsr2_mask_draws.size(); ++i) {
+    const auto& m = r->fsr2_mask_draws[i];
+    if (m.hud && i < r->fsr2_mask_after_3d) continue;  // (a full-screen background, a flare in the scene)
+    list->setPipeline(m.pso);
+    BindConstants(r, m.constants);
+    list->setVertexBuffers(0, m.views, m.view_count, m.slots);
+    list->setViewports(m.viewport);
+    list->setScissors(m.scissor);
+    list->setStencilReference(m.stencil_ref);
+    if (m.indexed) {
+      list->setIndexBuffer(&m.ibv);
+      list->drawIndexedInstanced(m.count, 1, 0, m.base, 0);
+    } else {
+      list->drawInstanced(m.count, 1, m.start, 0);
+    }
+  }
+  Transition(r, r->fsr2_reactive.get(), r->fsr2_reactive_layout, RenderTextureLayout::SHADER_READ);
+  Transition(r, r->fsr2_composition.get(), r->fsr2_composition_layout, RenderTextureLayout::SHADER_READ);
+  r->list_state = {};  // (the next draw binds its own framebuffer, pipeline, buffers)
+  r->fsr2_mask_frame = r->frames;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXLOG_INFO("native renderer: FSR 2 masks: {} draws", r->fsr2_mask_draws.size());
+  }
+}
+
+// The skinned draws' motion pipeline: fsr2_skin.vs with the draw's input layout, fsr2_skin.ps into the motion
+// vectors (RGBA16F), depth tested as the draw (less-equal, no writes); null without the shaders (test aid
+// SVR2011_TEST_FSR2_NO_SKIN: none).
+const plume::RenderPipeline* Fsr2SkinPipeline(Renderer* r, const std::vector<plume::RenderInputElement>& layout,
+                                              const plume::RenderInputSlot* slots, uint32_t layout_hash,
+                                              plume::RenderPrimitiveTopology topology) {
+  static const bool off = EnvFlag("SVR2011_TEST_FSR2_NO_SKIN");
+  if (off || r->fsr2_skin_off) return nullptr;
+  if (!r->fsr2_skin_vs) {
+    r->fsr2_skin_vs_code = ReadShader("fsr2_skin.vs");
+    r->fsr2_skin_ps_code = ReadShader("fsr2_skin.ps");
+    if (r->fsr2_skin_vs_code.empty() || r->fsr2_skin_ps_code.empty()) {
+      REXLOG_WARN("native renderer: fsr2_skin.vs / .ps missing - the wrestlers keep the camera's motion");
+      r->fsr2_skin_off = true;
+      return nullptr;
+    }
+    r->fsr2_skin_vs = r->device->createShader(r->fsr2_skin_vs_code.data(), r->fsr2_skin_vs_code.size(), "main",
+                                              backend::ShaderFormat());
+    r->fsr2_skin_ps = r->device->createShader(r->fsr2_skin_ps_code.data(), r->fsr2_skin_ps_code.size(), "main",
+                                              backend::ShaderFormat());
+    if (!r->fsr2_skin_vs || !r->fsr2_skin_ps) {
+      r->fsr2_skin_off = true;
+      return nullptr;
+    }
+  }
+  const uint32_t cull = Reg(PA_SU_SC_MODE_CNTL) & 7;
+  const uint64_t parts[2] = {uint64_t(topology) << 8 | uint64_t(cull) << 16, layout_hash};
+  const uint64_t h = XXH3_64bits(parts, sizeof(parts));
+  auto& slot = r->fsr2_skin_pipelines[h];
+  if (slot) return slot.get();
+  plume::RenderGraphicsPipelineDesc d;
+  d.pipelineLayout = r->layout.get();
+  d.vertexShader = r->fsr2_skin_vs.get();
+  d.pixelShader = r->fsr2_skin_ps.get();
+  d.renderTargetBlend[0].blendEnabled = false;
+  d.renderTargetBlend[0].renderTargetWriteMask = uint8_t(plume::RenderColorWriteEnable::ALL);
+  d.renderTargetFormat[0] = RenderFormat::R16G16B16A16_FLOAT;
+  d.renderTargetCount = 1;
+  d.cullMode = (cull & 1)   ? plume::RenderCullMode::FRONT
+               : (cull & 2) ? plume::RenderCullMode::BACK
+                            : plume::RenderCullMode::NONE;
+  d.frontFace = (cull & 4) ? plume::RenderFrontFace::CLOCKWISE : plume::RenderFrontFace::COUNTER_CLOCKWISE;
+  d.depthClipEnabled = true;
+  d.depthEnabled = true;
+  d.depthWriteEnabled = false;
+  d.depthFunction = plume::RenderComparisonFunction::LESS_EQUAL;
+  d.stencilEnabled = false;
+  d.dynamicStencilReferenceEnabled = true;
+  d.dynamicBlendFactorEnabled = true;
+  d.inputElements = layout.data();
+  d.inputElementsCount = uint32_t(layout.size());
+  d.inputSlots = slots;
+  d.inputSlotsCount = 16;
+  d.primitiveTopology = topology;
+  d.depthTargetFormat = backend::DepthFormat();
+  slot = r->device->createGraphicsPipeline(d);
+  if (slot && !backend::PipelineCreated(slot.get())) slot.reset();
+  if (!slot) {
+    static int logged = 0;
+    if (logged++ < 3) REXLOG_WARN("native renderer: FSR 2 skinned motion pipeline failed");
+  }
+  return slot.get();
+}
+
+// The skinned draws noted this frame drawn again into the motion vectors with their own motion (where their last
+// frame's bones are known), over the scene's depth (`depth`, `w` x `h`: the motion vectors' size); the camera's
+// motion pass keeps those texels (alpha 1).
+void DrawFsr2SkinMotion(Renderer* r, DepthTarget* depth, uint32_t w, uint32_t h) {
+  if (r->fsr2_mask_draws_frame != r->frames || !depth || !depth->resource || !r->fsr2_motion ||
+      r->fsr2_depth_w != w || r->fsr2_depth_h != h)
+    return;
+  uint32_t drawn = 0;
+  plume::RenderFramebuffer* fb = nullptr;
+  auto* list = r->list;
+  for (const auto& m : r->fsr2_mask_draws) {
+    if (!m.skin_key || !m.skin_pso) continue;
+    const auto now = r->fsr2_skin_now.find(m.skin_key);
+    const auto prev = r->fsr2_skin_prev.find(m.skin_key);
+    if (now == r->fsr2_skin_now.end() || prev == r->fsr2_skin_prev.end()) continue;
+    if (!fb) {
+      for (auto& f : r->fsr2_skin_framebuffers)
+        if (f.depth == depth->resource) fb = f.framebuffer.get();
+      if (!fb) {
+        const plume::RenderTexture* color = r->fsr2_motion.get();
+        auto made = r->device->createFramebuffer(plume::RenderFramebufferDesc(&color, 1, depth->resource.get()));
+        if (!made) return;
+        fb = made.get();
+        if (r->fsr2_skin_framebuffers.size() > 4) r->fsr2_skin_framebuffers.erase(r->fsr2_skin_framebuffers.begin());
+        r->fsr2_skin_framebuffers.push_back({depth->resource, std::move(made)});
+      }
+      Transition(r, r->fsr2_motion.get(), r->fsr2_motion_layout, RenderTextureLayout::COLOR_WRITE);
+      Transition(r, depth->resource.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+      list->setFramebuffer(fb);
+      list->setGraphicsPipelineLayout(r->layout.get());
+      r->list_state = {};
+      BindTables(r, list);
+      r->list_state.bound = true;
+    }
+    // own constants: VP now / then, bones now / then, the bone count and NDC offset, the NDC scale, the size
+    constexpr size_t kSize = (4 + 4 + 64 + 64 + 3) * 16;
+    auto [cpu, gpu] = Allocate(r, kSize);
+    if (!cpu) break;
+    float* c = reinterpret_cast<float*>(cpu);
+    std::memcpy(c, now->second.rows, 16 * 4);                 // c54-c57 now
+    std::memcpy(c + 16, prev->second.rows, 16 * 4);           // then
+    std::memcpy(c + 32, now->second.rows + 16, 64 * 16);      // bones now
+    std::memcpy(c + 32 + 256, prev->second.rows + 16, 64 * 16);  // then
+    float* params = c + 32 + 512;
+    params[0] = float(m.skin_bones), params[1] = 0, params[2] = m.skin_ndc[2], params[3] = m.skin_ndc[3];
+    params[4] = m.skin_ndc[0], params[5] = m.skin_ndc[1], params[6] = 0, params[7] = 0;
+    params[8] = float(w), params[9] = float(h), params[10] = 0, params[11] = 0;
+    RenderBufferReference constants[4] = {m.constants[0], m.constants[1], m.constants[2], gpu};
+    list->setPipeline(m.skin_pso);
+    BindConstants(r, constants);
+    list->setVertexBuffers(0, m.views, m.view_count, m.slots);
+    list->setViewports(m.viewport);
+    list->setScissors(m.scissor);
+    list->setStencilReference(m.stencil_ref);
+    if (m.indexed) {
+      list->setIndexBuffer(&m.ibv);
+      list->drawIndexedInstanced(m.count, 1, 0, m.base, 0);
+    } else {
+      list->drawInstanced(m.count, 1, m.start, 0);
+    }
+    ++drawn;
+  }
+  if (fb) {
+    Transition(r, r->fsr2_motion.get(), r->fsr2_motion_layout, RenderTextureLayout::SHADER_READ);
+    r->list_state = {};
+  }
+  static bool logged = false;
+  if (!logged && drawn) {
+    logged = true;
+    REXLOG_INFO("native renderer: FSR 2 / DLSS: {} skinned draws with their own motion", drawn);
+  }
+}
+#endif
+
 void Draw(Renderer* r, uint32_t primitive, int32_t base_vertex, uint32_t start, uint32_t count,
           bool indexed, const PendingUP* up = nullptr) {
   ScopeTimer timer(r->perf_draw_ms);
@@ -3307,9 +4127,22 @@ void Draw(Renderer* r, uint32_t primitive, int32_t base_vertex, uint32_t start, 
   // covering the whole screen (a fade) and everything else fill the width.
   bool middle = false;
   const bool depth_test = (Reg(RB_DEPTHCONTROL) >> 1) & 1;
+  // Free camera F7 (free_cam.h): in a match, the HUD isn't drawn - its 2D sprites (as below: flat in the target's
+  // pixels, no depth, not a full-screen fade or pass) and the players' bars on the floor (in the world, no depth,
+  // alpha blended: the frame's last draws; the scene's one draw without depth, the ring's, blends otherwise).
+  if (svr2011::UiHidden() && g_match_scene.load() && !g_frame_2d && (vte & 1) && !depth_test) {
+    bool full = false;
+    if (Reg(RB_BLENDCONTROL0) == 0x07060706 ||
+        (FlatPixels(decl, up, indexed, start, count, base_vertex, tw, th, &full) && !full)) {
+      ++r->frame_stats.skipped_target;
+      return;
+    }
+  }
   if (reshaped && depth_test) ++r->frame_stats.wide_3d;
   if (reshaped && g_frame_2d) {
-    middle = (vte & 1) != 0;  // (screen-space passes keep the target's width)
+    // (screen-space passes keep the target's width; so does the scene - a 2D screen has no depth-tested draws, the
+    // first frame after one does)
+    middle = (vte & 1) != 0 && !depth_test;
   } else if (reshaped && (vte & 1) && !depth_test) {
     bool full = false;
     middle = FlatPixels(decl, up, indexed, start, count, base_vertex, tw, th, &full) && !full;
@@ -3322,6 +4155,33 @@ void Draw(Renderer* r, uint32_t primitive, int32_t base_vertex, uint32_t start, 
   vp.y = vp.y * sy + pad_y;
   vp.width *= sx;
   vp.height *= sy;
+  // native_jitter: the match scene's 3D draws (projected, depth tested, into the scene target) moved by this frame's
+  // sub-pixel offset - in NDC, through g_HalfPixelOffset (the shaders add it times w: the same in every depth).
+  if ((g_jitter[0] != 0.0f || g_jitter[1] != 0.0f) && g_match_scene.load() && !g_frame_2d && !middle && (vte & 1) && depth_test &&
+      SceneTarget(uint32_t(tw), uint32_t(th))) {
+    ndc[2] += 2.0f * g_jitter[0] / vp.width;
+    ndc[3] -= 2.0f * g_jitter[1] / vp.height;
+  }
+#if SVR2011_FSR2
+  // FSR 2's camera: the scene's view x projection as the game's shaders have it - vertex constants c54-c57 (its
+  // columns; c50-c53 the view's), taken from the frame's first 3D scene draw. (The scene view global, 0x82E3CC00,
+  // is the game logic's: a frame ahead of what the render thread draws.)
+  if (g_fsr2 && g_match_scene.load() && !middle && (vte & 1) && depth_test && r->fsr2_vp_frame[0] != r->frames &&
+      SceneTarget(uint32_t(tw), uint32_t(th))) {
+    const uint8_t* c = Device() + guest::RegisterOffset(0x4000);
+    float vp[16];
+    for (int col = 0; col < 4; ++col)
+      for (int row = 0; row < 4; ++row) vp[row * 4 + col] = BeFloat(c + 16 * (54 + col) + 4 * row);
+    // (a perspective camera: w = the view's depth - a unit forward, the view's last column (0, 0, 0, 1))
+    const float fwd = std::sqrt(vp[3] * vp[3] + vp[7] * vp[7] + vp[11] * vp[11]);
+    if (std::fabs(fwd - 1.0f) < 0.01f && BeFloat(c + 16 * 53 + 12) == 1.0f && vp[15] == BeFloat(c + 16 * 52 + 12)) {
+      std::memcpy(r->fsr2_vp[1], r->fsr2_vp[0], sizeof(vp));
+      r->fsr2_vp_frame[1] = r->fsr2_vp_frame[0];
+      std::memcpy(r->fsr2_vp[0], vp, sizeof(vp));
+      r->fsr2_vp_frame[0] = r->frames;
+    }
+  }
+#endif
   // Window scissor: D3D keeps it in the mirrored 0x2000 group (0x2011 top-left,
   // 0x2012 bottom-right; x in bits 0-14, y in bits 16-30), already clamped to
   // the scissor rect when the game enables one (device +0x2F00).
@@ -3490,10 +4350,14 @@ void Draw(Renderer* r, uint32_t primitive, int32_t base_vertex, uint32_t start, 
     BindTables(r, list);
     ls.bound = true;
   }
+  RenderBufferReference draw_constants[4];
   {
+    // (Superstar Threads' attire bake - the 2080x1024 target: its paint layers checked at every draw)
+    textures::SetCheckEveryUse(targets.color->width == 2080 && targets.color->height == 1024);
     RenderBufferReference constants[4] = {GpuConstants(r, 0, kVertexConstantsBytes),
                                            GpuConstants(r, 256, kPixelConstantsBytes),
                                            SharedConstants(r, alpha_test, vs, ps, ndc), {}};
+    textures::SetCheckEveryUse(false);
     auto [cpu, gpu] = Allocate(r, 256);
     if (cpu) {
       const uint32_t n = r->frame_stats.drawn * 2654435761u;
@@ -3503,6 +4367,7 @@ void Draw(Renderer* r, uint32_t primitive, int32_t base_vertex, uint32_t start, 
       constants[3] = gpu;
     }
     BindConstants(r, constants);
+    std::copy(constants, constants + 4, draw_constants);
   }
   if (backend::CompactTables() || SlotTables()) BindCompactSets(r, list);
   if (ls.pso != pso) {
@@ -3582,12 +4447,113 @@ void Draw(Renderer* r, uint32_t primitive, int32_t base_vertex, uint32_t start, 
     list->drawInstanced(draw_count, 1, start, 0);
   }
   ++r->frame_stats.drawn;
+#if SVR2011_FSR2
+  // FSR 2's masks: this draw noted for them (drawn again at the scene's resolve) when it is the HUD (no depth
+  // test - the ring's no-depth quad, blend 01860186, aside), blended over the scene, or skinned (the wrestlers,
+  // the referee: they move without motion vectors).
+  if (g_fsr2 && g_match_scene.load() && !middle && targets.depth && SceneTarget(uint32_t(tw), uint32_t(th))) {
+    const uint32_t blend = Reg(RB_BLENDCONTROL0);
+    // (blended: drawn over the scene without writing depth - the game's models blend too, alpha 1, writing it)
+    const bool blended =
+        ((blend & 0x1F) != 1 || ((blend >> 8) & 0x1F) != 0) && !((Reg(RB_DEPTHCONTROL) >> 2) & 1);
+    // (skinned: weights and indices - the wrestlers, the referee, the 3D front-row fans; ropes and rigid props
+    // have indices only)
+    bool weights = false, indices = false;
+    for (const Element& el : decl) weights |= el.usage == 1, indices |= el.usage == 2;
+    const bool skinned = weights && indices;
+    float mask[4] = {0, 0, 0, 0};  // (reactive, composition)
+    if (!depth_test && blend != 0x01860186u) {
+      mask[0] = g_fsr2_mask_values[0], mask[1] = 1.0f;
+    } else if (depth_test && blended) {
+      mask[0] = g_fsr2_mask_values[1], mask[1] = 1.0f;
+    } else if (depth_test && skinned) {
+      mask[0] = g_fsr2_mask_values[2], mask[1] = 1.0f;
+    }
+    // (the crowd: alpha-tested, blended, indices without weights - animated cut-outs with no motion vectors)
+    else if (depth_test && alpha_test && indices && ((blend & 0x1F) != 1 || ((blend >> 8) & 0x1F) != 0)) {
+      mask[0] = g_fsr2_mask_values[3], mask[1] = 1.0f;
+    }
+    // (test aid SVR2011_TEST_FSR2_IDS: every scene draw, its number in the masks - logged at match frame 900)
+    static const bool ids = EnvFlag("SVR2011_TEST_FSR2_IDS");
+    if (ids) {
+      const uint32_t n = r->frame_stats.drawn;
+      mask[0] = float(n % 255 + 1) / 255.0f, mask[1] = float(n / 255) / 255.0f;
+      if (Be32(Virtual(0x82E3CD0C)) == 900) {
+        std::string u;
+        for (const Element& el : decl) u += fmt::format(" {}.{}", el.usage, el.index);
+        REXLOG_INFO("[fsr2ids] {} blend {:08X} depth {:08X} cc {:08X} vs {:016X} ps {:016X} n {} decl{}", n, blend,
+                    Reg(RB_DEPTHCONTROL), Reg(RB_COLORCONTROL), vs->hash, ps->hash, draw_count, u);
+      }
+    }
+    if ((mask[0] > 0.0f || mask[1] > 0.0f) && Fsr2MaskWanted(r)) {
+      const plume::RenderPipeline* mask_pso =
+          Fsr2MaskPipeline(r, vs, packed_normals ? 1 : 0, layout, slots, layout_hash, topology, depth_test);
+      auto [cpu, gpu] = Allocate(r, 256);
+      if (mask_pso && cpu) {
+        std::memcpy(cpu, mask, sizeof(mask));
+        Renderer::Fsr2MaskDraw m;
+        m.pso = mask_pso;
+        std::copy(draw_constants, draw_constants + 4, m.constants);
+        m.constants[3] = gpu;
+        m.view_count = max_slot + 1;
+        std::copy(views, views + m.view_count, m.views);
+        std::copy(slots, slots + m.view_count, m.slots);
+        m.ibv = ibv;
+        m.indexed = draw_indexed;
+        m.count = draw_count;
+        m.start = start;
+        m.base = draw_base;
+        m.viewport = vp;
+        m.scissor = scissor;
+        m.stencil_ref = stencil_ref;
+        m.hud = !depth_test;
+        // (a skinned draw: its view x projection and bones kept by its key - the vertex data's, its range, its
+        // shader - for the next frame's motion, and its own motion pipeline)
+        if (depth_test && skinned) {
+          if (r->fsr2_skin_frame != r->frames) {
+            std::swap(r->fsr2_skin_prev, r->fsr2_skin_now);
+            r->fsr2_skin_now.clear();
+            if (r->fsr2_skin_frame + 1 != r->frames) r->fsr2_skin_prev.clear();  // (frames skipped: none to match)
+            r->fsr2_skin_frame = r->frames;
+          }
+          uint64_t key_parts[6] = {0, 0, uint64_t(start), uint64_t(draw_count), uint64_t(uint32_t(draw_base)),
+                                   vs->hash};
+          for (const Element& el : decl)
+            if (el.usage == 0 && el.index == 0 && el.stream < 15)
+              key_parts[0] = g_streams[el.stream].buffer, key_parts[1] = g_streams[el.stream].offset;
+          const uint64_t key = XXH3_64bits(key_parts, sizeof(key_parts));
+          auto& rows = r->fsr2_skin_now[key];
+          const uint8_t* c = Device() + guest::RegisterOffset(0x4000);
+          for (int i = 0; i < 4; ++i)
+            for (int k = 0; k < 4; ++k) rows.rows[i * 4 + k] = BeFloat(c + 16 * (54 + i) + 4 * k);
+          for (int i = 0; i < 64; ++i)
+            for (int k = 0; k < 4; ++k) rows.rows[16 + i * 4 + k] = BeFloat(c + 16 * (74 + i) + 4 * k);
+          const uint32_t bools = Be32(Device() + guest::RegisterOffset(0x4900));
+          m.skin_bones = (bools & (1u << 3)) ? 4 : (bools & (1u << 2)) ? 3 : (bools & (1u << 1)) ? 2 : 1;
+          std::copy(ndc, ndc + 4, m.skin_ndc);
+          m.skin_pso = Fsr2SkinPipeline(r, layout, slots, layout_hash, topology);
+          m.skin_key = m.skin_pso ? key : 0;
+        }
+        r->fsr2_mask_draws.push_back(m);
+      }
+    }
+    if (depth_test && Fsr2MaskWanted(r)) r->fsr2_mask_after_3d = r->fsr2_mask_draws.size();
+  }
+#endif
 }
 
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // entry points
+
+uint32_t LastFrameDraws() { return g_last_draws.load(); }
+uint64_t FramesShown() { return g_frames_shown.load(); }
+
+FrameCosts LastFrameCosts() {
+  std::lock_guard lock(g_costs_mutex);
+  return g_costs;
+}
 
 std::string RendererLabel() {
   if (g_failed) return "Native - stopped";
@@ -3601,6 +4567,43 @@ bool Enabled() { return true; }
 // No switching to the emulated renderer any more.
 bool CanSwitch() { return false; }
 
+bool UpscalerAvailable(const std::string& kind, std::string* why) {
+  std::string reason;
+  if (kind == "fsr2") {
+#if SVR2011_FSR2
+    const backend::Api api = backend::ActiveApi();
+    if (api == backend::Api::kD3D11)
+      reason = "FSR 2 needs compute shaders: Direct3D 12 or Vulkan (the game draws with Direct3D 11)";
+    else if (api == backend::Api::kNone)
+      reason = "FSR 2: the renderer hasn't started";
+#else
+    reason = "FSR 2 isn't in this build (Windows only)";
+#endif
+  } else if (kind == "dlss") {
+#if SVR2011_DLSS
+    const backend::Api api = backend::ActiveApi();
+    if (api == backend::Api::kD3D11)
+      reason = "DLSS needs Direct3D 12 (the game draws with Direct3D 11)";
+    else if (api == backend::Api::kNone || !g_r)
+      reason = "DLSS: the renderer hasn't started";
+    else if (!svr2011::dlss::Probe(DlssHost(g_r), &reason) && reason.empty())
+      reason = "DLSS can't run here";
+#else
+    reason = "DLSS isn't in this build (built without the DLSS SDK)";
+#endif
+  } else {
+    reason = "unknown upscaler " + kind;
+  }
+  static std::mutex mutex;
+  static std::set<std::string> logged;
+  if (!reason.empty()) {
+    std::lock_guard lock(mutex);
+    if (logged.insert(reason).second) REXLOG_INFO("native renderer: upscaling choice hidden - {}", reason);
+  }
+  if (why) *why = reason;
+  return reason.empty();
+}
+
 void SetNativeActive(bool) {}
 
 std::string FailureReason() {
@@ -3612,7 +4615,47 @@ bool NativeActive() { return g_main && !g_failed && !g_suspended; }
 
 void SetMatchScene(bool in_match) { g_match_scene = in_match; }
 
+void RequestFrameCapture(bool previous) {
+  {
+    std::lock_guard lock(g_capture_mutex);
+    g_capture.clear();
+  }
+  g_capture_output = previous ? g_last_shown_output.load() : -1;
+  g_capture_wanted = true;
+}
+bool TakeFrameCapture(std::vector<uint8_t>& rgb, uint32_t& width, uint32_t& height) {
+  std::lock_guard lock(g_capture_mutex);
+  if (g_capture.empty()) return false;
+  rgb = std::move(g_capture), width = g_capture_w, height = g_capture_h;
+  g_capture.clear();
+  return true;
+}
+
 float CameraFovScale() { return g_fov_scale.load(std::memory_order_relaxed); }
+
+// a^-1 (4 x 4, Gauss-Jordan); false if singular.
+bool Invert4(const float a[16], float out[16]) {
+  double m[4][8];
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 8; ++c) m[r][c] = c < 4 ? a[r * 4 + c] : (c - 4 == r ? 1.0 : 0.0);
+  for (int c = 0; c < 4; ++c) {
+    int piv = c;
+    for (int r = c + 1; r < 4; ++r)
+      if (std::fabs(m[r][c]) > std::fabs(m[piv][c])) piv = r;
+    if (std::fabs(m[piv][c]) < 1e-12) return false;
+    std::swap(m[piv], m[c]);
+    const double inv = 1.0 / m[c][c];
+    for (int k = 0; k < 8; ++k) m[c][k] *= inv;
+    for (int r = 0; r < 4; ++r)
+      if (r != c) {
+        const double f = m[r][c];
+        for (int k = 0; k < 8; ++k) m[r][k] -= f * m[c][k];
+      }
+  }
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) out[r * 4 + c] = float(m[r][c + 4]);
+  return true;
+}
 
 void SetWindowSizeSource(std::function<std::pair<uint32_t, uint32_t>()> source) {
   g_window_size = std::move(source);
@@ -3633,6 +4676,7 @@ void Attach(rex::memory::Memory* memory) {
       s = *e == ',' ? e + 1 : e;
     }
     std::thread([memory, regions] {
+      rex::thread::set_current_thread_name("memory regions log");
       for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         std::string line;
@@ -3681,16 +4725,23 @@ void Attach(rex::memory::Memory* memory) {
 // frame; with SVR2011_NATIVE_STOP_AT_RESOLVE the main target before
 // post-processing) is copied to the window.
 // The pipeline showing a texture in the frame image (shaders/present.*.hlsl).
-const plume::RenderPipeline* PresentPipeline(Renderer* r) {
-  static std::unique_ptr<plume::RenderShader> vs, ps;
-  static std::unique_ptr<plume::RenderPipeline> pso;
-  static bool tried = false;
-  if (tried) return pso.get();
-  tried = true;
+// (the full-screen triangle with pixel shader `ps_name`: present.ps, or FSR 1's fsr_easu.ps / fsr_rcas.ps)
+const plume::RenderPipeline* PresentPipeline(Renderer* r, const char* ps_name = "present.ps") {
+  struct Built {
+    std::unique_ptr<plume::RenderShader> vs, ps;
+    std::unique_ptr<plume::RenderPipeline> pso;
+  };
+  static std::map<std::string, Built> built;
+  const bool tried = built.count(ps_name) != 0;
+  Built& b = built[ps_name];
+  if (tried) return b.pso.get();
+  auto& vs = b.vs;
+  auto& ps = b.ps;
+  auto& pso = b.pso;
   const std::vector<uint8_t> vs_code = ReadShader("present.vs");
-  const std::vector<uint8_t> ps_code = ReadShader("present.ps");
+  const std::vector<uint8_t> ps_code = ReadShader(ps_name);
   if (vs_code.empty() || ps_code.empty()) {
-    REXLOG_WARN("native renderer: present shaders missing");
+    REXLOG_WARN("native renderer: {} shaders missing", ps_name);
     return nullptr;
   }
   plume::RenderGraphicsPipelineDesc d;
@@ -3705,11 +4756,225 @@ const plume::RenderPipeline* PresentPipeline(Renderer* r) {
   d.renderTargetFormat[0] = RenderFormat::R8G8B8A8_UNORM;
   if (d.vertexShader && d.pixelShader) pso = r->device->createGraphicsPipeline(d);
   if (pso && !backend::PipelineCreated(pso.get())) pso.reset();
-  if (!pso) REXLOG_ERROR("native renderer: could not create the present pipeline");
+  if (!pso) REXLOG_ERROR("native renderer: could not create the {} pipeline", ps_name);
   return pso.get();
 }
 
 plume::RenderTexture* FrameImage(Renderer* r) { return r->outputs[r->output_index].get(); }
+
+
+#if SVR2011_FSR2
+// FSR 2 (experimental): the front buffer (the resolve copy at physical `base`; `region` the part shown) gathered with
+// this frame's scene depth (caught at the scene's resolve) into FSR 1's intermediate, the window's size; false if it
+// couldn't (Present uses FSR 1 then). `swap`: the copy's red and blue swapped.
+bool PresentFsr2(Renderer* r, uint32_t base, const float region[2], bool* swap) {
+  auto it = r->resolved.find(base);
+  if (it == r->resolved.end() || !it->second.resource || !r->fsr_image) return false;
+  ResolvedTexture& color = it->second;
+  const uint32_t rw = std::min(uint32_t(float(color.host_w) * region[0] + 0.5f), r->fsr2_depth_w);
+  const uint32_t rh = std::min(uint32_t(float(color.host_h) * region[1] + 0.5f), r->fsr2_depth_h);
+  if (rw < 64 || rh < 64) return false;
+  auto* list = r->list;
+  if (!r->fsr2 || r->fsr2->MaxRenderWidth() != r->fsr2_depth_w || r->fsr2->MaxRenderHeight() != r->fsr2_depth_h ||
+      r->fsr2->DisplayWidth() != g_out_w || r->fsr2->DisplayHeight() != g_out_h) {
+    if (r->fsr2 && !WaitIdle(r, "FSR 2 sizes")) return false;
+    r->fsr2.reset();
+    svr2011::fsr2::Host host;
+    host.device = r->device.get();
+    host.format = backend::ShaderFormat();
+    host.vulkan = backend::ActiveApi() == backend::Api::kVulkan;
+    host.read_shader = [](const std::string& name) { return ReadShader(name); };
+    r->fsr2 = svr2011::fsr2::Create(host, r->fsr2_depth_w, r->fsr2_depth_h, g_out_w, g_out_h, kFrames);
+    if (!r->fsr2) {
+      r->fsr2_failed = true;  // (FSR 1 from now on)
+      g_fsr2 = false;
+      return false;
+    }
+    // The motion vectors: none yet (a still camera's) - cleared once.
+    if (r->fsr2_motion) Retire(r, std::move(r->fsr2_motion));
+    r->fsr2_motion = r->device->createTexture(plume::RenderTextureDesc::Texture2D(
+        r->fsr2_depth_w, r->fsr2_depth_h, 1, RenderFormat::R16G16B16A16_FLOAT,
+        plume::RenderTextureFlag::RENDER_TARGET | plume::RenderTextureFlag::STORAGE |
+            plume::RenderTextureFlag::UNORDERED_ACCESS));
+    if (!r->fsr2_motion) return false;
+    if (r->fsr2_depth32) Retire(r, std::move(r->fsr2_depth32));
+    r->fsr2_depth32 = r->device->createTexture(plume::RenderTextureDesc::Texture2D(
+        r->fsr2_depth_w, r->fsr2_depth_h, 1, RenderFormat::R32_FLOAT,
+        plume::RenderTextureFlag::STORAGE | plume::RenderTextureFlag::UNORDERED_ACCESS));
+    if (!r->fsr2_depth32) return false;
+    r->fsr2_depth32->setName("FSR 2 / DLSS depth");
+    const plume::RenderTexture* mv = r->fsr2_motion.get();
+    auto fb = r->device->createFramebuffer(plume::RenderFramebufferDesc(&mv, 1));
+    Barrier(r, r->fsr2_motion.get(), RenderTextureLayout::COLOR_WRITE);
+    list->setFramebuffer(fb.get());
+    list->clearColor(0, plume::RenderColor(0, 0, 0, 0));
+    Barrier(r, r->fsr2_motion.get(), RenderTextureLayout::SHADER_READ);
+    Retire(r, std::shared_ptr<plume::RenderFramebuffer>(std::move(fb)));
+    r->fsr2_motion_layout = RenderTextureLayout::SHADER_READ;
+    r->list_state = {};
+  }
+  if (r->fsr_image_fresh && r->fsr_framebuffer) {  // (a render target: cleared before any other use - Direct3D 12)
+    Barrier(r, r->fsr_image.get(), RenderTextureLayout::COLOR_WRITE);
+    list->setFramebuffer(r->fsr_framebuffer.get());
+    list->clearColor(0, plume::RenderColor(0, 0, 0, 1));
+    r->fsr_image_fresh = false;
+    r->list_state = {};
+  }
+  using svr2011::fsr2::Texture;
+  svr2011::fsr2::Frame f;
+  // (UNKNOWN: plume knows where each is - the backend's first barrier always goes)
+  // (read as the target's view format: the copy's own is typeless - an invalid view on Direct3D 12)
+  const RenderFormat color_format = color.view_format != RenderFormat::UNKNOWN ? color.view_format : color.format;
+  f.color = Texture{color.resource.get(), color_format, color.host_w, color.host_h, RenderTextureLayout::UNKNOWN};
+  f.depth = Texture{r->fsr2_depth.get(), backend::DepthFormat(), r->fsr2_depth_w, r->fsr2_depth_h,
+                    RenderTextureLayout::UNKNOWN};
+  f.motion = Texture{r->fsr2_motion.get(), RenderFormat::R16G16B16A16_FLOAT, r->fsr2_depth_w, r->fsr2_depth_h,
+                     RenderTextureLayout::UNKNOWN};
+  f.output = Texture{r->fsr_image.get(), RenderFormat::R8G8B8A8_UNORM, g_out_w, g_out_h, RenderTextureLayout::UNKNOWN};
+  if (r->fsr2_mask_frame == r->frames && r->fsr2_reactive && r->fsr2_mask_w == r->fsr2_depth_w &&
+      r->fsr2_mask_h == r->fsr2_depth_h) {
+    f.reactive = Texture{r->fsr2_reactive.get(), RenderFormat::R8_UNORM, r->fsr2_mask_w, r->fsr2_mask_h,
+                         RenderTextureLayout::UNKNOWN};
+    f.composition = Texture{r->fsr2_composition.get(), RenderFormat::R8_UNORM, r->fsr2_mask_w, r->fsr2_mask_h,
+                            RenderTextureLayout::UNKNOWN};
+  }
+  f.render_w = rw;
+  f.render_h = rh;
+  f.jitter_x = g_jitter[0];
+  f.jitter_y = g_jitter[1];
+  f.frame_ms = 1000.0f / 60.0f;
+  f.fov_y = 0.2967f;  // (a match camera's; the scene camera's below when its projection was caught)
+  if (r->fsr2_vp_frame[0] == r->frames) {
+    const float* m = r->fsr2_vp[0];
+    const float sy = std::sqrt(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+    if (sy > 0.01f) f.fov_y = 2.0f * std::atan(1.0f / sy);
+  }
+  f.sharpness = g_fsr_sharpness;
+  f.reset = r->fsr2_last_frame == ~0ull || r->fsr2_last_frame + 1 != r->frames;
+  // The camera's motion vectors: this frame's clip space (unjittered) to the last frame's - none (identity) without
+  // both cameras.
+  {
+    float reproject[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    float inv[16];
+    // (test aid: SVR2011_TEST_FSR2_NO_MOTION - none, to compare)
+    static const bool no_motion = EnvFlag("SVR2011_TEST_FSR2_NO_MOTION");
+    if (!no_motion && !f.reset && r->fsr2_vp_frame[0] == r->frames && r->fsr2_vp_frame[1] + 1 == r->frames &&
+        Invert4(r->fsr2_vp[0], inv)) {
+      for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+          float sum = 0;
+          for (int k = 0; k < 4; ++k) sum += inv[i * 4 + k] * r->fsr2_vp[1][k * 4 + j];
+          reproject[i * 4 + j] = sum;
+        }
+    }
+    const float jitter[2] = {2.0f * g_jitter[0] / float(rw), -2.0f * g_jitter[1] / float(rh)};
+    Texture depth32{r->fsr2_depth32.get(), RenderFormat::R32_FLOAT, r->fsr2_depth_w, r->fsr2_depth_h,
+                    RenderTextureLayout::UNKNOWN};
+    r->fsr2->Motion(list, r->back_index, f.depth, f.motion, depth32, reproject, jitter, rw, rh);
+    f.motion.layout = RenderTextureLayout::UNKNOWN;
+    // Test aid: SVR2011_TEST_FSR2_DUMP=<prefix> - FSR 2's colour and motion (raw texels: the motion RGBA16F, the rest 4 bytes) and the
+    // reprojection (<prefix>.txt) in the frames SVR2011_TEST_FRAME_SHOT(S/_AT) take: the motion vectors checked
+    // offline against the next frame.
+    static const std::string dump = [] {
+      char* v = nullptr;
+      size_t n = 0;
+      std::string s;
+      if (_dupenv_s(&v, &n, "SVR2011_TEST_FSR2_DUMP") == 0 && v) s = v, free(v);
+      return s;
+    }();
+    static int dumps_taken = 0;
+    if (!dump.empty() && !r->hidden_frame && dumps_taken < std::max(1, EnvInt("SVR2011_TEST_FRAME_SHOTS", 1)) &&
+        Be32(Virtual(0x82E3CD0C)) > uint32_t(std::max(1, EnvInt("SVR2011_TEST_FRAME_SHOT_AT", 600)))) {
+      const int i = dumps_taken++;
+      auto take = [&](plume::RenderTexture* t, RenderFormat format, uint32_t w, uint32_t h, const char* what,
+                      uint32_t bytes = 4) {
+        Renderer::Fsr2Dump d;
+        d.w = w, d.h = h, d.bytes = bytes, d.row = ((w * bytes + 255) & ~255u) / bytes;
+        d.file = dump + "_" + std::to_string(i) + "_" + what + ".raw";
+        d.buffer = r->device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(d.row) * h * bytes));
+        if (!d.buffer) return;
+        Barrier(r, t, RenderTextureLayout::COPY_SOURCE);
+        list->copyTextureRegion(
+            plume::RenderTextureCopyLocation::PlacedFootprint(d.buffer.get(), format, w, h, 1, d.row),
+            plume::RenderTextureCopyLocation::Subresource(t));
+        Barrier(r, t, RenderTextureLayout::SHADER_READ);
+        r->fsr2_dumps.push_back(std::move(d));
+      };
+      take(color.resource.get(), color_format, color.host_w, color.host_h, "color");
+      take(r->fsr2_motion.get(), RenderFormat::R16G16B16A16_FLOAT, r->fsr2_depth_w, r->fsr2_depth_h, "motion", 8);
+      if (f.reactive.texture) {
+        take(r->fsr2_reactive.get(), RenderFormat::R8_UNORM, r->fsr2_mask_w, r->fsr2_mask_h, "reactive", 1);
+        take(r->fsr2_composition.get(), RenderFormat::R8_UNORM, r->fsr2_mask_w, r->fsr2_mask_h, "composition", 1);
+      }
+      if (FILE* t = std::fopen((dump + ".txt").c_str(), i ? "a" : "w")) {
+        std::fprintf(t, "%d render %u %u color %u %u depth %u %u jitter %.6f %.6f swap %d reset %d reproject", i, rw, rh,
+                     color.host_w, color.host_h, r->fsr2_depth_w, r->fsr2_depth_h, g_jitter[0], g_jitter[1],
+                     color.swap_rb ? 1 : 0, f.reset ? 1 : 0);
+        for (float v : reproject) std::fprintf(t, " %.9g", v);
+        std::fprintf(t, "\n");
+        std::fclose(t);
+      }
+      r->list_state = {};
+    }
+  }
+  bool upscaled = false;
+#if SVR2011_DLSS
+  if (g_dlss) {
+    static int32_t quality = 1;
+    if ((r->frames & 31) == 0 || !r->dlss) quality = REXCVAR_GET(native_upscale_quality);
+    if (!r->dlss || r->dlss->MaxRenderWidth() != r->fsr2_depth_w || r->dlss->MaxRenderHeight() != r->fsr2_depth_h ||
+        r->dlss->DisplayWidth() != g_out_w || r->dlss->DisplayHeight() != g_out_h || r->dlss->Quality() != quality) {
+      if (r->dlss && !WaitIdle(r, "DLSS sizes")) return false;
+      r->dlss = svr2011::dlss::Create(DlssHost(r), r->fsr2_depth_w, r->fsr2_depth_h, g_out_w, g_out_h, quality);
+      if (!r->dlss) {
+        r->dlss_failed = true;  // (FSR 2 from now on)
+        g_dlss = false;
+      }
+    }
+    if (r->dlss) {
+      svr2011::fsr2::Frame d = f;
+      d.depth = Texture{r->fsr2_depth32.get(), RenderFormat::R32_FLOAT, r->fsr2_depth_w, r->fsr2_depth_h,
+                        RenderTextureLayout::UNKNOWN};
+      upscaled = r->dlss->Dispatch(list, d);
+      if (!upscaled && !r->dlss_failed) {
+        static int fails = 0;
+        if (++fails > 30) r->dlss_failed = true, g_dlss = false;  // (a lasting failure: FSR 2)
+      }
+      // (DLSS sets its own state: the renderer binds everything again)
+      r->list_state = {};
+      static bool logged = false;
+      if (upscaled && !logged) {
+        logged = true;
+        REXLOG_INFO("native renderer: DLSS {}x{} -> {}x{}", rw, rh, g_out_w, g_out_h);
+      }
+    }
+  }
+#endif
+  if (!upscaled && !r->fsr2->Dispatch(list, r->back_index, f)) return false;
+  // (back to what the renderer tracks: the colour, depth and motion read; the result read by the present pass)
+  color.layout = RenderTextureLayout::SHADER_READ;
+  r->fsr2_depth_layout = RenderTextureLayout::SHADER_READ;
+  r->fsr2_motion_layout = RenderTextureLayout::SHADER_READ;
+  Barrier(r, color.resource.get(), RenderTextureLayout::SHADER_READ);
+  Barrier(r, r->fsr2_depth.get(), RenderTextureLayout::SHADER_READ);
+  Barrier(r, r->fsr_image.get(), RenderTextureLayout::SHADER_READ);
+  if (f.reactive.texture) {
+    r->fsr2_reactive_layout = r->fsr2_composition_layout = RenderTextureLayout::SHADER_READ;
+    Barrier(r, r->fsr2_reactive.get(), RenderTextureLayout::SHADER_READ);
+    Barrier(r, r->fsr2_composition.get(), RenderTextureLayout::SHADER_READ);
+  }
+  Barrier(r, r->fsr2_depth32.get(), RenderTextureLayout::SHADER_READ);
+  r->list_state = {};
+  r->fsr2_last_frame = r->frames;
+  *swap = color.swap_rb;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXLOG_INFO("native renderer: FSR 2 {}x{} -> {}x{}", rw, rh, g_out_w, g_out_h);
+  }
+  return true;
+}
+#endif
 
 // Draws the front buffer texture Swap named into the frame image; false if
 // it can't be shown.
@@ -3728,38 +4993,77 @@ bool PresentFrontBuffer(Renderer* r, uint32_t front_buffer) {
   const textures::Context ctx = TextureContext(r);
   const uint32_t srv = textures::Texture(ctx, fetch, 0);
   if (srv == UINT32_MAX) return false;
-  const uint32_t sampler = textures::Sampler(ctx, fetch);
+  // (bilinear whatever the game's fetch says: present.ps averages a bigger front buffer down with bilinear taps
+  // - with the game's point filter each tap was one texel, so ANTI-ALIASING 2X, a 2:1 scene, averaged nothing)
+  uint32_t linear_fetch[6];
+  std::memcpy(linear_fetch, fetch, sizeof(linear_fetch));
+  linear_fetch[3] = (linear_fetch[3] & ~(0xFu << 19)) | (1u << 19) | (1u << 21);  // (mag / min filter: linear)
+  const uint32_t sampler = textures::Sampler(ctx, linear_fetch);
   const uint32_t w = (fetch[2] & 0x1FFF) + 1, h = ((fetch[2] >> 13) & 0x1FFF) + 1;
-  auto [cpu, gpu] = Allocate(r, 256);
-  if (!cpu) return false;
-  const uint32_t indices[2] = {srv, sampler};
   const float scale[2] = {std::min(1.0f, float(kWidth) / float(w)),
                           std::min(1.0f, float(kHeight) / float(h))};
   const float out_size[2] = {float(g_out_w), float(g_out_h)};
-  std::memcpy(cpu, indices, 8);
-  std::memcpy(cpu + 8, scale, 8);
-  std::memcpy(cpu + 16, out_size, 8);
   auto* list = r->list;
+  // A full-screen pass: texture table index `tex` (the sampler's), constants {tex, sampler, c, the frame's size}.
+  auto pass = [&](const plume::RenderPipeline* p, uint32_t tex, const float c[2]) {
+    auto [cpu, gpu] = Allocate(r, 256);
+    if (!cpu) return false;
+    const uint32_t indices[2] = {tex, sampler};
+    std::memcpy(cpu, indices, 8);
+    std::memcpy(cpu + 8, c, 8);
+    std::memcpy(cpu + 16, out_size, 8);
+    list->setGraphicsPipelineLayout(r->layout.get());
+    BindTables(r, list);
+    if (backend::CompactTables() || SlotTables()) {
+      // (compact / slot tables: the texture and sampler in place 0 of the draw's sets)
+      uint32_t places[2][kSlotTextures];
+      std::fill(&places[0][0], &places[0][0] + 2 * kSlotTextures, UINT32_MAX);
+      places[0][0] = r->texture_base[0] + tex;
+      places[1][0] = sampler;
+      r->draw_sets[0] = CompactSet(r, 0, places[0]);
+      r->draw_sets[1] = CompactSet(r, 1, places[1]);
+      BindCompactSets(r, list);
+      const uint32_t zero[2] = {0, 0};
+      std::memcpy(cpu, zero, 8);
+    }
+    const RenderBufferReference constants[4] = {{}, {}, {}, gpu};
+    BindConstants(r, constants);
+    list->setPipeline(p);
+    list->setViewports(plume::RenderViewport(0, 0, out_size[0], out_size[1], 0, 1));
+    return true;
+  };
+  // FSR 2 (experimental; this frame's scene depth caught): into the intermediate, shown through RCAS unsharpened.
+  bool fsr2 = false, fsr2_swap = false;
+#if SVR2011_FSR2
+  if (g_fsr2 && r->fsr2_depth && r->fsr2_depth_frame == r->frames)
+    fsr2 = PresentFsr2(r, fetch[1] & 0xFFFFF000u, scale, &fsr2_swap);  // (fetch[1]: physical by now)
+  // (the front buffer's fetch swizzle - ZYXW: red and blue swapped - on top of the copy's own swap)
+  if (fsr2 && ((fetch[3] >> 1) & 7) == 2) fsr2_swap = !fsr2_swap;
+#endif
+  // FSR 1 (the scene smaller than the frame): EASU into the intermediate, then RCAS into the frame image below.
+  const plume::RenderPipeline* easu =
+      !fsr2 && g_fsr && r->fsr_framebuffer ? PresentPipeline(r, "fsr_easu.ps") : nullptr;
+  const plume::RenderPipeline* rcas = easu || fsr2 ? PresentPipeline(r, "fsr_rcas.ps") : nullptr;
+  if (easu) {
+    Barrier(r, r->fsr_image.get(), RenderTextureLayout::COLOR_WRITE);
+    list->setFramebuffer(r->fsr_framebuffer.get());
+    if (r->fsr_image_fresh) {  // (a render target is cleared before its first draw - Direct3D 12)
+      list->clearColor(0, plume::RenderColor(0, 0, 0, 1));
+      r->fsr_image_fresh = false;
+    }
+    if (!pass(easu, srv, scale)) return false;
+    list->setScissors(plume::RenderRect(0, 0, int32_t(out_size[0]), int32_t(out_size[1])));
+    list->drawInstanced(3, 1, 0, 0);
+    Barrier(r, r->fsr_image.get(), RenderTextureLayout::SHADER_READ);
+    r->list_state = {};
+  }
   Barrier(r, FrameImage(r), RenderTextureLayout::COLOR_WRITE);
   list->setFramebuffer(r->output_framebuffers[r->output_index].get());
-  list->setGraphicsPipelineLayout(r->layout.get());
-  BindTables(r, list);
-  if (backend::CompactTables() || SlotTables()) {
-    // (compact / slot tables: the texture and sampler in place 0 of the draw's sets)
-    uint32_t places[2][kSlotTextures];
-    std::fill(&places[0][0], &places[0][0] + 2 * kSlotTextures, UINT32_MAX);
-    places[0][0] = r->texture_base[0] + srv;
-    places[1][0] = sampler;
-    r->draw_sets[0] = CompactSet(r, 0, places[0]);
-    r->draw_sets[1] = CompactSet(r, 1, places[1]);
-    BindCompactSets(r, list);
-    const uint32_t zero[2] = {0, 0};
-    std::memcpy(cpu, zero, 8);
-  }
-  const RenderBufferReference constants[4] = {{}, {}, {}, gpu};
-  BindConstants(r, constants);
-  list->setPipeline(pso);
-  list->setViewports(plume::RenderViewport(0, 0, out_size[0], out_size[1], 0, 1));
+  // (RCAS's strength: 2 stops of sharpening over the 0-1 setting, 1 the most)
+  // (FSR 2 sharpened already; y: its result red / blue swapped back)
+  const float sharp[2] = {
+      !fsr2 && g_fsr_sharpness > 0.0f ? std::exp2(-2.0f * (1.0f - g_fsr_sharpness)) : 0.0f, fsr2_swap ? 1.0f : 0.0f};
+  if (!(rcas ? pass(rcas, kFsrSrv, sharp) : pass(pso, srv, scale))) return false;
   if (g_frame_2d && g_wide > 1.0f) {
     // A 2D screen on a wide one: its 16:9 middle, black sides.
     list->clearColor(0, plume::RenderColor(0, 0, 0, 1));
@@ -3782,6 +5086,7 @@ bool PresentFrontBuffer(Renderer* r, uint32_t front_buffer) {
 
 void OnPresent(uint32_t front_buffer) {
   svr2011::LatencyOnSwap();  // (frame_rate.h: test aid)
+  svr2011::PerfHintFrame(svr2011::FrameRateNow());  // (android_perf.h: the phone's clocks)
   std::lock_guard lock(g_mutex);
   Renderer* r = Get();
   if (!r) return;
@@ -3851,6 +5156,88 @@ void OnPresent(uint32_t front_buffer) {
     list->clearColor(0, plume::RenderColor(0.05f, 0.05f, 0.08f, 1.0f));
     Barrier(r, back, RenderTextureLayout::SHADER_READ);
   }
+  // Test aid: SVR2011_TEST_FRAME_SHOT=<file.ppm> - the frame image as it is (the window's pixels, not a desktop
+  // capture), once, 10 s into a match (upscaling comparisons); SVR2011_TEST_FRAME_SHOTS=<n>: n frames in a row
+  // (<file>_<i>.ppm - motion bursts), SVR2011_TEST_FRAME_SHOT_AT=<match frames> instead of 600;
+  // SVR2011_TEST_FRAME_SHOT_ON_2D=1: from the frame after the match's first frame without the scene after that.
+  // SVR2011_TEST_FRAME_SHOT_EVERY=<k>: the n shots k match frames apart (contact sheets across a move).
+  static const std::string frame_shot = [] {
+    char* v = nullptr;
+    size_t n = 0;
+    std::string s;
+    if (_dupenv_s(&v, &n, "SVR2011_TEST_FRAME_SHOT") == 0 && v) s = v, free(v);
+    return s;
+  }();
+  static const int frame_shots = std::max(1, EnvInt("SVR2011_TEST_FRAME_SHOTS", 1));
+  static const uint32_t frame_shot_at = uint32_t(std::max(1, EnvInt("SVR2011_TEST_FRAME_SHOT_AT", 600)));
+  static const bool frame_shot_on_2d = EnvInt("SVR2011_TEST_FRAME_SHOT_ON_2D", 0) != 0;
+  static const uint32_t frame_shot_every = uint32_t(std::max(0, EnvInt("SVR2011_TEST_FRAME_SHOT_EVERY", 0)));
+  static int frame_shots_taken = 0;
+  bool test_shot = !frame_shot.empty() && frame_shots_taken < frame_shots && !r->hidden_frame &&
+                   g_match_scene.load() &&
+                   Be32(Virtual(0x82E3CD0C)) > frame_shot_at + frame_shot_every * uint32_t(frame_shots_taken) &&
+                   (!frame_shot_on_2d || g_flat_frame_seen);
+  if (frame_shot_on_2d && g_match_scene.load() && Be32(Virtual(0x82E3CD0C)) <= frame_shot_at) g_flat_frame_seen = false;
+  // Test aid: SVR2011_TEST_SHOT_REQUEST=<file> - whenever that file appears (anywhere: menus, story walks), the next
+  // frame is shot to the .ppm named in it and the file is removed (a hidden test game has no window to capture).
+  static const std::string shot_request = [] {
+    char* v = nullptr;
+    size_t n = 0;
+    std::string s;
+    if (_dupenv_s(&v, &n, "SVR2011_TEST_SHOT_REQUEST") == 0 && v) s = v, free(v);
+    return s;
+  }();
+  static uint32_t shot_request_poll = 0;
+  std::string requested_file;
+  const bool capture = !r->hidden_frame && g_capture_wanted.exchange(false);  // (RequestFrameCapture)
+  if (capture) test_shot = true;
+  // (the frame shown before this one: its image is still in the ring - kOutputs - for a few frames)
+  const int capture_output = capture ? g_capture_output.exchange(-1) : -1;
+  plume::RenderTexture* shot_src = capture_output >= 0 && uint32_t(capture_output) != r->output_index
+                                       ? r->outputs[uint32_t(capture_output) % kOutputs].get()
+                                       : back;
+  if (!r->hidden_frame) g_last_shown_output = int(r->output_index);
+  if (!test_shot && !shot_request.empty() && !r->hidden_frame && ++shot_request_poll % 15 == 0)
+    if (FILE* f = std::fopen(shot_request.c_str(), "rb")) {
+      char name[512] = {};
+      const size_t got = std::fread(name, 1, sizeof name - 1, f);
+      std::fclose(f);
+      std::remove(shot_request.c_str());
+      requested_file.assign(name, got);
+      while (!requested_file.empty() && std::isspace(uint8_t(requested_file.back()))) requested_file.pop_back();
+    }
+  std::shared_ptr<plume::RenderBuffer> shot;
+  const uint32_t shot_row = (g_out_w + 63) & ~63u;  // (256-byte rows)
+  std::string shot_file = requested_file.empty() ? frame_shot : requested_file;
+  if (!requested_file.empty()) test_shot = true;
+  if (test_shot) {
+    if (frame_shots > 1 && requested_file.empty()) {
+      const size_t dot = shot_file.rfind('.');
+      shot_file.insert(dot == std::string::npos ? shot_file.size() : dot, "_" + std::to_string(frame_shots_taken));
+    }
+    if (requested_file.empty() && !capture) ++frame_shots_taken;
+    shot = r->device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(shot_row) * g_out_h * 4));
+    if (shot) {
+      Barrier(r, shot_src, RenderTextureLayout::COPY_SOURCE);
+      list->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(
+                                  shot.get(), RenderFormat::R8G8B8A8_UNORM, g_out_w, g_out_h, 1, shot_row),
+                              plume::RenderTextureCopyLocation::Subresource(shot_src));
+      Barrier(r, shot_src, RenderTextureLayout::SHADER_READ);
+    }
+  }
+#if SVR2011_DEBUG_SUITE
+  // (a dbg_shot due: the frame image copied to a readback buffer, written once the frame is done - below)
+  if (!shot && !r->hidden_frame && svr2011::dbg::ShotWanted()) {
+    shot = r->device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(shot_row) * g_out_h * 4));
+    if (shot) {
+      Barrier(r, back, RenderTextureLayout::COPY_SOURCE);
+      list->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(
+                                  shot.get(), RenderFormat::R8G8B8A8_UNORM, g_out_w, g_out_h, 1, shot_row),
+                              plume::RenderTextureCopyLocation::Subresource(back));
+      Barrier(r, back, RenderTextureLayout::SHADER_READ);
+    }
+  }
+#endif
   r->list->end();
   // Debug: SVR2011_NATIVE_TEST_STALL=<frame> stalls the GPU queue for good at
   // that frame (as a stuck GPU job would), to test WaitForFrame's way out.
@@ -3878,17 +5265,106 @@ void OnPresent(uint32_t front_buffer) {
     r->queue->executeCommandLists(submit, r->fences[r->back_index].get());
   }
   r->submitted[r->back_index] = true;
-  if (backend::DeviceLost(r->device.get())) {
+  // (test: SVR2011_TEST_DEVICE_LOST_AT=<frame> - the device taken as lost there)
+  static const uint64_t test_lost = uint64_t(EnvInt("SVR2011_TEST_DEVICE_LOST_AT", 0));
+  if (backend::DeviceLost(r->device.get()) || (test_lost && r->frames == test_lost)) {
     ReportDeviceRemoved(r);
     return;
   }
+  if (shot && capture && WaitForFrame(r, r->back_index, "frame capture")) {
+    if (const auto* px = static_cast<const uint8_t*>(shot->map())) {
+      std::vector<uint8_t> rgb(size_t(g_out_w) * g_out_h * 3);
+      for (uint32_t y = 0; y < g_out_h; ++y) {
+        const uint8_t* s = px + size_t(y) * shot_row * 4;
+        uint8_t* d = rgb.data() + size_t(y) * g_out_w * 3;
+        for (uint32_t x = 0; x < g_out_w; ++x) std::memcpy(d + size_t(x) * 3, s + size_t(x) * 4, 3);
+      }
+      shot->unmap();
+      std::lock_guard lock(g_capture_mutex);
+      g_capture = std::move(rgb), g_capture_w = g_out_w, g_capture_h = g_out_h;
+    }
+  } else if (shot && test_shot && WaitForFrame(r, r->back_index, "test frame shot")) {
+    if (const auto* px = static_cast<const uint8_t*>(shot->map())) {
+      if (FILE* f = std::fopen(shot_file.c_str(), "wb")) {  // (binary PPM, RGB)
+        std::fprintf(f, "P6\n%u %u\n255\n", g_out_w, g_out_h);
+        std::vector<uint8_t> row(size_t(g_out_w) * 3);
+        for (uint32_t y = 0; y < g_out_h; ++y) {
+          const uint8_t* s = px + size_t(y) * shot_row * 4;
+          for (uint32_t x = 0; x < g_out_w; ++x) std::memcpy(&row[size_t(x) * 3], s + size_t(x) * 4, 3);
+          std::fwrite(row.data(), 1, row.size(), f);
+        }
+        std::fclose(f);
+        REXLOG_INFO("native renderer: test frame shot {}x{} -> {} (jitter {} {})", g_out_w, g_out_h, shot_file,
+                    g_jitter[0], g_jitter[1]);
+      }
+      shot->unmap();
+    }
+  }
+#if SVR2011_FSR2
+  if (!r->fsr2_dumps.empty() && WaitForFrame(r, r->back_index, "FSR 2 dump")) {
+    for (auto& d : r->fsr2_dumps)
+      if (const auto* px = static_cast<const uint8_t*>(d.buffer->map())) {
+        if (FILE* f = std::fopen(d.file.c_str(), "wb")) {
+          for (uint32_t y = 0; y < d.h; ++y) std::fwrite(px + size_t(y) * d.row * d.bytes, d.bytes, d.w, f);
+          std::fclose(f);
+        }
+        d.buffer->unmap();
+      }
+    r->fsr2_dumps.clear();
+  }
+#endif
+#if SVR2011_DEBUG_SUITE
+  if (shot && !test_shot && WaitForFrame(r, r->back_index, "dbg shot")) {
+    if (const auto* px = static_cast<const uint8_t*>(shot->map())) {
+      svr2011::dbg::WriteShot(px, g_out_w, g_out_h, shot_row * 4);
+      shot->unmap();
+    }
+  }
+#endif
   // This frame, for the emulator's next swap (rex/external_frame.h).
   g_last_hidden = r->hidden_frame;
   if (!r->hidden_frame)  // (a frame not shown keeps the last one on screen)
     backend::PublishFrame(r->outputs[r->output_index], g_out_w, g_out_h, r->fences[r->back_index].get());
   r->frame_open = false;
   ++r->frames;
-  g_frame_2d = (g_wide > 1.0f || g_tall > 1.0f) && r->frame_stats.drawn > 0 && r->frame_stats.wide_3d == 0;
+  {
+    // native_jitter: the next frame's offset - Halton (2, 3), 8 frames, centred on the pixel.
+    static bool jitter = REXCVAR_GET(native_jitter);
+    if ((r->frames & 31) == 0) jitter = REXCVAR_GET(native_jitter);
+    // (FSR 2 gathers the jittered frames: on with it, in the frames it runs)
+#if SVR2011_FSR2
+    const bool fsr2_jitter = g_fsr2 && r->fsr2_last_frame + 2 >= r->frames;
+#else
+    const bool fsr2_jitter = false;
+#endif
+    auto halton = [](uint32_t i, uint32_t b) {
+      float f = 1.0f, v = 0.0f;
+      for (; i; i /= b) v += (f /= float(b)) * float(i % b);
+      return v;
+    };
+    const uint32_t i = uint32_t(r->frames % 8) + 1;
+    g_jitter[0] = jitter || fsr2_jitter ? halton(i, 2) - 0.5f : 0.0f;
+    g_jitter[1] = jitter || fsr2_jitter ? halton(i, 3) - 0.5f : 0.0f;
+  }
+  {
+    // A 2D screen (no depth-tested draws into the wide / tall targets): the next frame's 2D in the 16:9 middle,
+    // black bars around it. In a match only once it lasts (kFrames2d): a big move's camera cut has a lone frame
+    // or two without the scene (2 draws), which got the bars and the next frame's scene squeezed into the
+    // 16:9 band - a "cut in half" flash with a black line (16:10 report, 23 Oct).
+    constexpr int kFrames2d = 4;
+    static int run_2d = 0;
+    const bool flat =
+        (g_wide > 1.0f || g_tall > 1.0f) && r->frame_stats.drawn > 0 && r->frame_stats.wide_3d == 0;
+    run_2d = flat ? run_2d + 1 : 0;
+    g_frame_2d = flat && (run_2d >= kFrames2d || !g_match_scene.load());
+    if (flat && run_2d == 1 && g_match_scene.load()) {
+      g_flat_frame_seen = true;  // (test aid: SVR2011_TEST_FRAME_SHOT_ON_2D)
+      static int logged = 0;
+      if (logged++ < 20)
+        REXLOG_INFO("native renderer: frame {} without the scene in a match ({} draws) - kept full size", r->frames,
+                    r->frame_stats.drawn);
+    }
+  }
   {
     static const std::string drawlog = [] {
       char* e = nullptr;
@@ -4229,6 +5705,35 @@ void OnResolve(const PPCContext& ctx) {
     dst.host_h = dst_host_h;
   }
   auto* list = r->list;
+#if SVR2011_FSR2
+  if (g_fsr2 && !depth && t.depth && g_match_scene.load() && SceneTarget(src_w, src_h) &&
+      t.depth->host_w == src_host_w && t.depth->host_h == src_host_h) {
+    // FSR 2's depth: the scene's, copied as the scene is resolved (its colour - the front buffer - comes later).
+    if (!r->fsr2_depth || r->fsr2_depth_w != src_host_w || r->fsr2_depth_h != src_host_h) {
+      if (r->fsr2_depth) Retire(r, std::move(r->fsr2_depth));
+      plume::RenderTextureDesc d = plume::RenderTextureDesc::Texture2D(
+          src_host_w, src_host_h, 1, backend::DepthFormat(),
+          backend::ActiveApi() == backend::Api::kVulkan ? plume::RenderTextureFlag::DEPTH_TARGET
+                                                        : plume::RenderTextureFlag::NONE);
+      d.committed = true;
+      r->fsr2_depth = r->device->createTexture(d);
+      r->fsr2_depth_layout = RenderTextureLayout::UNKNOWN;
+      r->fsr2_depth_w = src_host_w, r->fsr2_depth_h = src_host_h;
+      if (r->fsr2_depth) r->fsr2_depth->setName("FSR 2 depth");
+    }
+    DrawFsr2Masks(r, t.depth, src_host_w, src_host_h);
+    DrawFsr2SkinMotion(r, t.depth, src_host_w, src_host_h);
+    if (r->fsr2_depth) {
+      const RenderTextureLayout before = t.depth->layout;
+      Transition(r, t.depth->resource.get(), t.depth->layout, RenderTextureLayout::COPY_SOURCE);
+      Transition(r, r->fsr2_depth.get(), r->fsr2_depth_layout, RenderTextureLayout::COPY_DEST);
+      list->copyTexture(r->fsr2_depth.get(), t.depth->resource.get());
+      Transition(r, r->fsr2_depth.get(), r->fsr2_depth_layout, RenderTextureLayout::SHADER_READ);
+      if (before != RenderTextureLayout::UNKNOWN) Transition(r, t.depth->resource.get(), t.depth->layout, before);
+      r->fsr2_depth_frame = r->frames;
+    }
+  }
+#endif
   const RenderTextureLayout src_before = *src_layout;
   Transition(r, src, *src_layout, RenderTextureLayout::COPY_SOURCE);
   Transition(r, dst.resource.get(), dst.layout, RenderTextureLayout::COPY_DEST);
@@ -4250,6 +5755,8 @@ void OnResolve(const PPCContext& ctx) {
     // so the view swaps them back. (The mirror doesn't hold the resolve's
     // RB_COPY_DEST_INFO: the destination's swizzle tells.)
     const bool swap_rb = t.color->components == 4 && ((fetch[3] >> 1) & 7) == 2;
+    dst.swap_rb = swap_rb;
+    dst.view_format = t.color->view_format;
     textures::RegisterResolved(base, dst.resource.get(), t.color->view_format,
                                t.color->view_gamma_format, t.color->components, swap_rb,
                                dst_w * dst_h * 4);

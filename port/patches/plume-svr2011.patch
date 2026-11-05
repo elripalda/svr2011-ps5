@@ -1029,10 +1029,10 @@ index 0789c20..3f803fe 100644
  endif()
 diff --git a/plume_d3d11.h b/plume_d3d11.h
 new file mode 100644
-index 0000000..6887b83
+index 0000000..1808745
 --- /dev/null
 +++ b/plume_d3d11.h
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,311 @@
 +//
 +// plume
 +//
@@ -1100,9 +1100,11 @@ index 0000000..6887b83
 +            Microsoft::WRL::ComPtr<ID3D11Resource> staging;
 +            uint32_t subresource = 0;
 +            uint64_t offset = 0;
-+            uint32_t rowPitch = 0;
++            uint32_t rowPitch = 0;     // (the buffer's: the footprint's padded row)
 +            uint32_t rows = 0;
 +            uint32_t depth = 1;
++            uint32_t rowBytes = 0;     // the staging texture's data per row (its width; the
++            uint32_t stagingRows = 0;  // footprint row can be wider) and its rows
 +        };
 +        std::mutex readbackMutex;
 +        std::vector<PendingReadback> readbacks;
@@ -1234,6 +1236,10 @@ index 0000000..6887b83
 +        std::deque<Submission> pending;
 +        std::atomic<uint64_t> submitted = 0;
 +        std::atomic<uint64_t> replayed = 0;
++        // The GPU has finished every submission up to this one: the fences' queries checked by the replay thread while
++        // it holds the context lock (pollFinished) - a frame wait that finds its submission here takes no lock.
++        std::atomic<uint64_t> finished = 0;
++        std::deque<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D11Query>>> inFlight;  // (the context lock's)
 +        bool stop = false;
 +        std::thread thread;
 +
@@ -1244,6 +1250,8 @@ index 0000000..6887b83
 +        void worker();
 +        // Waits until submission `number` has been replayed.
 +        bool waitReplayed(uint64_t number, uint32_t timeoutMs);
++        // The queries the GPU has passed (oldest first, without a flush): `finished` moved on. The context lock held.
++        void pollFinished();
 +        std::unique_ptr<RenderCommandList> createCommandList() override;
 +        std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) override { return nullptr; }
 +        void executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) override;
@@ -1269,6 +1277,7 @@ index 0000000..6887b83
 +        // and time uploading upload buffers, time replaying the commands.
 +        std::atomic<uint64_t> statDraws = 0;
 +        std::atomic<uint64_t> statUploadBytes = 0;
++        std::atomic<uint64_t> statFenceWaits = 0, statFenceLockFree = 0;  // (frame waits; those answered without the context lock)
 +        std::atomic<uint64_t> statUploadNs = 0;
 +        std::atomic<uint64_t> statReplayNs = 0;
 +        std::atomic<uint64_t> statLockWaitNs = 0;  // (the presenter holding the context)
@@ -1332,13 +1341,15 @@ index 0000000..6887b83
 +    extern uint32_t D3D11FlushDrawLimit;
 +    // Submissions replayed on the queue's thread (false: in executeCommandLists).
 +    extern bool D3D11AsyncReplay;
++    // Constant buffers never mapped NO_OVERWRITE, even where the driver says it can (each upload a renamed copy).
++    extern bool D3D11NoOverwriteConstantsOff;
 +};
 diff --git a/plume_d3d11.cpp b/plume_d3d11.cpp
 new file mode 100644
-index 0000000..ae7405c
+index 0000000..3118f5f
 --- /dev/null
 +++ b/plume_d3d11.cpp
-@@ -0,0 +1,1828 @@
+@@ -0,0 +1,1874 @@
 +//
 +// plume
 +//
@@ -1724,6 +1735,7 @@ index 0000000..ae7405c
 +    void (*D3D11LogFunction)(const char *message) = nullptr;
 +    uint32_t D3D11FlushDrawLimit = 1000;
 +    bool D3D11AsyncReplay = true;
++    bool D3D11NoOverwriteConstantsOff = false;
 +
 +    // D3D11Buffer
 +
@@ -1760,11 +1772,15 @@ index 0000000..ae7405c
 +                    if (FAILED(device->context->Map(p.staging.Get(), p.subresource, D3D11_MAP_READ, 0, &mapped))) {
 +                        continue;
 +                    }
++                    // Per row: the bytes the staging row holds (not the buffer's padded pitch - reading that
++                    // much ran past the staging copy's end on the last row).
++                    const uint32_t bytes = std::min({p.rowPitch, p.rowBytes ? p.rowBytes : p.rowPitch, uint32_t(mapped.RowPitch)});
++                    const uint32_t rows = p.stagingRows ? std::min(p.rows, p.stagingRows) : p.rows;
 +                    for (uint32_t z = 0; z < p.depth; ++z) {
-+                        for (uint32_t y = 0; y < p.rows; ++y) {
++                        for (uint32_t y = 0; y < rows; ++y) {
 +                            const uint64_t dst = p.offset + (uint64_t(z) * p.rows + y) * p.rowPitch;
-+                            if (dst + p.rowPitch > desc.size) break;
-+                            std::memcpy(cpu + dst, static_cast<const uint8_t *>(mapped.pData) + size_t(z) * mapped.DepthPitch + size_t(y) * mapped.RowPitch, p.rowPitch);
++                            if (dst + bytes > desc.size) break;
++                            std::memcpy(cpu + dst, static_cast<const uint8_t *>(mapped.pData) + size_t(z) * mapped.DepthPitch + size_t(y) * mapped.RowPitch, bytes);
 +                        }
 +                    }
 +                    device->context->Unmap(p.staging.Get(), p.subresource);
@@ -1922,7 +1938,22 @@ index 0000000..ae7405c
 +        d.BindFlags = bind;
 +        d.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
 +        Microsoft::WRL::ComPtr<ID3D11Texture2D> t;
-+        if (SUCCEEDED(device->d3d->CreateTexture2D(&d, zeroed ? initial.data() : nullptr, &t))) d3d = t;
++        const HRESULT hr = device->d3d->CreateTexture2D(&d, zeroed ? initial.data() : nullptr, &t);
++        if (SUCCEEDED(hr)) {
++            d3d = t;
++        } else {
++            // (once a format: a texture the driver can't make samples as nothing)
++            static std::mutex mutex;
++            static std::vector<DXGI_FORMAT> logged;
++            std::lock_guard lock(mutex);
++            if (std::find(logged.begin(), logged.end(), format) == logged.end()) {
++                logged.push_back(format);
++                char message[192];
++                std::snprintf(message, sizeof(message), "plume D3D11: a %ux%u texture of DXGI format %d (%u mip levels, bind %X) could not be made (%08X)",
++                              d.Width, d.Height, int(format), d.MipLevels, d.BindFlags, uint32_t(hr));
++                if (D3D11LogFunction) D3D11LogFunction(message);
++            }
++        }
 +    }
 +
 +    std::unique_ptr<RenderTextureView> D3D11Texture::createTextureView(const RenderTextureViewDesc &desc) const {
@@ -2683,7 +2714,7 @@ index 0000000..ae7405c
 +                if (!src->d3d || !dst) break;
 +                // A staging copy of the subresource, read into the buffer at map().
 +                Microsoft::WRL::ComPtr<ID3D11Resource> staging;
-+                UINT stagingSub = 0;
++                UINT stagingSub = 0, stagingW = 0, stagingH = 0;
 +                Microsoft::WRL::ComPtr<ID3D11Texture2D> t2;
 +                if (SUCCEEDED(src->d3d.As(&t2))) {
 +                    D3D11_TEXTURE2D_DESC d;
@@ -2691,6 +2722,7 @@ index 0000000..ae7405c
 +                    const UINT mip = c.a % d.MipLevels;
 +                    d.Width = std::max(d.Width >> mip, 1u);
 +                    d.Height = std::max(d.Height >> mip, 1u);
++                    stagingW = d.Width, stagingH = d.Height;
 +                    d.MipLevels = 1;
 +                    d.ArraySize = 1;
 +                    d.Usage = D3D11_USAGE_STAGING;
@@ -2712,6 +2744,13 @@ index 0000000..ae7405c
 +                p.rowPitch = c.b;
 +                p.rows = c.c;
 +                p.depth = c.d;
++                {
++                    // (a staging row holds only the texture's width: the footprint's row is padded to 256
++                    // bytes - a 736-wide Created Superstar portrait read 3072 bytes from 2944-byte rows)
++                    const uint32_t blockWidth = RenderFormatBlockWidth(src->desc.format);
++                    p.rowBytes = ((stagingW + blockWidth - 1) / blockWidth) * RenderFormatSize(src->desc.format);
++                    p.stagingRows = (stagingH + blockWidth - 1) / blockWidth;
++                }
 +                std::lock_guard lock(dst->readbackMutex);
 +                dst->readbacks.push_back(std::move(p));
 +                break;
@@ -2781,6 +2820,7 @@ index 0000000..ae7405c
 +        std::lock_guard lock(*device->contextMutex);
 +        const auto t1 = std::chrono::steady_clock::now();
 +        device->statLockWaitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++        pollFinished();
 +        uint32_t draws = 0;
 +        for (const RenderCommandList *list : submission.lists) {
 +            static_cast<const D3D11CommandList *>(list)->replay();
@@ -2791,6 +2831,7 @@ index 0000000..ae7405c
 +            Microsoft::WRL::ComPtr<ID3D11Query> query;
 +            if (SUCCEEDED(device->d3d->CreateQuery(&q, &query))) {
 +                device->context->End(query.Get());
++                inFlight.emplace_back(submission.number, query);
 +            }
 +            std::lock_guard fenceLock(fence->mutex);
 +            if (fence->submission == submission.number) fence->query = query;
@@ -2801,6 +2842,16 @@ index 0000000..ae7405c
 +        // and the fence wait (GetData) or the presenter's Present flushes them.
 +        if (draws < D3D11FlushDrawLimit) {
 +            device->context->Flush();
++        }
++    }
++
++    void D3D11CommandQueue::pollFinished() {
++        while (!inFlight.empty()) {
++            BOOL done = FALSE;
++            const HRESULT hr = device->context->GetData(inFlight.front().second.Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH);
++            if (hr != S_OK && SUCCEEDED(hr)) return;  // (S_FALSE: not yet)
++            finished = inFlight.front().first;
++            inFlight.pop_front();
 +        }
 +    }
 +
@@ -2851,6 +2902,11 @@ index 0000000..ae7405c
 +            number = f->submission;
 +        }
 +        if (!number) return true;
++        ++device->statFenceWaits;
++        if (finished >= number) {  // (seen done by the replay thread: no context lock)
++            ++device->statFenceLockFree;
++            return true;
++        }
 +        // Replayed first (the fence's query is made then), then the GPU done.
 +        if (!waitReplayed(number, timeoutMs)) return false;
 +        Microsoft::WRL::ComPtr<ID3D11Query> query;
@@ -2866,6 +2922,7 @@ index 0000000..ae7405c
 +                BOOL done = FALSE;
 +                const HRESULT hr = device->context->GetData(query.Get(), &done, sizeof(done), 0);
 +                if (hr == S_OK || FAILED(hr)) {
++                    pollFinished();  // (the lock held: the older ones too)
 +                    return true;
 +                }
 +            }
@@ -2886,7 +2943,7 @@ index 0000000..ae7405c
 +        ctx.As(&context1);
 +        D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
 +        if (SUCCEEDED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options)))) {
-+            mapNoOverwriteConstants = options.MapNoOverwriteOnDynamicConstantBuffer;
++            mapNoOverwriteConstants = options.MapNoOverwriteOnDynamicConstantBuffer && !D3D11NoOverwriteConstantsOff;
 +        }
 +        capabilities.maxTextureSize = featureLevel >= D3D_FEATURE_LEVEL_11_0 ? 16384 : 8192;
 +        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;

@@ -134,6 +134,105 @@ Test switch `SVR2011_TEST_HCTP_ROOF=props` in rooms 31-36 drives the interaction
 generator, slam; racks, wall, locker, toilet, shower; lion; window, pole) and puts fighter 0 (the scripted
 pad) by the forklift (31) / under the helicopter (33).
 
+## The HCTP backstage as walkable worlds (2026-10-20, branch hctp-full)
+
+`tools/backstage_port.py convert --item hctpworld` (Back Entrance, Parking Lot, Training Room, Times Square,
+Outside the Arena) and `--item hctpfountain` (Fountain Square, Parking Lot, Back Entrance, Training Room) build
+one backstage row each whose rooms the fighters walk between through HCTP's own gates (`tools/hctp/build_world.py
+<unpacked> <pac11> <work> <mod> [rooms]`; the first room is where the match starts). Both are offered as a BETA
+(the Mod Maker's Backstage page lists them; `SVR2011_HCTP_WORLDS=0` hides them) and need 2.1.6.
+- Limits found: 2011 loads ~400 stage meshes at most (stock bg78 445 with its characters' share; 5 rooms =
+  ~400 load, 6 = 625 fail in the stage loader sub_826E73F8 - the null comes from allocator 128's physical
+  window 0x15140000-0x16230000, ~17 MB, shared with the stage textures and the gimmick package; texture bytes
+  alone weren't it: six rooms at PS2 resolution still failed). Room 35 alone is 225 meshes (61 textures on
+  its ground) - hence two worlds. World builds upscale PS2 textures 2x (see-through 1x; single rooms 4x / 2x),
+  cap the stage bundle at 3.5 MB (world_stage.TEX_BUDGET) and leave out HCTP 'w' models (HCTP_DROP_W).
+- The match camera's framed target stays inside the stock backstage (it stopped at x 325 when the rooms
+  stood 1000 apart along x): all rooms lie one over the other in the parking room's place.
+- Stage (`world_stage.py`): room k in model ids 20k..20k+19 (stock bg78 keeps one room per id block too);
+  its texture names get the prefix `k`; stock models 0-199 not taken are stubs and their textures go; all
+  rooms' collision in the parking pair 1003 / 1004 (rooms in order).
+- Gimmick package: every room's props as objects 1000-1139 (stock CFRS uses 1000-1139 for its rooms),
+  records in room order, then the climb spots room by room; the bank = bank_wr + each room's object acts from
+  its own first key (31: 13000, 32: 13100, 33: 13200, 34: 13300, 35: 13400; room 30's are in bank_h3).
+- hctp.txt: `room <n> <model lo> <hi> <object lo> <hi> <object act key> <x0> <x1> <z0> <z1> <tri lo> <hi>
+  <spot lo> <hi>` before each room's lines (triangles after stage_wrap's dummies: k + k // 255), `door <id>
+  <to> <x> <y> <z> <exit act> <way out> <x,z;x,z;... 8 spots> <way in>` (older builds: `<entry x> <entry z>
+  <entry yaw>`) and `spawn <model> <x> <y> <z>` (weapons put down on the room's first visit; the first room's
+  are the manifest's weapons=).
+- HCTP's gates (SLES_520.36, `tools/hctp/re/gate/`: CGate4 / CMoveStage disassembly and gate_tables.py): each
+  stage 50000.txt `m` point (id at weapon +0x30) is a gate. g_stg_audi_list (0x419FB0, 2 bytes per id) gives
+  the stage it leads to (0 = the arena) and the point there you come in at; bord_group_list+0x10 (0x419F90,
+  s16 per id) the exit act. CGate4::Action (backstage rules only, not in the first 300 frames, 209 only once
+  hide item 11 is unlocked): a wrestler on his feet within 10 of the point on x, y and z who presses the action
+  button (pad 0x80; the CPU too) while walking. CMoveStage plays the exit act on him at the point, the others
+  stand (act 0), then loads the stage; Rear puts wrestler i at the entry point + its rotation of
+  (offx[i], 0, offz[i] - 33), offx -9 9 -9 9 -12 12 0 14, offz 8 8 -8 -8 0 0 0 -10. CGate4::Draw draws a lit
+  marker, no text.
+
+  | gate (room) | leads to | exit act |   | gate (room) | leads to | exit act |
+  |---|---|---|---|---|---|---|
+  | 201 (30) | arena 200 | 15919 | | 206 (31) | 207 (34) / 208 (35) | 15919 |
+  | 202 (30) | 203 (32) | 15900 | | 207 (34) | 206 (31) | 15919 |
+  | 203 (32) | 202 (30) | 15907 | | 208 (35) | 206 (31) | 15919 |
+  | 204 (30) | 205 (31) | 15902 | | 209 (34) | 210 (33) | 15909 |
+  | 205 (31) | 204 (30) | 15902 | | 210 (33) | 209 (34) | 15909 |
+
+  Fountain Square (35) is never next to Outside the Arena (34): 35 takes 34's place when the match started
+  in stage 0x16 / 0x17 (31's gate 206 then leads to 35's 208) - hence two worlds, and Times Square (33, only
+  through 34's 209) isn't in the fountain one. The exit acts (HCTP MOT_GAME/00004.bin 15900-15919) are in the
+  world bank as 12900 + n. 201 (back to the arena) has no room here.
+- Game (hctp_room.cpp): after each CFRS update (match_types.cpp hook) only the current room's models
+  (sub_8252FF40) and its records' objects (sub_824B4198) are shown; the other rooms' collision triangles are
+  lifted away (as DropCollision) and their climb spots inactive (sub_824B8FE0); only its props run. A player at a
+  gate (within 10 on each axis in HCTP, 16 across here: 2011's walls keep him 12 from room 30's roof gate;
+  an older door line: within 22, 4 up or down; on his feet: motion 0 /
+  stance 20 / walking / running) sees the prompt "<Y> GO TO <room>" (DoorPromptOverlay, match_hud.h's panel;
+  the button as his pad names it: Y, TRIANGLE or his keybind_y key) and goes through with Y; a CPU (port
+  char+1152 >= 4) walks or runs into one for 30 frames (its AI chasing - CPU-vs-CPU keeps changing rooms);
+  ROOF=walkin gives players the walk-in too. He plays the gate's exit act there facing out (held placement at
+  the point; through once his motion is no longer the act or its frames have played - the act holds its last
+  frame - at once if the bank lacks it; the others get act 0 and are kept where they stood meanwhile - HCTP
+  stops the pads; the acts' screen fade, event op 18, is dropped by hctp2ymks.py: HCTP's next stage load fades
+  back in, 2011 stayed black - DoorPromptOverlay draws the fade instead: black over the act's last 20 frames,
+  back in over 20 in the new room),
+  then every fighter goes through (in HCTP the opponent came along): fighter i at the other gate's spot i
+  (older lines: side by side at its entry), the fight box moved to that room (SetFightBox), the camera's eye
+  put at the framed target +
+  its old offset for 30 views (SnapMatchCamera - moving the eye once didn't hold: the camera rebuilt it).
+  A room's runtime state (later shows, taxis, poles, heli, forklift, what ShowRec hid) is kept while it is
+  away. Test switches `SVR2011_TEST_HCTP_ROOF=tour`: a door every 6 seconds; `=door`: fighter 0 put on the first door's trigger 5 s in (walk with the scripted stick); `=fork` (room 31): fighter 0 gets on the forklift 5 s in; `SVR2011_TEST_HCTP_NOVIS=1 /
+  models / objects`: the stock visibility only.
+- Online (inputs-only netplay, svrtest lan): the doors work and stay in step (same at 300 / 600 / 1200 / 1500,
+  the wrestlers at the other door's entry). Two things it took: (1) online the game's update puts a wrestler
+  back on his physics body, which then eases toward him over several frames - a door's placement is held:
+  written again at the start of the next 10 world frames, before the game's update (HctpBeforeFrame,
+  frame_rate.cpp), with the body's other position copies +704 / +768; (2) a port (char+1152) is local - the
+  other side's player has one of 4 or more - so online every wrestler counts as a player (Y; no CPU walk-in)
+  and both games decide alike. The prompt shows only for this PC's own players.
+- Weapons: lying ones are parked 5000 below the floor while their room is away (the match's weapon objects,
+  72 pointers at 0x82DE0220, position +288..+296) and put back on return; one within 14 of a wrestler stays
+  (held: it goes with him; one only lying by him shows in the next room).
+
+HCTP's own model flags (50001.txt legend): s normal translucent, a additive translucent, k translucent
+before shadows, z no z-write, m(n) motion, l(n) light motion, r / y also drawn mirrored / turned, n near
+clip, e events only, w only in the move camera during play. 2011 reads s / a / z / n itself (stock bg78:
+s on shadow / line decals, a + l(101..) on light cones). HCTP 'a' layers became plain translucent ('s') at a
+quarter of their vertex alpha: 2011 draws 'a' in its light motion's colour (Times Square's traffic-light
+glows, 208 x 208 ground quads with green / yellow vertex colours, covered the street solid green - also with
+l(101)).
+
+Facing conventions (2011): a fighter's yaw y faces (sin y, cos y); a gimmick object's local +z at yaw a
+points (-sin a, cos a) - objects turn the other way. The traffic car (atan2(-dx, dz)) and the forklift
+(model yaw pi - heading) were driving mirrored ("wrong way"). Wrestlers put at a prop take FighterYaw(prop yaw) = -yaw
+(+ the HCTP turn): with the prop's own yaw they faced the mirrored way on props turned 90 (room 35's lions
+at +-3pi/4, room 30's crate at -pi/2; props at 0 / pi are the same either way).
+
+PS2 culling: the room shells wind like stock 2011 (every triangle agrees with its normals; normals unit),
+but the PS2 drew everything from both sides. Converted meshes now clear render flag 0x2 (back-face cull) for
+props and for cut-out / blended textures (fences, grilles, signs); solid walls stay culled, so a camera
+outside a room still sees in. Room 33's taxis had mixed winding - double-sided now.
+
 ## State when paused (2026-10-14, branch hctp-resume)
 
 Done and checked in game: all seven rooms build and load (60 fps) with their props, own weapons and
@@ -148,8 +247,12 @@ Next steps (none started):
   stage-light control found.
 - Room 30's button lamps (CGmSwitchLight 1246): drawn as grey slabs as plain objects - needs an additive /
   emissive draw.
-- Fountain throw (room 35) and treadmill / sandbag knock-down: coded, not driven by a test yet (a real Irish
-  whip / A mashing with the scripted pad).
+- Fountain throw (room 35): checked (21 Oct, ROOF=props puts both by the basin at 1100: 12627 x / y 0 and 1
+  found, the throw plays). Treadmill: checked (ROOF=props puts fighter 0 on it at 800;
+  A mashed: level 1, 12674; he runs facing the console). Sandbag knock-down: coded, not driven by a test yet.
+- Motion keys: a call's (x, y) match the bank entry's second / first field (logged with SVR2011_TEST_HCTP_LOG);
+  lookups the game makes itself for acts HCTP has in one part only (12679 y 1, 12606 / 12608 y 50 ..) miss
+  harmlessly.
 - Lion statue fade (HCTP draws it at 0.3 when a wrestler is behind it), broken-car crushed collision (2098),
   locker-door / TV / window weapons (2011 has no matching weapons), taxi and forklift solidity (static
   collision only).

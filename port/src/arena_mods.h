@@ -2,7 +2,9 @@
 // Plan and findings: docs/ARENA_MOD_MAKER_PLAN.md.
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rex::memory {
@@ -22,6 +24,11 @@ void InstallArenaMods(rex::memory::Memory* memory, rex::filesystem::VirtualFileS
 // The arena select page label (an ImGui overlay).
 void InstallArenaModsOverlay(rex::ui::ImGuiDrawer* drawer);
 
+// The arena mods with their own VS theme (vs/theme.pac): {id, file} - vs_styles.cpp merges them into its overlay
+// pac and gives each its group ("VA00" ...), used on the VS screen while that arena is chosen.
+std::vector<std::pair<std::string, std::string>> ArenaThemePacs();
+void SetArenaThemeGroup(const std::string& id, const std::string& group);
+
 // Serve <game folder>/<relative_file> whenever the game opens arena BGnn
 // (empty: back to the original). Takes effect at the next open (arenas are
 // opened when they load, not held open).
@@ -38,15 +45,27 @@ void SetMatchLoading(bool loading);
 // on; "" when a stock arena), and another game's pick played here too (on
 // that tile; "" back to none) - false when it isn't installed here.
 std::string ArenaModInUse(int* tile);
+// The manifest text of the custom arena the next match loads ("" when a stock arena): crowd_fight.cpp.
+std::string ArenaModManifest();
 bool UseArenaMod(const std::string& folder, int tile);
 
 // String lookups (menu_hooks.cpp, r3 for the lookup from `caller`, 0 for the
 // game's): the online arena screen's title on a custom arena's tile.
 uint32_t ArenaSelectString(uint32_t caller);
 
+// A superstar mod's loading picture (1024 x 512 DXT5 file; "" none) for the match being set up: the NOW LOADING
+// screen shows it in place of the game's (and of a custom arena's own) while that match loads (test_match.cpp:
+// person 0's, else the next person's in slot order).
+void SetSuperstarLoading(const std::string& file);
 // The arena number a match in that arena plays as (RedirectArena: the stock
 // practice ring on another tile plays as 29); the arena itself otherwise.
 int ArenaNumberFor(int arena);
+// The match screen's arena read (sub_8247B6C8(screen), test_match.cpp's hook - the match loads by it): a custom
+// arena's tile set to the arena it plays as.
+void ScreenArenaRead(uint8_t* base, uint32_t screen);
+// A match loads (menu_hooks.cpp sub_823EEB98): the live settings' and the match screen's arena become the arena a
+// custom arena's tile plays as, before the load reads them.
+void ArenaPlaysAsAtLoad(uint8_t* base);
 // A player's pad buttons as the game read them (XInput bits, with LT / RT
 // pressed as 0x400 / 0x800): LB / RB and LT / RT turn the arena select page.
 void ArenaSelectPad(uint32_t user, uint16_t buttons);
@@ -86,5 +105,9 @@ const std::vector<BackstageRow>& BackstageRows();
 // The bg78 of row i for the next match (-1: the usual one).
 void UseBackstageRow(int i);
 extern int g_active_row;  // (the row in use, -1 none)
+
+// The size (in 0x100 bytes) of stage entry `entry` ("/STG/0019") in the file a redirected arena serves, when it
+// differs from the shipped file's - the size the game's file loader must read it at (model_mem.cpp); 0 otherwise.
+uint32_t ServedStageUnits(const char* entry);
 
 }  // namespace svr2011

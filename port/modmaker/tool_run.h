@@ -50,12 +50,28 @@ bool RunTool(const std::wstring& script, const std::vector<std::wstring>& args, 
 // the log and its "progress <0-100> <text>" lines to the status bar.
 bool RunToolJson(const std::wstring& script, const std::vector<std::wstring>& args,
                  std::function<void(int code, const std::string& out)> done, const std::wstring& cwd = L"");
+// Move converting is experimental: a RunToolJson that converts moves (moves_port.py convert, superstar_port.py
+// convert without --no-moves) first shows a warning the player must accept - once per session, never again with its
+// "Don't show this again". Cancel: nothing runs and done() gets exit 2 with {"ok":false,"error":...}. Each frame:
+// MovesWarning() draws it. Hidden test runs (--behind) skip it unless SVR2011_TEST_MOVES_WARNING is set
+// (show: just shown; accept / accept_dont_show / cancel: answered after a moment, for the test).
+void MovesWarning();
+bool ConvertsMoves(const std::wstring& script, const std::vector<std::wstring>& args);
+
 // Stops the running RunToolJson converter and everything it started (its job object); its done() then gets a
 // non-zero code and ToolCancelled() is true until the next converter starts.
 void CancelTool();
 bool ToolCancelled();
 // Any process the same way (a full command line).
 bool RunCommand(const std::wstring& cmdline, std::function<void(int)> done, const std::wstring& cwd = L"");
+
+// A full command line run hidden and waited for (a worker thread: it blocks), stdout and stderr into `out`;
+// its exit code (-1: it didn't start). Not a converter job: CancelTool doesn't stop it.
+int RunWait(const std::wstring& cmdline, std::string& out);
+// An entrance / titantron movie (.bik, .bk2, any video ffmpeg reads) as an .mp4 at `out`: port/tools/movie_shrink.py
+// when it is there (its CLI: <in> <out.mp4> --ffmpeg <exe>, the last stdout line its JSON), else ffmpeg itself
+// (H.264 CRF 20, yuv420p, AAC, +faststart, the size and rate kept). Blocks; "" when made, else why in plain words.
+std::string ShrinkMovie(const std::wstring& in, const std::wstring& out);
 
 // Quotes one argument for a command line.
 std::wstring Quote(const std::wstring& arg);

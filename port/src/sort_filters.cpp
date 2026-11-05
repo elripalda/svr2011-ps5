@@ -38,15 +38,15 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+#include "big_roster.h"
 #include "generated/default/svr2011_init.h"
+#include "rtwm_streak.h"
 #include "superstar_mods.h"
+#include "../modmaker/svrfmt/bytes.h"
 
 namespace {
 
-uint32_t Rd32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
-void Wr32(uint8_t* p, uint32_t v) {
-  p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
-}
+using svrfmt::Rd32, svrfmt::Wr32;
 
 constexpr uint32_t kListSize = 2580, kMaxEntries = 322, kFlags = 4 + 1288;
 constexpr uint32_t kSmackDown = 1, kRaw = 2, kNpc = 3, kMods = 5;
@@ -170,9 +170,9 @@ void DumpRoster(uint8_t* base) {
   out << "# id\tname\t+209\tselectable\tgender(1 diva)\tdlc\n";
   int n = 0;
   for (uint32_t id = 1; id < 1000; ++id) {
-    const uint32_t index = uint32_t(base[kIdToIndex + id * 2]) << 8 | base[kIdToIndex + id * 2 + 1];
+    const uint32_t index = svr2011::RosterIndex(base, id);
     if (index >= 1000) continue;
-    const uint8_t* rec = base + kRecords + index * kRecordSize;
+    const uint8_t* rec = base + svr2011::RosterEntry(kRecords, kRecordSize, index);
     if ((uint32_t(rec[32]) << 8 | rec[33]) != id) continue;
     const std::string name(reinterpret_cast<const char*>(rec + 34), strnlen(reinterpret_cast<const char*>(rec + 34), 32));
     if (name.empty()) continue;
@@ -188,8 +188,36 @@ REX_EXTERN(__imp__sub_82734970);
 REX_HOOK_RAW(sub_82734970) {
   const uint32_t lists = ctx.r4.u32;
   __imp__sub_82734970(ctx, base);
-  if (lists) Retag(base, lists);
+  // (not a list of Create-a-Superstar slots: Road to WrestleMania's Streak story lists only those - its master holds
+  // slot numbers 0, 1, 2 ..., not roster ids - and NPC / MODS put roster ids in it: they showed, and picking one did
+  // nothing (slot 111...). A roster list has no id 0; its CAS entries have the top bit. Every id a slot number (under
+  // the 50 CAS slots) and id 0 there - or, in Road to WrestleMania, any slots: a save whose one CAW is in slot 2
+  // listed only {2}, was taken for a roster list and its MODS showed the CAW alone, 28 Oct.)
+  constexpr uint32_t kCasSlots = 50;
+  bool slots = false;
+  if (lists) {
+    const List master{base, lists + 6 * kListSize};
+    bool all_slots = master.Count() > 0, zero = false;
+    for (uint32_t i = 0; i < master.Count(); ++i) all_slots &= master.Id(i) < kCasSlots, zero |= master.Id(i) == 0;
+    slots = all_slots && (zero || svr2011::InRoadToWrestleMania());
+  }
+  if (lists && !slots) Retag(base, lists);
+  if (lists && !slots) svr2011::RtwmCasList(0, false);
+  // (Road to WrestleMania's Streak list: the superstar mods in MODS - rtwm_streak.cpp plays the story as one)
+  if (lists && slots && svr2011::InRoadToWrestleMania() && !svr2011::SuperstarModIds().empty()) {
+    const List master{base, lists + 6 * kListSize};
+    svr2011::RtwmCasList(master.Count() ? master.Id(0) : 0, true);
+    FillMods(base, lists);
+  }
   DumpRoster(base);
+  if (lists && std::getenv("SVR2011_TEST_LIST_LOG")) {  // (test aid: each category's count and first ids)
+    for (uint32_t c = 0; c < 8; ++c) {
+      const List l{base, lists + c * kListSize};
+      std::string ids;
+      for (uint32_t i = 0; i < l.Count() && i < 12; ++i) ids += fmt::format(" {:X}/{}", l.Id(i), l.Flag(i));
+      REXLOG_INFO("[svr2011] sort: list {:08X} cat {}: {} -{}", lists, c, l.Count(), ids);
+    }
+  }
 }
 
 // A category is shown: sub_824611B8(screen, player) - its label (the text

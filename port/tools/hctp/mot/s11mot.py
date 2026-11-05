@@ -1,5 +1,9 @@
 """SvR2011 YMKs character track -> per-frame (root, angles) using ymks.py (unpacked m.pac form)."""
 import collections
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # (its own folder: the embeddable Python doesn't add it)
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))  # (tools\: ymks.py)
 import ymks as Y
 
 

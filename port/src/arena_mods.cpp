@@ -23,6 +23,9 @@
 // untiled, with 16-bit words byte-swapped.
 #include "host_case.h"  // [ps5 port] game files in any letter case
 #include "backgrounds_page.h"
+#include "arena_lights.h"
+#include "no_mods.h"
+#include "weapon_mods.h"
 #include "arena_mods.h"
 #include "crowd_off.h"
 #include "move_packs.h"
@@ -37,6 +40,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <set>
 #include <cstring>
 #include <fstream>
@@ -69,6 +73,8 @@
 #include "native/native_renderer.h"
 #include "../modmaker/svrfmt/pac.h"
 #include "../modmaker/svrfmt/texture.h"
+#include "../modmaker/svrfmt/jboy.h"
+#include "util.h"
 
 namespace {
 
@@ -82,13 +88,47 @@ fs::path g_game, g_overlay;
 bool g_overlay_ready = false;
 std::string g_redirect[100];  // arena number -> relative file ("" = original)
 int g_number_for[100];        // arena number -> the number a match there plays as (0: its own), see RedirectArena
+// arena number -> the arena a match picked there plays as, + 1 (0: its own - stored + 1 so that a base of arena 0,
+// SmackDown, isn't taken for none: a mod built on SmackDown played its tile's stock arena, 30 Oct report): a custom
+// arena on another arena's tile plays as its base arena (FollowCursor), whose file is the custom one
+int g_plays_as[100];
 std::string g_default[100];   // arena number -> its file when no custom arena is on its tile (media mods: screens)
+// The served file's STG entries whose size differs from the shipped file's (RedirectArena): the game reads an entry
+// with the size its pac directory had when the pacs were mounted - the shipped file's (or plist360.arc's) - so a
+// bigger stage was read cut short (its end left out: a crash 6 s into the match) and a smaller one read past its end.
+// The file loader's read (model_mem.cpp) takes the served size instead (ServedStageUnits).
+struct StgEntry {
+  char name[5];
+  uint32_t sector, units;  // (units: size / 0x100, as the pac table and the loader's request keep it)
+};
+std::mutex g_stg_mutex;
+std::vector<StgEntry> g_served_stg[100];
 
-std::string Upper(std::string s) {
-  for (char& c : s) c = char(std::toupper(static_cast<unsigned char>(c)));
-  return s;
+// The STG group's entries of an EPAC's first 0x4000 bytes (with each entry's offset in `head`).
+std::vector<std::pair<StgEntry, size_t>> StgEntries(const char* head, size_t n) {
+  std::vector<std::pair<StgEntry, size_t>> out;
+  if (n < 0x4000 || std::memcmp(head, "EPAC", 4)) return out;
+  for (size_t p = 0x800; p + 12 <= n;) {
+    if (!head[p] && !head[p + 1] && !head[p + 2] && !head[p + 3]) break;
+    uint32_t words;
+    std::memcpy(&words, head + p + 4, 4);  // (little-endian)
+    const bool stg = !std::memcmp(head + p, "STG ", 4);
+    const size_t count = (words & 0xFFFF) / 3;
+    p += 12;
+    for (size_t e = 0; e < count && p + 12 <= n; ++e, p += 12) {
+      if (!stg) continue;
+      StgEntry s{};
+      std::memcpy(s.name, head + p, 4);
+      std::memcpy(&s.sector, head + p + 4, 4);
+      std::memcpy(&s.units, head + p + 8, 4);
+      out.push_back({s, p});
+    }
+    if (stg) break;
+  }
+  return out;
 }
 
+using svr2011::NowMs, svr2011::Upper;
 // Makes the file system see overlay/<name> as it is now: the host device
 // indexes a folder created after startup lazily, and keeps a file's size
 // from when it first saw it.
@@ -226,6 +266,7 @@ bool g_bpe_log = false;
 // u32 and byte) kept across requests; "hex:<bytes>" finds a byte pattern.
 void StartScan() {
   std::thread([] {
+    rex::thread::set_current_thread_name("arena scan");
     const fs::path trigger = g_game / "scan.txt";
     std::string last_text;
     std::vector<uint32_t> cand32, cand8;
@@ -298,9 +339,9 @@ void StartScan() {
 // Moving past the right edge goes to the next page, past the left edge to
 // the previous one (as the Paint Tool grid); LB / RB and LT / RT change the
 // page too (keyboard: 1 / 3 and Q / E, the controller keys' defaults).
-// A custom arena borrows its tile's arena as host: while its tile is the one
-// under the cursor, the host's file is the custom arena's
-// (RedirectArena), so the match that follows loads it.
+// A custom arena borrows its base arena as host: while its tile is the one
+// under the cursor, the host's file is the custom arena's (RedirectArena) and
+// a match on the tile plays as the host (PointAt), so the match loads it.
 
 struct Banner {
   std::string name;    // "arena_SD"
@@ -316,11 +357,17 @@ struct CustomArena {
   std::string id, name, file;  // file: relative to the game folder
   std::string manifest;        // its text (ring.* keys: ring_rules.h)
   std::string base;            // the arena it was made from (manifest base=arena_SS)
+  int base_arena = -1;         // its number (-1: no base - it plays as the tile's arena)
+  bool tron_live = false;      // manifest titantron=live: its video screens show the match camera (TitantronFile)
   svrfmt::Bytes banner;        // DXT5 blocks, 16-bit swapped (empty = none)
   // its VS screen pictures (vs/<name>.dds): name -> DXT5 blocks, swapped
   std::vector<std::pair<std::string, svrfmt::Bytes>> vs;
   // its loading screen (load.dds, 1024 x 512 DXT5): blocks, swapped
   svrfmt::Bytes load;
+  // its own VS screen (vs/theme.pac: VSTL / VSTI / VSTF, tools/vs_port.py theme): the file, and its group in the VS
+  // styles' overlay pac once vs_styles.cpp merged it ("VA00" ...; empty: the game's / the VS style's theme)
+  std::string theme_pac, theme_group;
+  svrfmt::Image card;  // the entrance title card's logo (card.dds / card=; empty: the base arena's card)
 };
 std::vector<CustomArena> g_customs;
 
@@ -457,40 +504,58 @@ void LoadBanners() {
   }
 }
 
-// Custom arenas on the pages: each on the tile of the arena it was made
-// from (manifest base=), so it plays in that arena's place - the file the
-// game loads for that tile, with the memory room and VS screen style it was
-// made for. More than one on the same arena: pages 3, 4... Arenas without a
-// base fill the free tiles.
+// Custom arenas on the pages: in install order (g_customs: Mods/Arenas/order.txt), left to right and row by row,
+// no gaps - a page more only when one is full. Whatever tile one is on, a match on it plays as the arena it was
+// made from (manifest base=: its memory room, VS screen style, the game's per-arena data) - FollowCursor points
+// that arena's file at it and the match at that arena (g_plays_as). (Until 2.1.3 each sat on its base's tile:
+// page 2's SmackDown tile empty when no mod was made from SmackDown, RAW's filled.)
 std::vector<std::array<int, 20>> g_layout;  // pages 2.. : tile -> index in g_customs (-1)
 
-int TileOf(const std::string& banner) {
-  for (int k = 0; k < 20; ++k)
-    if (banner == g_tiles[k].banner) return k;
+int ArenaOfBanner(const std::string& banner) {
+  for (const Tile& t : kTiles)
+    if (banner == t.banner) return t.arena;
   return -1;
 }
 
 void LayOutPages() {
   g_layout.clear();
-  auto place = [](size_t i, int tile) {
-    for (auto& page : g_layout)
-      if (tile >= 0 ? page[tile] < 0 : true) {
-        if (tile >= 0) { page[tile] = int(i); return; }
-        for (int& t : page)
-          if (t < 0) { t = int(i); return; }
-      }
-    std::array<int, 20> page;
-    page.fill(-1);
-    page[tile >= 0 ? tile : 0] = int(i);
-    g_layout.push_back(page);
-  };
-  for (size_t i = 0; i < g_customs.size(); ++i)
-    if (TileOf(g_customs[i].base) >= 0) place(i, TileOf(g_customs[i].base));
-  for (size_t i = 0; i < g_customs.size(); ++i)
-    if (TileOf(g_customs[i].base) < 0) place(i, -1);
+  for (size_t i = 0; i < g_customs.size(); ++i) {
+    if (i % 20 == 0) g_layout.emplace_back().fill(-1);
+    g_layout.back()[i % 20] = int(i);
+  }
+}
+
+// The install order: Mods/Arenas/order.txt, a folder a line (the game's own file - written when a folder comes or
+// goes). Folders not in it yet (installed since) go last, by name among themselves; folders gone leave it, so the
+// rest close up. Switched-off ones keep their line (and their place when switched on again).
+std::vector<fs::path> InInstallOrder(const fs::path& dir, std::vector<fs::path> folders) {
+  std::vector<std::string> order, kept;
+  if (std::ifstream in(dir / "order.txt"); in)
+    for (std::string l; std::getline(in, l);) {
+      while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+      if (!l.empty() && std::find(order.begin(), order.end(), l) == order.end()) order.push_back(l);
+    }
+  std::error_code ec;
+  for (const auto& l : order)  // (folder names as written: the ANSI code page, as the mods' ids)
+    if (fs::exists(dir / fs::path(l) / "arena.pac", ec)) kept.push_back(l);
+  std::sort(folders.begin(), folders.end());
+  for (const auto& f : folders)
+    if (std::find(kept.begin(), kept.end(), f.filename().string()) == kept.end()) kept.push_back(f.filename().string());
+  if (kept != order) {
+    std::ofstream out(dir / "order.txt", std::ios::binary | std::ios::trunc);
+    for (const auto& l : kept) out << l << '\n';
+    REXLOG_INFO("[svr2011] arena mods: order.txt {} ({} folders, was {})", out ? "written" : "NOT written", kept.size(),
+                order.size());
+  }
+  std::vector<fs::path> sorted;
+  for (const auto& l : kept)
+    for (const auto& f : folders)
+      if (f.filename().string() == l) sorted.push_back(f);
+  return sorted;
 }
 
 void LoadCustomArenas() {
+  if (svr2011::NoMods()) return;  // (Start Without Mods: no_mods.h)
   std::error_code ec;
   const fs::path dir = g_game / "Mods" / "Arenas";
   if (!fs::is_directory(dir, ec)) return;
@@ -498,7 +563,7 @@ void LoadCustomArenas() {
   for (const auto& e : fs::directory_iterator(dir, ec))
     if (e.is_directory() && fs::exists(e.path() / "arena.pac", ec) && !fs::exists(e.path() / "disabled", ec))
       folders.push_back(e.path());  // ("disabled": turned off in the launcher's Mods tab)
-  std::sort(folders.begin(), folders.end());
+  folders = InInstallOrder(dir, folders);
   for (const auto& f : folders) {
     CustomArena c;
     c.id = f.filename().string();
@@ -517,9 +582,12 @@ void LoadCustomArenas() {
       }
       std::fclose(t);
     }
+    c.base_arena = ArenaOfBanner(c.base);
+    c.tron_live = c.manifest.find("\ntitantron=live") != std::string::npos || c.manifest.rfind("titantron=live", 0) == 0;
     svrfmt::Bytes dds;
     if (svrfmt::ReadFile((f / "banner.dds").string(), dds)) c.banner = BannerBlocks(dds);
     if (c.banner.empty()) REXLOG_WARN("[svr2011] arena mods: {} has no 256 x 128 DXT5 banner.dds", c.id);
+    if (fs::exists(f / "vs" / "theme.pac", ec)) c.theme_pac = (f / "vs" / "theme.pac").string();
     if (fs::is_directory(f / "vs", ec))
       for (const auto& v : fs::directory_iterator(f / "vs", ec)) {
         svrfmt::Bytes vdds;
@@ -538,6 +606,19 @@ void LoadCustomArenas() {
       else
         REXLOG_WARN("[svr2011] arena mods: {} load.dds is not 1024 x 512 DXT5", c.id);
     }
+    {  // the entrance title card's logo: card=<file> (card.dds without the key) - CardSwaps
+      std::string card = "card.dds";
+      for (size_t at = 0; at < c.manifest.size();) {
+        size_t end = c.manifest.find('\n', at);
+        if (end == std::string::npos) end = c.manifest.size();
+        if (c.manifest.compare(at, 5, "card=") == 0) card = c.manifest.substr(at + 5, end - at - 5);
+        at = end + 1;
+      }
+      while (!card.empty() && (card.back() == '\r' || card.back() == ' ')) card.pop_back();
+      svrfmt::Bytes cdds;
+      if (!card.empty() && svrfmt::ReadFile((f / fs::u8path(card)).string(), cdds) && !svrfmt::DdsDecode(cdds, c.card))
+        REXLOG_WARN("[svr2011] arena mods: {} {} is not a DDS picture", c.id, card);
+    }
     g_customs.push_back(std::move(c));
   }
   REXLOG_INFO("[svr2011] arena mods: {} custom arenas", g_customs.size());
@@ -546,10 +627,6 @@ void LoadCustomArenas() {
 
 int Pages() { return 1 + int(g_layout.size()); }
 
-int64_t NowMs() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
 
 // Finds each banner in guest physical memory (4 KB view) by a run of blocks.
 // A block of the banner to look for it by: one of two colours mixed (a flat
@@ -747,6 +824,9 @@ struct DecodeSwaps {
   std::unordered_map<uint64_t, std::vector<size_t>> keys;  // middle 32 bytes -> swaps
   std::vector<size_t> sizes;                               // the swaps' top level sizes (distinct)
   int theme = -1;                                          // VS theme forced (-1 none)
+  std::string arena;                                       // the arena mod's id (its own VS theme: theme_group)
+  // the title card's pictures (CardSwaps): a whole DDS (header and mips) by its size and Fnv -> the arena's
+  std::unordered_map<size_t, std::vector<std::pair<uint64_t, std::shared_ptr<const svrfmt::Bytes>>>> cards;
 };
 std::mutex g_decode_mutex;
 std::shared_ptr<const DecodeSwaps> g_decode;
@@ -756,6 +836,99 @@ uint64_t Fnv(const uint8_t* p, size_t n) {
   for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
   return h;
 }
+
+// The entrance's title card (show logo + city, sub_8277E928): pac/evt/evtgdhd.pac ETEX <arena number, 4 digits> -
+// a PACH of BPE parts; parts 0 and 10 are DDS sets (PACH) whose pictures layouts 10000 / 10010 (AG2D: u32 count at
+// +0x10, its 16-byte names from the offset at +0x14) name in order. A custom arena shows its base's card; with a
+// card picture the base's logo pictures ("logo") get it, fitted (RAW's hd_RAW01: a strip of 4 logo steps, one in
+// each quarter), and its build-up / effect frames (fire, anime, spiral, loop, light, numbered frames) are cleared -
+// plates and bars stay.
+struct CardPic {
+  size_t size = 0;
+  uint64_t hash = 0;
+  int role = 0;  // 1 logo, 2 cleared, 3 a strip of 4 logos (one under the other)
+  svrfmt::DdsInfo info;
+};
+int CardRole(std::string n) {
+  for (auto& ch : n) ch = char(std::tolower(uint8_t(ch)));
+  if (n.find("logo") != std::string::npos) return 1;
+  if (n == "hd_raw01") return 3;
+  for (const char* p : {"fire", "anime", "spiral", "loop", "light"})
+    if (n.find(p) != std::string::npos) return 2;
+  if (n.size() == 2 && std::isdigit(uint8_t(n[0])) && std::isdigit(uint8_t(n[1]))) return 2;
+  return 0;
+}
+std::vector<CardPic> CardPictures(int arena) {
+  static std::mutex m;
+  static std::map<int, std::vector<CardPic>> cache;
+  std::lock_guard lock(m);
+  if (auto it = cache.find(arena); it != cache.end()) return it->second;
+  std::vector<CardPic> out;
+  svrfmt::Bytes d;
+  svrfmt::Epac e;
+  char key[8];
+  std::snprintf(key, sizeof key, "%04d", arena);
+  if (arena >= 0 && arena < 10000 && svrfmt::ReadFile((g_game / "pac" / "evt" / "evtgdhd.pac").string(), d) &&
+      svrfmt::EpacRead(d, e))
+    for (const auto& g : e.groups) {
+      if (g.type != "ETEX") continue;
+      for (const auto& en : g.entries) {
+        std::vector<svrfmt::PachEntry> parts;
+        if (en.name != key || !svrfmt::PachRead(en.data, parts)) continue;
+        auto part = [&](uint32_t id) {
+          std::vector<svrfmt::PachEntry> in;
+          for (const auto& p : parts)
+            if (p.id == id && svrfmt::PachRead(svrfmt::Unpack(p.data), in)) return in;
+          return std::vector<svrfmt::PachEntry>();
+        };
+        for (const uint32_t set : {0u, 10u}) {
+          const auto pics = part(set), layout = part(10000 + set);
+          if (pics.empty() || layout.empty()) continue;
+          const svrfmt::Bytes& a = layout[0].data;
+          if (a.size() < 0x18 || std::memcmp(a.data(), "AG2D", 4)) continue;
+          const auto be = [&](size_t o) { return uint32_t(a[o]) << 24 | uint32_t(a[o + 1]) << 16 | uint32_t(a[o + 2]) << 8 | a[o + 3]; };
+          const uint32_t n = be(0x10), names = be(0x14);
+          for (uint32_t i = 0; i < n && i < pics.size() && names + 16 * (i + 1) <= a.size(); ++i) {
+            const char* s = reinterpret_cast<const char*>(&a[names + 16 * i]);
+            CardPic cp;
+            cp.role = CardRole(std::string(s, strnlen(s, 16)));
+            const svrfmt::Bytes& dds = pics[i].data;
+            if (!cp.role || !svrfmt::DdsInfoOf(dds, cp.info) || cp.info.format != svrfmt::DxtFormat::kDxt5) continue;
+            cp.size = dds.size(), cp.hash = Fnv(dds.data(), dds.size());
+            out.push_back(cp);
+          }
+        }
+      }
+    }
+  cache[arena] = out;
+  return out;
+}
+// The card pictures of arena `arena` made from `logo` (fitted into each logo picture, the rest cleared).
+void CardSwaps(DecodeSwaps& t, int arena, const svrfmt::Image& logo) {
+  int made = 0;
+  for (const auto& cp : CardPictures(arena)) {
+    svrfmt::Image img;
+    img.w = cp.info.w, img.h = cp.info.h;
+    img.rgba.assign(size_t(img.w) * img.h * 4, 0);
+    const int rows = cp.role == 3 ? 4 : 1, rh = img.h / rows;
+    for (int r = 0; r < rows && cp.role != 2 && logo.w > 0 && logo.h > 0 && rh > 0; ++r) {
+      const float k = std::min(img.w * 0.96f / logo.w, rh * 0.96f / logo.h);
+      const int w = std::max(1, int(logo.w * k)), h = std::max(1, int(logo.h * k));
+      const svrfmt::Image s = svrfmt::Resize(logo, w, h);
+      const int x0 = (img.w - w) / 2, y0 = r * rh + (rh - h) / 2;
+      for (int y = 0; y < h; ++y)
+        std::memcpy(&img.rgba[(size_t(y0 + y) * img.w + x0) * 4], &s.rgba[size_t(y) * w * 4], size_t(w) * 4);
+    }
+    auto mine = std::make_shared<const svrfmt::Bytes>(svrfmt::DdsEncode(img, svrfmt::DxtFormat::kDxt5, cp.info.mips > 1));
+    if (mine->size() != cp.size) continue;  // (another layout of the file: left as it is)
+    t.cards[cp.size].push_back({cp.hash, std::move(mine)});
+    ++made;
+  }
+  REXLOG_INFO("[svr2011] arena mods: title card logo - {} pictures of arena {}'s card", made, arena);
+}
+
+// A part the game just unpacked: the title card's pictures that have a swap (CardSwaps).
+void CardDecoded(uint8_t* d, uint32_t size);
 
 struct LoadPic {
   std::string name;
@@ -811,8 +984,23 @@ void ReadLoadingPictures() {
   REXLOG_INFO("[svr2011] arena mods: {} loading screen pictures", g_load_pics.size());
 }
 
+// A superstar mod with a loading picture (its load.dds, or a manifest loading= line): SetSuperstarLoading.
+bool AnySuperstarLoading() {
+  std::error_code ec;
+  for (const auto& d : fs::directory_iterator(g_game / "Mods" / "Superstars", ec)) {
+    if (!d.is_directory(ec)) continue;
+    if (fs::exists(d.path() / "load.dds", ec)) return true;
+    svrfmt::Bytes man;
+    if (svrfmt::ReadFile((d.path() / "manifest.txt").string(), man) &&
+        std::string(man.begin(), man.end()).find("\nloading=") != std::string::npos)
+      return true;
+  }
+  return false;
+}
+
 void LoadLoadingPictures() {
-  const bool wanted = std::any_of(g_customs.begin(), g_customs.end(), [](const CustomArena& c) { return !c.load.empty(); });
+  const bool wanted = std::any_of(g_customs.begin(), g_customs.end(), [](const CustomArena& c) { return !c.load.empty(); }) ||
+                      AnySuperstarLoading();
   if (!wanted) {
     REXLOG_INFO("[svr2011] arena mods: no custom loading screens - the game's own aren't read");
     std::lock_guard lock(g_load_pics_mutex);
@@ -850,10 +1038,18 @@ svrfmt::Bytes LoadPart(const svrfmt::Bytes& load, int part) {
   return o;
 }
 
+svrfmt::Bytes g_star_load;   // a superstar mod's loading picture for the match being set up (kept swapped, as c->load)
+std::string g_star_load_file;
+const CustomArena* g_swaps_arena = nullptr;   // (SetDecodeSwaps' last arena and host: rebuilt with g_star_load)
+int g_swaps_host = -1;
+
 void SetDecodeSwaps(const CustomArena* c, int host) {
+  g_swaps_arena = c, g_swaps_host = host;
   auto t = std::make_shared<DecodeSwaps>();
-  if (c) {
-    t->theme = host;
+  const svrfmt::Bytes& load_pic = !g_star_load.empty() ? g_star_load : c ? c->load : g_star_load;   // (the superstar's wins)
+  if (c || !load_pic.empty()) {
+    t->theme = c ? host : -1;
+    t->arena = c ? c->id : std::string();
     // (a game picture by its key / hash; the replacement shared - not 240
     // copies of the game's pictures and 240 of the custom one's)
     auto add = [&](const std::string& name, const LoadPic& orig, std::shared_ptr<const svrfmt::Bytes> mine, bool loading) {
@@ -862,17 +1058,18 @@ void SetDecodeSwaps(const CustomArena* c, int host) {
       if (std::find(t->sizes.begin(), t->sizes.end(), orig.size) == t->sizes.end()) t->sizes.push_back(orig.size);
       t->swaps.push_back({name, orig.size, orig.hash, std::move(mine), loading});
     };
-    if (!c->load.empty() && !LoadingPicturesReady(std::chrono::seconds(10))) {
+    if (!load_pic.empty() && !LoadingPicturesReady(std::chrono::seconds(10))) {
       REXLOG_WARN("[svr2011] arena mods: the game's loading pictures still not read after 10 s - {} keeps the game's",
-                  c->id);
-    } else if (!c->load.empty()) {
-      const svrfmt::Bytes load = Swap16(c->load.data(), c->load.size());  // (kept swapped: back to file order)
+                  c ? c->id : g_star_load_file);
+    } else if (!load_pic.empty()) {
+      const svrfmt::Bytes load = Swap16(load_pic.data(), load_pic.size());  // (kept swapped: back to file order)
       std::shared_ptr<const svrfmt::Bytes> parts[3];
       for (int k = 0; k < 3; ++k) parts[k] = std::make_shared<const svrfmt::Bytes>(LoadPart(load, k));
       for (const auto& lp : g_load_pics)
         if (lp.part >= 0 && lp.part < 3) add(lp.name, lp, parts[lp.part], true);
     }
-    if (!c->vs.empty()) {
+    if (c && !c->card.rgba.empty() && host >= 0) CardSwaps(*t, host, c->card);
+    if (c && !c->vs.empty()) {
       const auto theme = VsTheme(host);
       for (const auto& [name, mine] : c->vs)
         for (const auto& [tname, orig] : theme)
@@ -883,10 +1080,27 @@ void SetDecodeSwaps(const CustomArena* c, int host) {
           }
     }
   }
-  REXLOG_INFO("[svr2011] arena mods: loading / VS pictures {} for {} (theme {:02})", t->swaps.size(),
-              c ? c->id : std::string("-"), host);
+  REXLOG_INFO("[svr2011] arena mods: loading / VS pictures {} for {} (theme {:02}){}", t->swaps.size(),
+              c ? c->id : std::string("-"), host, g_star_load.empty() ? "" : " - the loading picture " + g_star_load_file);
   std::lock_guard lock(g_decode_mutex);
-  g_decode = c ? std::move(t) : nullptr;
+  g_decode = c || !load_pic.empty() ? std::move(t) : nullptr;
+}
+
+void StarLoading(const std::string& file) {
+  if (file == g_star_load_file) return;
+  svrfmt::Bytes pic;
+  if (!file.empty()) {
+    svrfmt::Bytes dds;
+    svrfmt::DdsInfo info;
+    if (svrfmt::ReadFile(file, dds) && svrfmt::DdsInfoOf(dds, info) && info.w == 1024 && info.h == 512 &&
+        info.format == svrfmt::DxtFormat::kDxt5 && dds.size() >= 128 + 1024 * 512)
+      pic = Swap16(dds.data() + 128, 1024 * 512);
+    else
+      REXLOG_WARN("[svr2011] superstar mods: {} is not a 1024 x 512 DXT5 loading picture", file);
+  }
+  g_star_load = std::move(pic);
+  g_star_load_file = file;
+  SetDecodeSwaps(g_swaps_arena, g_swaps_host);
 }
 
 std::shared_ptr<const DecodeSwaps> CurrentDecodeSwaps() {
@@ -936,6 +1150,31 @@ void SwapDecoded(uint8_t* d, uint32_t size) {
   }
 }
 
+void CardDecoded(uint8_t* d, uint32_t size) {
+  if (size < 8 || std::memcmp(d, "PACH", 4)) return;
+  const auto t = CurrentDecodeSwaps();
+  if (!t || t->cards.empty()) return;
+  const auto le = [](const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | uint32_t(p[3]) << 24; };
+  const uint32_t n = le(d + 4);
+  const uint64_t base = 8 + 12ull * n;
+  if (!n || n > 4096 || base > size) return;
+  int swapped = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint64_t off = base + le(d + 8 + 12 * i + 4), sz = le(d + 8 + 12 * i + 8);
+    if (off + sz > size || sz < 128 || std::memcmp(d + off, "DDS ", 4)) continue;
+    const auto it = t->cards.find(size_t(sz));
+    if (it == t->cards.end()) continue;
+    const uint64_t h = Fnv(d + off, size_t(sz));
+    for (const auto& [hash, mine] : it->second)
+      if (hash == h) {
+        std::memcpy(d + off, mine->data(), size_t(sz));
+        ++swapped;
+        break;
+      }
+  }
+  if (swapped) REXLOG_INFO("[svr2011] arena mods: title card - {} pictures swapped as they were unpacked", swapped);
+}
+
 // "/MENU/M<nn>I" or "/MENU/M<nn>L" (the VS theme): the custom arena's base theme.
 void ForceTheme(char* path) {
   const auto t = CurrentDecodeSwaps();
@@ -950,24 +1189,152 @@ void ForceTheme(char* path) {
   path[8] = b;
 }
 
-// The host arena of the tile under the cursor plays the custom arena there.
+// The titantron. The game shows its videos on an arena's models 800-899 (every stock arena: 801 / 807 the arena's
+// loop video, 803 / 806 / 808 the entrance video): during entrances the video, in a match the match camera (it
+// resolves the camera into their texture). Stock arenas are made for that; a ported one (WWE 2K / '13) has its own
+// screen art on other models, flagged g (shown in matches only), which those screens cover - so its match showed the
+// camera over it (user report 20 Oct). Custom arenas therefore get their 800-899 models flagged e (0xC351: shown
+// during entrances only) - the entrance video stays, the match shows the arena's own screens; manifest
+// titantron=live keeps the camera. The flagged copy: Mods/ArenaOverlay/tron_<id>.pac, made once (again when the
+// arena's file changes: size and time in tron_<id>.pac.src).
+std::string TitantronFile(const CustomArena& c) {
+  if (c.tron_live) return c.file;
+  std::error_code ec;
+  const fs::path src = g_game / fs::u8path(c.file);
+  const std::string rel = "Mods/ArenaOverlay/tron_" + c.id + ".pac";
+  const fs::path dst = g_game / fs::u8path(rel), stamp_file = dst.string() + ".src";
+  // (" v2": announce table monitors kept - copies made by the first rule are made again)
+  const std::string stamp = std::to_string(fs::file_size(src, ec)) + " " +
+                            std::to_string(static_cast<long long>(fs::last_write_time(src, ec).time_since_epoch().count())) +
+                            " v2";
+  if (fs::exists(dst, ec)) {
+    std::ifstream in(stamp_file);
+    std::string had;
+    std::getline(in, had);
+    if (had == stamp) return rel;
+    if (had == stamp + " unchanged") return c.file;
+  }
+  svrfmt::Bytes data;
+  svrfmt::Epac e;
+  if (!svrfmt::ReadFile(src.string(), data) || !svrfmt::EpacRead(data, e)) {
+    REXLOG_WARN("[svr2011] arena mods: {} - its file can't be read for the titantron (as it is)", c.id);
+    return c.file;
+  }
+  int flagged = 0, kept = 0;
+  for (auto& g : e.groups)
+    for (auto& en : g.entries) {
+      const svrfmt::Bytes raw = svrfmt::Unpack(en.data);
+      std::vector<svrfmt::PachEntry> kids;
+      if (raw.size() < 4 || std::memcmp(raw.data(), "PACH", 4) || !svrfmt::PachRead(raw, kids)) continue;
+      // Which of its 800-899 models are the hall's screens: an announce table's monitor (small, at the ring:
+      // a 2K17 port's 820) keeps the game's feed in the match - it showed nothing once flagged (21 Oct report).
+      std::set<int> monitors;
+      for (const auto& k : kids) {
+        if (k.id < 800 || k.id > 899) continue;
+        svrfmt::Bytes m = svrfmt::Unpack(k.data);
+        if (svrfmt::IsPach(m)) {
+          std::vector<svrfmt::PachEntry> parts;
+          svrfmt::Bytes jboy;
+          if (svrfmt::PachRead(m, parts))
+            for (const auto& p : parts)
+              if (p.id == 0) jboy = svrfmt::Unpack(p.data);
+          m = std::move(jboy);
+        }
+        svrfmt::Model model;
+        if (!svrfmt::IsJboy(m) || !svrfmt::JboyRead(m, model) || model.meshes.empty()) continue;
+        bool small_at_ring = true;
+        for (const auto& s : model.meshes)
+          small_at_ring = small_at_ring && s.sphere[3] < 60.f && std::fabs(s.sphere[0]) < 60.f && std::fabs(s.sphere[2]) < 60.f;
+        if (small_at_ring) monitors.insert(int(k.id));
+      }
+      bool changed = false;
+      for (auto& k : kids) {
+        if (k.id != 0xC351) continue;
+        const svrfmt::Bytes text = svrfmt::Unpack(k.data);
+        std::string t(text.begin(), text.end()), out;
+        size_t at = 0;
+        while (at < t.size()) {  // (lines "<model id> <flags>"; ids 800-899 without e / g get e)
+          size_t end = t.find('\n', at);
+          if (end == std::string::npos) end = t.size();
+          std::string line = t.substr(at, end - at);
+          const bool cr = !line.empty() && line.back() == '\r';
+          if (cr) line.pop_back();
+          size_t p = line.find_first_not_of(" \t");
+          if (p != std::string::npos && std::isdigit(uint8_t(line[p]))) {
+            const int id = std::atoi(line.c_str() + p);
+            std::istringstream words(line.substr(p));
+            std::string w;
+            bool has = false;
+            words >> w;
+            while (words >> w) has |= w == "e" || w == "g";
+            if (id >= 800 && id <= 899 && !has) {
+              if (monitors.count(id)) ++kept;
+              else line += " e", ++flagged, changed = true;
+            }
+          }
+          out += line + (cr ? "\r" : "") + (end < t.size() ? "\n" : "");
+          at = end + 1;
+        }
+        if (changed) k.data = svrfmt::BpeEncode(svrfmt::Bytes(out.begin(), out.end()));
+      }
+      if (changed) {  // (packed again when it was: the arena's memory holds the file as it is)
+        const bool packed = en.data.size() >= 4 && !std::memcmp(en.data.data(), "BPE ", 4);
+        en.data = packed ? svrfmt::BpeEncode(svrfmt::PachWrite(kids)) : svrfmt::PachWrite(kids);
+      }
+    }
+  fs::create_directories(dst.parent_path(), ec);
+  if (!flagged) {  // (no video screens to change: its own file, remembered)
+    std::ofstream(dst, std::ios::binary | std::ios::trunc);
+    std::ofstream(stamp_file, std::ios::trunc) << stamp << " unchanged\n";
+    return c.file;
+  }
+  const svrfmt::Bytes out = svrfmt::EpacWrite(e);
+  const fs::path tmp = dst.string() + ".tmp";
+  {
+    std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+    o.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+    if (!o) {
+      REXLOG_WARN("[svr2011] arena mods: {} - the titantron copy can't be written (as it is)", c.id);
+      return c.file;
+    }
+  }
+  fs::remove(dst, ec);
+  fs::rename(tmp, dst, ec);
+  if (ec) return c.file;
+  std::ofstream(stamp_file, std::ios::trunc) << stamp << "\n";
+  REXLOG_INFO("[svr2011] arena mods: {} - {} video screens shown during entrances only (its own screens in the "
+              "match; titantron=live keeps the camera){}",
+              c.id, flagged, kept ? fmt::format(", {} announce table monitor(s) as they were", kept) : std::string());
+  return rel;
+}
+
+// Custom arena c picked on the tile of arena `tile` (nullptr: none): it plays as its base arena (the tile's when it
+// has none) - that arena's file is c's, and a match on the tile plays as that arena (g_plays_as).
+int g_redirected_file = -1;  // (the arena whose file is the custom one: its base)
+void PointAt(const CustomArena* c, int tile) {
+  if (g_redirected_file >= 0) svr2011::RedirectArena(g_redirected_file, "");
+  if (g_redirected_host >= 0) g_plays_as[g_redirected_host] = 0;
+  g_redirected_custom = c;
+  g_redirected_host = g_redirected_file = -1;
+  const int as = c ? (c->base_arena >= 0 ? c->base_arena : tile) : -1;
+  SetDecodeSwaps(c, as);
+  svr2011::SetRingRules(c ? c->manifest : std::string());
+  if (!c || tile < 0) return;
+  svr2011::RedirectArena(as, TitantronFile(*c));
+  g_redirected_host = tile, g_redirected_file = as;
+  if (as != tile) g_plays_as[tile] = as + 1;  // (+1: 0 is none - a base of 0, SmackDown, is 1)
+}
+
+// The custom arena on the tile under the cursor is the one played.
 void FollowCursor(int row, int col) {
   const CustomArena* c = row < 4 ? CustomAt(row * 5 + col) : nullptr;
   g_cursor_custom = c ? int(c - g_customs.data()) : -1;
-  // the tile's arena: the one the game loads (LayOutPages puts each custom
-  // arena on the tile of the arena it was made from)
-  const int host = c ? g_tiles[row * 5 + col].arena : -1;
-  if (c == g_redirected_custom && host == g_redirected_host) return;
-  g_redirected_custom = c;
-  SetDecodeSwaps(c, host);
-  if (g_redirected_host >= 0) svr2011::RedirectArena(g_redirected_host, "");
-  g_redirected_host = -1;
-  svr2011::SetRingRules(c ? c->manifest : std::string());
-  if (c) {
-    svr2011::RedirectArena(host, c->file);
-    g_redirected_host = host;
-    REXLOG_INFO("[svr2011] arena select: {} on {}", c->name, g_tiles[row * 5 + col].banner);
-  }
+  const int tile = c ? g_tiles[row * 5 + col].arena : -1;
+  if (c == g_redirected_custom && tile == g_redirected_host) return;
+  PointAt(c, tile);
+  if (c)
+    REXLOG_INFO("[svr2011] arena select: {} on {} (arena {}, plays as arena {})", c->name, g_tiles[row * 5 + col].banner,
+                tile, g_redirected_file);
 }
 
 }  // namespace
@@ -1012,6 +1379,20 @@ REX_HOOK_RAW(sub_8217DCE8) {
   __imp__sub_8217DCE8(ctx, base);
 }
 
+// The live match settings' arena (0x82E3DE00 +0x40) holds the tile's number from the pick until the match record
+// copies the screen's: the first load's show branding, the host announcer and the interfaces read it there (a RAW
+// port on the Judgment Day tile: its first entrance as Judgment Day, 21 Oct report) - it plays as its base too.
+int g_loads_since_pick = 0;  // (a match's loads, for the log: counted from the match screen's arena read)
+
+void LiveArenaPlaysAs(uint8_t* base) {
+  uint8_t* q = base + 0x82E3DE40;
+  const uint32_t arena = uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
+  if (arena >= 100 || !g_plays_as[arena]) return;
+  const uint32_t as = uint32_t(g_plays_as[arena] - 1);
+  q[0] = uint8_t(as >> 24), q[1] = uint8_t(as >> 16), q[2] = uint8_t(as >> 8), q[3] = uint8_t(as);
+  REXLOG_INFO("[svr2011] arena mods: the live settings' arena {} plays as arena {}", arena, as);
+}
+
 REX_EXTERN(__imp__sub_82773F00);
 REX_HOOK_RAW(sub_82773F00) {
   constexpr uint32_t kMatchScreen = 0x82EDEB48, kScreenArena = 244;
@@ -1020,15 +1401,52 @@ REX_HOOK_RAW(sub_82773F00) {
     return uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
   };
   g_crowd_guard_logged = false, g_crowd_frames = 0;  // (the crowd guard: once per match)
+  LiveArenaPlaysAs(base);
   if (const uint32_t screen = rd(kMatchScreen)) {
     const uint32_t arena = rd(screen + kScreenArena);
     g_crowd_arena = int(arena);
     const int as = svr2011::ArenaNumberFor(int(arena));
+    REXLOG_INFO("[svr2011] arena mods: a match loads in arena {}{}", arena,
+                g_redirected_custom ? " - " + static_cast<const CustomArena*>(g_redirected_custom)->name + " chosen" : "");
+    // Test aid: SVR2011_TEST_ARENA_SCAN=1 - where else the tile's arena number sits (the match screen, the live settings)
+    if (std::getenv("SVR2011_TEST_ARENA_SCAN") && g_redirected_host >= 0) {
+      const uint32_t tile = uint32_t(g_redirected_host);
+      std::string s;
+      for (uint32_t o = 0; o < 0x1000; ++o) {
+        if (o % 4 == 0 && rd(screen + o) == tile) s += fmt::format(" screen+{:X}(w)", o);
+        if (base[screen + o] == tile) s += fmt::format(" screen+{:X}(b)", o);
+      }
+      for (uint32_t o = 0; o < 0x800; ++o) {
+        if (o % 4 == 0 && rd(0x82E3DE00 + o) == tile) s += fmt::format(" live+{:X}(w)", o);
+        if (base[0x82E3DE00 + o] == tile) s += fmt::format(" live+{:X}(b)", o);
+      }
+      REXLOG_INFO("[svr2011] arena mods: test - tile arena {} at:{}", tile, s);
+    }
     if (as != int(arena)) {
       uint8_t* q = base + screen + kScreenArena;
       q[0] = uint8_t(uint32_t(as) >> 24), q[1] = uint8_t(uint32_t(as) >> 16), q[2] = uint8_t(uint32_t(as) >> 8), q[3] = uint8_t(as);
       REXLOG_INFO("[svr2011] arena mods: the match in arena {} plays as arena {}", arena, as);
     }
+    // (for reports: each load since the pick - an entrance, the match - with the arena file it reads)
+    {
+      std::string file;
+      if (as >= 0 && as < 100) {
+        std::lock_guard lock(g_mutex);
+        file = g_redirect[as];
+      }
+      REXLOG_INFO("[svr2011] arena mods: load {} since the pick - arena {} (screen {}, live {}), BG{:02} -> {}", ++g_loads_since_pick,
+                  as, arena, rd(0x82E3DE40), as, file.empty() ? "original" : file);
+    }
+    // (for reports: a custom arena chosen whose file the match doesn't load - the stock arena plays)
+    if (const auto* c = static_cast<const CustomArena*>(g_redirected_custom); c && g_redirected_file >= 0) {
+      if (as != g_redirected_file && svr2011::ArenaNumberFor(g_redirected_file) != as)
+        REXLOG_WARN("[svr2011] arena mods: {} chosen (arena {} plays as {}), but the match is in arena {} (as {}) - not it",
+                    c->name, g_redirected_host, g_redirected_file, arena, as);
+      else
+        REXLOG_INFO("[svr2011] arena mods: the match plays {} (BG{:02})", c->name, g_redirected_file);
+    }
+  } else {
+    REXLOG_INFO("[svr2011] arena mods: a match loads with no match screen (arena not checked)");
   }
   __imp__sub_82773F00(ctx, base);
 }
@@ -1046,14 +1464,71 @@ REX_HOOK_RAW(sub_826AEF10) {
   const uint32_t size = s[12] | s[13] << 8 | s[14] << 16 | uint32_t(s[15]) << 24;
   __imp__sub_826AEF10(ctx, base);
   if (dst && size) SwapDecoded(base + dst, size);
+  if (dst && size) CardDecoded(base + dst, size);
   if (dst && size) svr2011::BackgroundsDecoded(base + dst, size);  // (custom menu pictures: backgrounds_page.h)
+  if (dst && size) {  // (an arena's light bank: ARENA BRIGHTNESS, the arena mod's light keys - arena_lights.h)
+    const auto* chosen = static_cast<const CustomArena*>(g_redirected_custom);
+    svr2011::ArenaLightsDecoded(base + dst, size, chosen ? chosen->manifest : std::string());
+  }
+}
+
+// The entrance's title card (show logo + city): sub_8277E928 (card state +196 == 4) picks the city's string by the
+// arena's number - the base arena's for a custom one (King of the Ring '98 on Hell in a Cell said "NEWARK, NJ") -
+// and copies it to card +2248 (97 bytes). The chosen arena's manifest city= is written there instead.
+REX_EXTERN(__imp__sub_8277E928);
+REX_HOOK_RAW(sub_8277E928) {
+  const uint32_t card = ctx.r3.u32;
+  const uint8_t* s = base + card + 196;
+  const bool city_card = (uint32_t(s[0]) << 24 | uint32_t(s[1]) << 16 | uint32_t(s[2]) << 8 | s[3]) == 4;
+  __imp__sub_8277E928(ctx, base);
+  const auto* c = static_cast<const CustomArena*>(g_redirected_custom);
+  if (!city_card) return;
+  static int shown = 0;
+  if (shown++ < 4) REXLOG_INFO("[svr2011] arena mods: title card shown{}", c ? " (" + c->id + ")" : std::string());
+  if (!c) return;
+  std::string city;
+  for (size_t at = 0; at < c->manifest.size();) {
+    size_t end = c->manifest.find('\n', at);
+    if (end == std::string::npos) end = c->manifest.size();
+    if (c->manifest.compare(at, 5, "city=") == 0) city = c->manifest.substr(at + 5, end - at - 5);
+    at = end + 1;
+  }
+  while (!city.empty() && (city.back() == '\r' || city.back() == ' ' || city.back() == '\t')) city.pop_back();
+  if (city.empty()) return;
+  city.resize(std::min<size_t>(city.size(), 96));
+  std::memcpy(base + card + 2248, city.c_str(), city.size() + 1);
+  static int logged = 0;
+  if (logged++ < 4) REXLOG_INFO("[svr2011] arena mods: title card city '{}' ({})", city, c->id);
 }
 
 // Does a file exist (r3 path): a custom arena's VS theme instead of the one
 // the game would pick (see SetDecodeSwaps).
 REX_EXTERN(__imp__sub_826A17D0);
 REX_HOOK_RAW(sub_826A17D0) {
-  if (ctx.r3.u32) ForceTheme(reinterpret_cast<char*>(base + ctx.r3.u32));
+  if (ctx.r3.u32) {
+    char* path = reinterpret_cast<char*>(base + ctx.r3.u32);
+    ForceTheme(path);
+    // (the VS screen opening: its theme - test scripts wait for this line, vs_styles.h)
+    static int logged = 0;
+    if (!std::strncmp(path, "/MENU/M", 7) && logged++ < 100) REXLOG_INFO("[svr2011] VS screen: theme {:.16}", path);
+    static const bool evp_log = std::getenv("SVR2011_TEST_EVP_LOG") != nullptr;
+    if (evp_log && !std::strncmp(path, "/EV", 3))
+      REXLOG_INFO("evp: {:.20} (lr {:08X})", path, uint32_t(ctx.lr));
+    // An arena mod with its own VS theme (vs/theme.pac): "/MENU/M<nn>x" -> "/VA<k>/VSTx" (the same length), its group
+    // in the VS styles' overlay pac. Decided here, as the screen opens: the game finds the file by this name now
+    // (the boot-time names are only the game's own).
+    const auto t = CurrentDecodeSwaps();
+    const CustomArena* own = nullptr;
+    for (const auto& c : g_customs)
+      if (t && !t->arena.empty() && c.id == t->arena && c.theme_group.size() == 4) own = &c;
+    if (own && !std::strncmp(path, "/MENU/M", 7) && std::isdigit(uint8_t(path[7])) && std::isdigit(uint8_t(path[8])) &&
+        (path[9] == 'L' || path[9] == 'I' || path[9] == 'F') && !path[10]) {
+      std::memcpy(path + 1, own->theme_group.data(), 4);
+      std::memcpy(path + 6, "VST", 3);
+      static int told = 0;
+      if (told++ < 30) REXLOG_INFO("[svr2011] arena mods: VS screen -> the arena mod's own theme {}", path);
+    }
+  }
   __imp__sub_826A17D0(ctx, base);
 }
 
@@ -1104,7 +1579,7 @@ REX_HOOK_RAW(sub_823D4FC0) {
     g_located_at = NowMs();
     // A custom arena already chosen (the screen opened again from the match
     // screen): its page again, with it still played - the game puts the
-    // cursor on its tile (its base arena's). Going back to page 1 here
+    // cursor on the match's arena's tile. Going back to page 1 here
     // dropped the pick: a stock arena was played (2.0.5 player reports).
     g_committed_custom = g_redirected_custom;
     g_committed_host = g_redirected_host;
@@ -1146,32 +1621,27 @@ REX_HOOK_RAW(sub_823D4FC0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(hitch));
     }
   }
-  // (the cursor: the offline grid's row and column; the online screen's tile)
-  const uint32_t at = uint32_t(g_online_tile.load());
-  const uint32_t row = online_grid ? at / 5 : rd(28), col = online_grid ? at % 5 : rd(44), cols = online_grid ? 5 : rd(48);
   __imp__sub_823D4FC0(ctx, base);
+  // (the cursor: the offline grid's row and column; the online screen's tile)
   const uint32_t now_at = uint32_t(g_online_tile.load());
   const uint32_t new_col = online_grid ? now_at % 5 : rd(44), new_row = online_grid ? now_at / 5 : rd(28);
-  // Past an edge: the cursor jumped from the last column to the first or back
-  // in its row (the game wraps it), whatever moved it - a check of the button
-  // field's direction bits missed a 2.0.3 player's presses. Any player's
-  // LB / RB page too (not in that field: read with the game's pad reads).
+  // Pages turn with any player's LB / RB (or LT / RT - pads, the touch MENU layout's buttons, keys 1 / 3: read
+  // with the game's pad reads). LEFT / RIGHT past an edge wrap the cursor within its row, on the same page (the
+  // game's own wrap): turning the page there put a stock tile under the cursor by accident (a player's
+  // report, 23 Oct - the match was then in a stock arena).
   static uint32_t held = 0;
   uint32_t shoulders = 0;
   for (const auto& s : g_shoulders) shoulders |= s.load();
   const uint32_t pressed = shoulders & ~held;
   held = shoulders;
   int page = g_page;
-  const bool wrapped = row < 4 && new_row == row && cols > 2;
   // a page button turns one page per press: a press within 250 ms of the last
   // turn is the same press read again (a hitch's repeated pad reads turned
   // page 2 straight back to page 1)
   static int64_t last_turn = 0;
   const bool button_ok = NowMs() - last_turn > 250;
   const char* why = nullptr;
-  if (wrapped && col + 1 == cols && new_col == 0) why = "right edge";
-  else if (wrapped && col == 0 && new_col + 1 == cols) why = "left edge";
-  else if (button_ok && (pressed & 0xA00)) why = pressed & 0x800 ? "RT" : "RB";
+  if (button_ok && (pressed & 0xA00)) why = pressed & 0x800 ? "RT" : "RB";
   else if (button_ok && (pressed & 0x500)) why = pressed & 0x400 ? "LT" : "LB";
   if (why) page = (why[0] == 'r' || why[0] == 'R' ? g_page + 1 : g_page + Pages() - 1) % Pages();
   // A picks the tile under the cursor (kept); B leaves the screen with the
@@ -1180,21 +1650,15 @@ REX_HOOK_RAW(sub_823D4FC0) {
   if (pressed & 0x1000) {
     g_committed_custom = g_redirected_custom;
     g_committed_host = g_redirected_host;
+    // (for reports: the tile the cursor was on as seen here - the match's own arena follows at its load)
+    if (new_row < 4 && new_col < 5)
+      REXLOG_INFO("[svr2011] arena select: A on page {} row {} col {} - {} (tile arena {})", g_page + 1, new_row, new_col,
+                  g_redirected_custom ? static_cast<const CustomArena*>(g_redirected_custom)->name : std::string("stock"),
+                  g_page == 0 ? g_tiles[new_row * 5 + new_col].arena : g_redirected_host);
   } else if (pressed & 0x2000) {
     if (g_committed_custom != g_redirected_custom || g_committed_host != g_redirected_host) {
-      if (g_redirected_host >= 0) svr2011::RedirectArena(g_redirected_host, "");
-      g_redirected_host = -1;
-      g_redirected_custom = nullptr;
-      if (const auto* c = static_cast<const CustomArena*>(g_committed_custom); c && g_committed_host >= 0) {
-        SetDecodeSwaps(c, g_committed_host);
-        svr2011::SetRingRules(c->manifest);
-        svr2011::RedirectArena(g_committed_host, c->file);
-        g_redirected_custom = c;
-        g_redirected_host = g_committed_host;
-      } else {
-        SetDecodeSwaps(nullptr, -1);
-        svr2011::SetRingRules(std::string());
-      }
+      const auto* c = static_cast<const CustomArena*>(g_committed_custom);
+      PointAt(c && g_committed_host >= 0 ? c : nullptr, g_committed_host);
       REXLOG_INFO("[svr2011] arena select: cancelled, {} kept",
                   g_redirected_custom ? static_cast<const CustomArena*>(g_redirected_custom)->name : std::string("the stock arena"));
     }
@@ -1250,8 +1714,30 @@ uint32_t ArenaSelectString(uint32_t caller) {
 // bg78 plays only in matches started from that row (UseBackstageRow).
 std::vector<BackstageRow> g_backstage_rows;
 
+// A weapon in a backstage row's load_weapons= / weapons=: a model number, or a weapon mod's folder (weapon_mods.h,
+// pool=backstage; 0: none such).
+int BackstageWeaponModel(std::string token, const std::string& row) {
+  while (!token.empty() && token.front() == ' ') token.erase(0, 1);
+  while (!token.empty() && token.back() == ' ') token.pop_back();
+  if (token.empty()) return 0;
+  if (std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isdigit(c); })) return std::atoi(token.c_str());
+  for (const auto& m : svr2011::WeaponMods())
+    if (m.folder == token && m.backstage) return m.id;
+  REXLOG_WARN("[svr2011] arena mods: backstage row '{}' - weapon '{}' is no weapon mod for backstage areas: left out", row,
+              token);
+  return 0;
+}
+
 void LoadBackstage() {
+  if (svr2011::NoMods()) return;  // (Start Without Mods: no_mods.h)
   std::error_code ec;
+  if (svr2011::BackstageModsOff()) {  // (no_mods.h: the stock backstage only - each installed one named)
+    for (const auto& e : fs::directory_iterator(g_game / "Mods" / "Backstage", ec))
+      if (e.is_directory() && fs::exists(e.path() / "arena.pac", ec))
+        REXLOG_INFO("[svr2011] arena mods: backstage mod '{}' skipped - backstage mods are off, the stock backstage "
+                    "plays", e.path().filename().string());
+    return;
+  }
   std::vector<fs::path> found;
   std::vector<fs::path> dirs;
   for (const auto& e : fs::directory_iterator(g_game / "Mods" / "Backstage", ec))
@@ -1279,7 +1765,7 @@ void LoadBackstage() {
           std::string v = l.substr(13);
           for (size_t at = 0; at < v.size();) {
             const size_t end = std::min(v.find(',', at), v.size());
-            if (const int m = std::atoi(v.substr(at, end - at).c_str()); m > 0) r.load_weapons.push_back(m);
+            if (const int m = BackstageWeaponModel(v.substr(at, end - at), r.label); m > 0) r.load_weapons.push_back(m);
             at = end + 1;
           }
         }
@@ -1299,9 +1785,12 @@ void LoadBackstage() {
           while (at < l.size()) {
             const size_t end = std::min(l.find(';', at), l.size());
             BackstageRow::Weapon w{};
-            if (std::sscanf(l.substr(at, end - at).c_str(), "%d,%f,%f,%f,%f", &w.model, &w.x, &w.y, &w.z, &w.yaw) ==
-                    5 &&
-                w.model > 0 && w.model < 256)
+            const std::string item = l.substr(at, end - at);
+            const size_t comma = item.find(',');
+            w.model = BackstageWeaponModel(item.substr(0, comma), r.label);
+            if (comma != std::string::npos &&
+                std::sscanf(item.c_str() + comma + 1, "%f,%f,%f,%f", &w.x, &w.y, &w.z, &w.yaw) == 4 && w.model > 0 &&
+                w.model < 256)
               r.weapons.push_back(w);
             at = end + 1;
           }
@@ -1316,10 +1805,11 @@ void LoadBackstage() {
       // Its own gimmicks (cars and their hot spots): gimmick.pac, a small pac
       // with GMGB/<gimmick> (4 chars, e.g. 78P8), mounted as one more pac
       // (move_packs.cpp) and played in place of the room's GMGB package in its
-      // matches (sub_824B0090 below). Only the first such mod brings one.
-      static bool have_gm = false;
-      if (r.gimmick.size() == 4 && fs::exists(d / "gimmick.pac", ec) && !have_gm) {
-        have_gm = true;
+      // matches (sub_824B0090 below). One mod per entry brings it - the first
+      // by folder name, as move_packs.cpp mounts them (HCTP rooms and worlds
+      // each have their own entry).
+      static std::set<std::string> have_gm;
+      if (r.gimmick.size() == 4 && fs::exists(d / "gimmick.pac", ec) && have_gm.insert(r.gimmick).second) {
         REXLOG_INFO("[svr2011] arena mods: {} plays its gimmicks GMGB/{}", r.label, r.gimmick);
       } else {
         if (!r.gimmick.empty()) REXLOG_WARN("[svr2011] arena mods: {}: gimmicks ignored", r.label);
@@ -1349,6 +1839,7 @@ void UseBackstageRow(int i) {
 }
 
 void SetMatchLoading(bool loading) { g_match_loading = loading; }
+void SetSuperstarLoading(const std::string& file) { StarLoading(file); }
 
 std::string ArenaModInUse(int* tile) {
   // (the arena redirected is the one the match loads - the online screen's A
@@ -1359,6 +1850,13 @@ std::string ArenaModInUse(int* tile) {
   return c->id;
 }
 
+std::string ArenaModManifest() {
+  const auto* c = static_cast<const CustomArena*>(g_redirected_custom);
+  return c && g_redirected_host >= 0 ? c->manifest : std::string();
+}
+
+// (tile: the arena of the host's tile - the session's arena; this game finds the mod's base itself, so the pages'
+// order may differ between the two games)
 bool UseArenaMod(const std::string& folder, int tile) {
   static int used = -1;  // (the tile this game plays another's arena on)
   static std::string used_folder;
@@ -1366,9 +1864,7 @@ bool UseArenaMod(const std::string& folder, int tile) {
   used_folder = folder;
   if (folder.empty() || tile < 0 || tile >= 100) {
     if (used >= 0) {
-      RedirectArena(used, "");
-      SetDecodeSwaps(nullptr, -1);
-      SetRingRules(std::string());
+      PointAt(nullptr, -1);
       REXLOG_INFO("[svr2011] arena mods: the online session's custom arena off");
     }
     used = -1;
@@ -1376,18 +1872,51 @@ bool UseArenaMod(const std::string& folder, int tile) {
   }
   for (const auto& c : g_customs) {
     if (c.id != folder) continue;
-    if (used >= 0 && used != tile) RedirectArena(used, "");
-    SetDecodeSwaps(&c, tile);
-    SetRingRules(c.manifest);
-    RedirectArena(tile, c.file);
-    if (used != tile) REXLOG_INFO("[svr2011] arena mods: the online session's custom arena {} on arena {}", c.name, tile);
+    PointAt(&c, tile);
+    if (used != tile)
+      REXLOG_INFO("[svr2011] arena mods: the online session's custom arena {} on arena {} (plays as arena {})", c.name,
+                  tile, g_redirected_file);
     used = tile;
     return true;
   }
   return false;
 }
 
-int ArenaNumberFor(int arena) { return arena >= 0 && arena < 100 && g_number_for[arena] ? g_number_for[arena] : arena; }
+int ArenaNumberFor(int arena) {
+  if (arena >= 0 && arena < 100 && g_plays_as[arena]) arena = g_plays_as[arena] - 1;
+  return arena >= 0 && arena < 100 && g_number_for[arena] ? g_number_for[arena] : arena;
+}
+
+// (The match record copies the screen's arena when the match screen opens - sub_82773F00 - and again from this read
+// once one is picked: a WWE Universe match picked on page 2 played the tile's stock arena without it.)
+namespace {
+void ScreenPlaysAs(uint8_t* base, uint32_t screen) {
+  constexpr uint32_t kScreenArena = 244;
+  if (!screen) return;
+  uint8_t* q = base + screen + kScreenArena;
+  const uint32_t arena = uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
+  if (arena >= 100 || !g_plays_as[arena]) return;
+  const uint32_t as = uint32_t(g_plays_as[arena] - 1);
+  q[0] = uint8_t(as >> 24), q[1] = uint8_t(as >> 16), q[2] = uint8_t(as >> 8), q[3] = uint8_t(as);
+  REXLOG_INFO("[svr2011] arena mods: the match screen's arena {} plays as arena {}", arena, as);
+}
+}  // namespace
+
+void ScreenArenaRead(uint8_t* base, uint32_t screen) {
+  LiveArenaPlaysAs(base);
+  g_loads_since_pick = 0;
+  ScreenPlaysAs(base, screen);
+}
+
+// (A match's load, sub_823EEB98 - before anything of it reads the arena: the INFERNO's fire set up at the load's
+// start with the tile's own number still in the live settings - a mod on another arena's tile had no ringside fire
+// and the temperature never rose, report 7a6b96; the screen read that turns it into the plays-as arena came ~2 s
+// later.)
+void ArenaPlaysAsAtLoad(uint8_t* base) {
+  LiveArenaPlaysAs(base);
+  const uint8_t* m = base + 0x82EDEB48;  // (the match screen)
+  ScreenPlaysAs(base, uint32_t(m[0]) << 24 | uint32_t(m[1]) << 16 | uint32_t(m[2]) << 8 | m[3]);
+}
 
 void ArenaSelectPad(uint32_t user, uint16_t buttons) {
   if (user < 8) g_shoulders[user] = buttons & 0x3F00;  // (+ A 0x1000, B 0x2000: pick / cancel)
@@ -1397,6 +1926,15 @@ void SetArenaDefault(int arena, const std::string& relative_file) {
   if (arena < 0 || arena >= 100) return;
   g_default[arena] = relative_file;
   RedirectArena(arena, relative_file);
+}
+
+uint32_t ServedStageUnits(const char* entry) {
+  if (std::strncmp(entry, "/STG/", 5) != 0 || std::strlen(entry) != 9) return 0;
+  std::lock_guard lock(g_stg_mutex);
+  for (const auto& list : g_served_stg)
+    for (const auto& e : list)
+      if (!std::memcmp(e.name, entry + 5, 4)) return e.units;
+  return 0;
 }
 
 void RedirectArena(int arena, const std::string& file) {
@@ -1456,6 +1994,39 @@ void RedirectArena(int arena, const std::string& file) {
         }
       }
     }
+  }
+  {  // the stage entries' sizes against the shipped file's (g_served_stg)
+    std::vector<StgEntry> differ;
+    if (!relative_file.empty()) {
+      std::vector<char> stock(0x4000);
+      size_t got = 0;
+      if (FILE* f = std::fopen((g_game / "pac" / "bg" / name).string().c_str(), "rb")) {
+        got = std::fread(stock.data(), 1, stock.size(), f);
+        std::fclose(f);
+      }
+      const auto shipped = StgEntries(stock.data(), got);
+      for (auto [e, at] : StgEntries(head, sizeof head)) {
+        if (long(at) == stage_at) std::memcpy(e.name, want, 4);  // (renamed into the slot below)
+        for (const auto& [s, s_at] : shipped) {
+          if (std::memcmp(s.name, e.name, 4) || s.units == e.units) continue;
+          if (s.sector != e.sector)
+            REXLOG_WARN("[svr2011] arena mods: {} STG/{} is at sector {}, the shipped file's at {}: the game reads it "
+                        "there - keep the stage entries in the shipped order (a bigger entry last)",
+                        relative_file, e.name, e.sector, s.sector);
+          else
+            differ.push_back(e);
+        }
+      }
+      for (const auto& e : differ)
+        REXLOG_INFO("[svr2011] arena mods: {} STG/{} is {} bytes (the shipped BG{:02}'s {}): read at its own size",
+                    relative_file, e.name, uint64_t(e.units) << 8, arena, [&] {
+                      for (const auto& [s, s_at] : shipped)
+                        if (!std::memcmp(s.name, e.name, 4)) return uint64_t(s.units) << 8;
+                      return uint64_t(0);
+                    }());
+    }
+    std::lock_guard stg_lock(g_stg_mutex);
+    g_served_stg[arena] = std::move(differ);
   }
   // The game's own practice ring as it is (the Practice Arena mod: bg29 on
   // SummerSlam's tile): not renamed into the slot. The game draws arena 29
@@ -1564,6 +2135,19 @@ void InstallArenaMods(rex::memory::Memory* memory, rex::filesystem::VirtualFileS
     REXLOG_INFO("[svr2011] crowd: off - arenas without their crowd");
   }
   LoadCustomArenas();
+  // Test aid: SVR2011_TEST_ARENA_MOD=<custom arena folder> - it is picked from the start, on its base arena's tile
+  // (SVR2011_TEST_MATCH arena=<that base> plays it); SVR2011_TEST_ARENA_TILE=<n> - on arena n's tile instead (as on
+  // a page where it sits on another arena's tile: SVR2011_TEST_MATCH arena=<n>). Tile 0 crashes at the load with a mod
+  // (FATAL call 0xA9AAAAAA, 2.1.8 too; a real pick on tile 0 plays) - use another tile.
+  if (const char* v = std::getenv("SVR2011_TEST_ARENA_MOD"); v && *v) {
+    const char* t = std::getenv("SVR2011_TEST_ARENA_TILE");
+    for (const auto& c : g_customs)
+      if (c.id == v) {
+        PointAt(&c, t && *t ? std::atoi(t) : c.base_arena >= 0 ? c.base_arena : 1);
+        REXLOG_INFO("[svr2011] arena mods: test - {} picked on arena {}'s tile (plays as arena {})", c.name,
+                    g_redirected_host, g_redirected_file);
+      }
+  }
   LoadBackstage();
   LoadLoadingPictures();
   // Test aid: SVR2011_TEST_LOADING=<custom arena id>:<theme>: its loading and
@@ -1575,11 +2159,17 @@ void InstallArenaMods(rex::memory::Memory* memory, rex::filesystem::VirtualFileS
       if (c.id == sv.substr(0, colon)) SetDecodeSwaps(&c, colon == std::string::npos ? 1 : std::atoi(sv.c_str() + colon + 1));
   }
   if (std::getenv("SVR2011_TEST_SCAN")) StartScan();
-  // Test aid: SVR2011_TEST_ARENA_REDIRECT=<nn>=<file relative to the game folder>
+  // Test aid: SVR2011_TEST_ARENA_REDIRECT=<nn>=<file relative to the game folder> (a custom arena's arena.pac:
+  // chosen as if picked on the arena select - its manifest's keys apply, e.g. the light keys)
   if (const char* v = std::getenv("SVR2011_TEST_ARENA_REDIRECT"); v && *v) {
     const std::string s = v;
     const size_t eq = s.find('=');
-    if (eq != std::string::npos) RedirectArena(std::atoi(s.substr(0, eq).c_str()), s.substr(eq + 1));
+    if (eq != std::string::npos) {
+      const std::string file = s.substr(eq + 1);
+      RedirectArena(std::atoi(s.substr(0, eq).c_str()), file);
+      for (const auto& c : g_customs)
+        if (c.file == file) g_redirected_custom = &c, svr2011::SetRingRules(c.manifest);
+    }
   }
   // Test aid: SVR2011_TEST_FILE_LINK=<path>=<path>;... (game folder relative,
   // e.g. PAC\M.PAC=Mods\PacOverlay\m.pac): file-level symbolic links.
@@ -1658,6 +2248,18 @@ class ArenaPageLabel final : public rex::ui::ImGuiDialog {
 namespace svr2011 {
 
 void InstallArenaModsOverlay(rex::ui::ImGuiDrawer* drawer) { new ArenaPageLabel(drawer); }
+
+std::vector<std::pair<std::string, std::string>> ArenaThemePacs() {
+  std::vector<std::pair<std::string, std::string>> out;
+  for (const auto& c : g_customs)
+    if (!c.theme_pac.empty()) out.push_back({c.id, c.theme_pac});
+  return out;
+}
+
+void SetArenaThemeGroup(const std::string& id, const std::string& group) {
+  for (auto& c : g_customs)
+    if (c.id == id) c.theme_group = group;
+}
 
 }  // namespace svr2011
 

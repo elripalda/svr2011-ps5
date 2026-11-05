@@ -9,7 +9,12 @@
 //   - the key that signs login certificates: the server's own.
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
+#include <string>
+#include <vector>
+
+#include <rex/ppc.h>
 
 namespace rex::memory {
 class Memory;
@@ -31,6 +36,16 @@ void InstallOnline(rex::memory::Memory* memory, const std::filesystem::path& sav
 // the PC doesn't have (gamer cards, Xbox LIVE Party).
 uint32_t OnlineString(uint32_t id);
 
+// Community Creations: the mods a Created Superstar's profile record needs (its moveset's pack moves the
+// stock game can't play, its entrance's pack parts) - empty when none; and, at an upload's confirm step
+// (sub_82511C18), refuse one that needs mods with the game's message box and the reason (true: refused).
+std::vector<std::string> CawModUses(uint8_t* base, uint32_t profile);
+bool CcUploadModsRefused(PPCContext& ctx, uint8_t* base, uint32_t screen);
+// The ONLINE screen's NEWS panel: the server's news (the presence poll's
+// config "news", UTF-8, already in the game font's characters) for the next
+// visit. No server answer: the game keeps what it fetched.
+void SetOnlineNews(const std::string& text);
+
 // Guest scratch memory for online_cpu.cpp's calls into the game (4 KB, the
 // game's thread only); 0 before InstallOnline.
 uint32_t OnlineScratch();
@@ -38,5 +53,22 @@ uint32_t OnlineScratch();
 // "no picture" (sub_8273BB60 from 0x8273C080: online_cpu.cpp's Created
 // Superstar pictures shown with a stand-in - that one isn't usable).
 void OnlineCawPictureFailed(uint8_t* base, uint32_t holder);
+
+// For one call of the match's pad exchange (net_stats.cpp's hooks of the send
+// sub_82893BD0 and the take sub_82893E18, net = the match's net object): with
+// CPU slots, the entry count reaches the humans' highest lobby slot - a human
+// in 3P with a CPU in 2P sent and took no pads (online_cpu.cpp).
+class OnlineCpuPadScope {
+ public:
+  OnlineCpuPadScope(uint8_t* base, uint32_t net);
+  ~OnlineCpuPadScope();
+  OnlineCpuPadScope(const OnlineCpuPadScope&) = delete;
+  OnlineCpuPadScope& operator=(const OnlineCpuPadScope&) = delete;
+
+ private:
+  uint8_t* base_;
+  uint32_t net_ = 0, count_ = 0, wide_ = 0, left_ = 0;
+  uint32_t slots_[6] = {};
+};
 
 }  // namespace svr2011

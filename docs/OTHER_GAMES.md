@@ -19,10 +19,12 @@ slot it is played in (`arena_mods.cpp` RedirectArena), so any base slot works.
 | **SvR 2007 (360)** | `pac/bg/bg<k>.pac`, many arenas each | **ready** | as 2008, plus the host's arena motions |
 | **SvR 2008 (360)** | `pac/bg/bgNN.pac`, EPAC | **ready** | texture sets moved to 2011's ids, crowd from a 2011 arena (`--pac11`) |
 | **SvR 2009 (360)** | `pac/bg/bgNN.pac`, EPAC | **ready** | as 2008, plus light numbers remapped |
-| **SvR 2010 (360)** | `pac/bg/bgNN.pac`, EPAC | **ready** | the same format as 2011: the file is used as it is |
+| **Legends of WrestleMania (360)** | `pac/bg/bg201-216, 219.pac`, EPAC | **ready** | SvR 2009's format (the 2008 path); see below |
+| **SvR 2010 (360)** | `pac/bg/bgNN.pac`, EPAC | **ready** | the same format as 2011: the file is used as it is, except its motion bank (2011 RAW's) and match light sets too dark for 2011 (WrestleMania 25: set 10 ground 0.20 - 2011 RAW's, via `svrmod lights`) |
 | **WWE '12 (360)** | `pac/bg/bgNN.pac`, plain EPAC | **ready (in the Mod Maker)** | the WWE '13 converter (`svrmod wwe13`) takes it as is |
 | **WWE '13 (360)** | `pac/bg/bgNN.pac`, `0x0FF512ED` LZX container around an EPK8 | **ready (in the Mod Maker)** | `svrfmt/wwe13.cpp` (`svrmod wwe13`); see below |
 | **WWE 2K14 (360)** | `pac/bg/bgNN.pac`, EPAC with ZLIB entries | **ready (in the Mod Maker)** | the WWE '13 converter: ZLIB unpacked, the host's arena motions |
+| **WWE 2K15 - 2K17 (360)** | `pac/bg/bgNN.pac`: 2K15 as 2K14, 2K16 in the LZX container, 2K17 an HSPC of SHDCs | **ready (in the Mod Maker)** | the WWE '13 converter. Their screens (`layout_<show>_movie` / `layout_arena_movie` / `layout_mini_tron`) become 2011's `titantron_movie` / `arena_movie`, and move to the ids 2011 plays videos on (entrance 803 / 806 / 808, loop 801 / 807; the rest merged into the biggest of their kind; announce-table monitors kept): otherwise they played the live camera, in entrances too. 2K17's select pictures: MatchHD.pac `Ar<NN>`. WWE 2K14's screens are main&banner (titantron), <show>_header&wall and mini_tron (loops); WWE '12's minitron_movie and any other ...movie name are loops. A picture an arena names but doesn't carry (2K17 WCW Nitro's light cards pas_light / pas_light02) gets a clear one instead of drawing white. Long names get "(2K17)" or no game (the select shows ~30 letters). Tested in a match (27 Oct): 2K17 SummerSlam, RAW, WrestleMania 32 (85,915 points: 2.1.6+), WCW Nitro, NXT TakeOver: Brooklyn; 2K16 SmackDown, Royal Rumble '15, WrestleMania 15; 2K15 NXT, Hell in a Cell; 2K14 Raw, WrestleMania 29, WrestleMania 3. |
 
 ### SvR 2010
 
@@ -150,6 +152,21 @@ slot it is played in (`arena_mods.cpp` RedirectArena), so any base slot works.
   16 One Night Stand, 17 Cyber Sunday, 18 Vengeance (from the texture
   names; check in game).
 
+### Legends of WrestleMania
+
+- **Format:** SvR 2009's arenas (`arena_port.py` game `low`, the 2008 path:
+  texture sets moved, crowd / table pictures / card from 2011 RAW, 2011's
+  light set 10, light numbers remapped).
+- **Arenas:** bg201-215 WrestleMania I - XV (its `string.pac` SDB 0100, entry
+  674 + n - 200), bg216 Royal Rumble 2008 (MatchHD `MD8I` holds logoRR08),
+  bg219 its Rumble-match copy (the same textures). The WrestleManias play as
+  2011's WrestleMania slot, the Royal Rumbles as Royal Rumble. bg223 / 224 /
+  225 / 250 are its Create Moves, prop check and approval stages: not listed
+  (they still convert as one arena file).
+- **Pictures:** MatchHD `M<arena in hex>I` (`MC9I` = bg201; 2008 / 2009 name
+  them in decimal): the loading and VS pictures.
+- **Tested:** WrestleMania III (bg203) plays in 2011 (24 Oct 2026).
+
 ### WWE '12
 
 - **Format:** the arena files are plain EPAC (no LZX container), in WWE
@@ -194,6 +211,36 @@ Superstar Porting chat. Converters: `tools/superstar_port.py`, `moves_port.py`,
 superstar mod (docs/SUPERSTAR_MODS.md) and a move pack (docs/MOVE_PACKS.md).
 Entrances have their own file: [OTHER_GAMES_ENTRANCES.md](OTHER_GAMES_ENTRANCES.md)
 (HCTP Entrance chat).
+
+**Vehicle entrances (2.1.5).** The bike is 2011's own prop 2540 (`evtobj.pac`,
+entrances 518/519): parent 9999, one world track, one 0x75 key a frame (root =
+cm x 10, node 0 = body heading, 1/4 steering about y, 2/3 wheels about x), lights
+on at the first move, off after the last. `wwe13_entrance.py` builds it from a
+2K14 bike (prop 2540, channels `#0c5879e5` root, `#fdd95b24/25` wheels,
+`#fdd95b27` steering). `hctp_entrance.py` maps HCTP prop 2035 to 2540 (HCTP nodes
+1/4 wheels, 2 steering; world heading = 32768 - y). HCTP segments where the bike
+is the rider's child are baked onto a world track from the rider (offset
+(10, -790, -32) root units, heading +150). Heights: in a vehicle entrance the
+rider's and the bike's slot origins (and HCTP's ramp pitch, slot param 4) are
+baked into their roots, their 2011 slots stay at 0, and a baked bike near the
+floor is put on it (root y 1217). HCTP's flat-stage versions (32xx / 35xx: the
+stage segments' slot 12 down) get no ground fix. A 2K14 bike off the floor (409:
+a raised stage) moves onto it frame by frame with its rider; the cameras stay.
+Tested: 2K14 210 / 409, HCTP 3003 / 3411 (3203 / 3511 checked offline).
+
+**The source game's own bike.** The pack adds it as a new `evtobj.pac` SOBJ
+entry (`pacentry evt\evtobj.pac SOBJ <id> props/<id>.bin`, `entrance_props.py`):
+the game copies evtobj.pac into Mods\PacOverlay with it and never writes its own.
+`propfallback <id> <game prop>`: if that copy can't be made, the packs' entrance
+scripts use 2011's prop and the other packs still play (test aid
+SVR2011_TEST_NO_PROP_COPY). 2K14 2540 = 2011's mesh with 2K14's textures (the
+black bike) -> 2541. HCTP 2035 -> 2542 (`hctp_bike.py`: its YOBJ, model-space
+vertices on their nodes, its own 13 nodes). Prop entries are plain PACHs (a
+BPE-packed one crashed `sub_826B6BA8`); palettes count nodes from 1; a prop
+track's node k drives the node named `root` / `bone0k`. HCTP segments with the
+bike on the rider: it heads along his path, wheels level, and he sits where he
+sits in its world segment (3003: (17, -804, 680) root units in the bike's frame).
+Fallback limits: 2540 under an HCTP track keeps the position, not the wheels.
 
 States: **decoded** = we read it and a tool uses it or could; **partly** =
 layout known, some fields not; **unknown** = not looked at or not found.
@@ -256,6 +303,30 @@ names: SYM `PAC/MOVES.PAC` CATE (lists of 40-byte {id, name +8}), HCTP / SvR 200
 and name), else one of the same name with another number that 2011 uses in that kind of slot ("similar"),
 else the base's - no PS2 motions are ported. Mapped slots that get a 2011 move: JBI 34 % (EDIT.PAC MOVS entry 999 names; its records are SYM's layout + 4 and SYM's ids), SYM 32 %, HCTP 37 %, SvR 2004
 45 %, 2006 45 %, PS2 2007 60 %, 2008 60 %, 2009 69 %, 2010 82 % (offline, every superstar of each disc).
+
+### Legends of WrestleMania (360)
+
+`superstar_port.py` game `low` (disc id 54510838; `GameLoW`, on the SvR 2009 reader). SvR 2009's engine, all pacs
+EPAC: `pac/ch/ch100-254.pac` + `chEtc.pac`, `pac/evt/Nyujyo0-3.pac`, themes `sound/music1.yaf` / `music2.yaf`
+(record music id x 100), titantrons `movies/titantron/<movie id>.bik` (Bink 1).
+- **Records:** chEtc CHAR/DAT 262 B = 2009's with 12 rating bytes (twice) where 2009 keeps 8 (name +46 raw, full
+  name +114, short +182; read as 2009's record); CHAR/PRO 504 B, entrance block +0xE4 as 2009 (music, movie,
+  entrance 4000 + id - 100, champion entrance). 89 superstars with models (ids 100-254).
+- **Ids:** its own (100 The Rock); 2011's by name - 33 of them (its Ted DiBiase, 136, is the father: not 2011's 261).
+- **Model:** `svr08_char.py` unchanged (The Rock: 2 attires, 152 of 1024 pages; Ultimate Warrior 202 pages: needs
+  2.1.6+). Renders: `DLC_HD.pac` groups SSFA / SSFB / SSFC at the top level (2009 nests them in MENU), entries
+  named by the decimal id. Loading pictures: `menu/LoadHD.pac` LOAD `S<id>` (not used yet).
+- **Entrances:** `entrance_port.py` game `low` (2009's scripts plus LoW's generic extras); the ring-cart
+  "Gondola" entrances (4170-4186, 4230-4233, 4350-4359) ride LoW's own cart (pac/evt/_EvtObj.pac SOBJ 2552 /
+  2565, added by the pack under the same ids; propfallback 2011's jeep 2526) on its own world track - tested 4170
+  (24 Oct 2026). Their scripts start at segment 1: no Create-An-Entrance parts.
+- **Ratings:** its DAT +4..+15 rate on its own scheme (five real fields: +6 +7 +8 +12 +13, the rest 0x01):
+  ratings_port 'low', fitted on 35 shared superstars - rough (leave-one-out 7.4-10.2 vs 9-12.5 for the roster
+  mean). **Abilities:** none in its records (2009's list at +232 is zeros here): guessed from the ratings.
+- **Not ported yet:** the **moveset** (the base's; the `moveset` / `moveset-pack` verbs say so): its CHAR/PRO
+  is its own layout with its own move ids (not 2009's - SvR 2009 movesets are done, moveset_maps.json svr2009).
+- **Tested** (24 Oct 2026): The Rock, Andre the Giant, Ultimate Warrior converted; Ultimate Warrior in a match with
+  his model, theme, titantron and name plate.
 
 ### Converter plan
 

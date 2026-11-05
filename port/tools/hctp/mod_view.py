@@ -4,6 +4,7 @@ import base64, io, math, os, struct, sys
 import numpy as np
 from PIL import Image
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # (its own folder: the embeddable Python doesn't add it)
 import svr08_stage as s8, svr08_gimmick as G, svrfmt as f, jboy, arena_tool as at
 import to_glb
 
@@ -44,7 +45,8 @@ def main(moddir, out):
     for i in range(20):
         if d.get(i, b'')[:4] == b'JBOY':
             models.append((f'stage{i:02d}', from_jboy(jboy.read(d[i])), None))
-    (h, g, t), _, pk = G.find(moddir + '/gimmick.pac', b'GMGB', b'78H3')
+    entry = next((l.strip()[8:] for l in open(moddir + '/manifest.txt') if l.startswith('gimmick=')), '78H3')
+    (h, g, t), _, pk = G.find(moddir + '/gimmick.pac', b'GMGB', entry.encode())
     sub = {i: G.unpack(b) for i, b in f.pach_read(dict(f.pach_read(pk))[0])}
     W = struct.unpack(f'<{len(sub[2]) // 4}I', sub[2])
     objs = {}

@@ -42,7 +42,7 @@ def run(*args, **kw):
     subprocess.run([str(a) for a in args], check=True, **kw)
 
 
-def build_native():
+def build_native(debug_suite=False):
     env = dict(os.environ)
     env["PATH"] = str(ROOT / "recomp" / "bin") + os.pathsep + env["PATH"]  # ninja
     if not (NATIVE / "build.ninja").exists():
@@ -52,14 +52,19 @@ def build_native():
             "-DCMAKE_BUILD_TYPE=Release", f"-DREXSDK_DIR={SDK_DIR.as_posix()}",
             "-DREXGLUE_ARM64_TUNE=cortex-a53",  # (in-order little cores: Mali tablets; big cores barely mind)
             "-DREXGLUE_USE_VULKAN=ON",
+            *(["-DSVR2011_DEBUG_SUITE=ON"] if debug_suite else []),
             f"-DREXGLUE_HOST_TOOL={(SDK_DIR / 'out/win-amd64/rexglue.exe').as_posix()}", env=env)
     run("cmake", "--build", NATIVE, "--target", "svr2011", env=env)
 
 
 def version():
     v = (PORT / "VERSION.txt").read_text().strip()
-    major, minor, patch = (int(x) for x in v.split(".")[:3])
-    return v, major * 10000 + minor * 100 + patch
+    parts = [int(x) for x in v.split(".")] + [0, 0, 0]
+    major, minor, patch, fix = parts[:4]
+    if (major, minor, patch, fix) <= (2, 1, 4, 0):
+        return v, major * 10000 + minor * 100 + patch   # (2.1.4 and older: 20104 ...)
+    # from 2.1.4.1 on: room for hotfixes (2.1.4.1 -> 201041, 2.1.5 -> 201050), still above every older code
+    return v, (major * 10000 + minor * 100 + patch) * 10 + fix
 
 
 def main():
@@ -67,12 +72,25 @@ def main():
     ap.add_argument("--skip-native", action="store_true", help="package the last native build")
     ap.add_argument("--debuggable", action="store_true",
                     help="test builds: adb run-as can reach the app's storage (a game folder there)")
+    ap.add_argument("--debug-suite", action="store_true",
+                    help="the debug / test suite (docs/DEBUG_SUITE_PLAN.md, tools/dev/svrtest_android.ps1): its own "
+                         "build (out/build/DebugSuiteAndroid) and out/android-dbg/SvR2011-dbg.apk - never a release "
+                         "(release_guard.ps1 refuses it)")
+    ap.add_argument("--version-code", type=int, default=0,
+                    help="test installs on a player's phone: this version code (the installed one, so the "
+                         "player's own APK can go back on - Android never downgrades a release app)")
     args = ap.parse_args()
 
+    global NATIVE, OUT
+    if args.debug_suite:
+        NATIVE = PORT / "out" / "build" / "DebugSuiteAndroid"
+        OUT = PORT / "out" / "android-dbg"
     if not args.skip_native:
-        build_native()
+        build_native(args.debug_suite)
 
     version_name, version_code = version()
+    if args.version_code:
+        version_code = args.version_code
     if OUT.exists():
         shutil.rmtree(OUT)
     (OUT / "classes").mkdir(parents=True)
@@ -190,7 +208,7 @@ def main():
             "-keyalg", "RSA", "-keysize", "2048", "-validity", "36500",
             "-storepass", KEY_PASS, "-keypass", KEY_PASS,
             "-dname", "CN=WWE SvR2011 PC port")
-    apk = OUT / "SvR2011.apk"
+    apk = OUT / ("SvR2011-dbg.apk" if args.debug_suite else "SvR2011.apk")
     run(BUILD_TOOLS / "apksigner.bat", "sign", "--ks", KEYSTORE, "--ks-pass", f"pass:{KEY_PASS}",
         "--out", apk, OUT / "aligned.apk", env=env)
     for tmp in ("base.apk", "aligned.apk", "res.zip", "sources.txt", "classes.jar", "classes.dex"):

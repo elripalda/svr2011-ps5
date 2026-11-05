@@ -4,6 +4,7 @@
 // signs_page.cpp, backgrounds_page.cpp, media_page.cpp, moves_page.cpp, assets_page.cpp,
 // anims_page.cpp, icons_page.cpp, help_page.cpp; the 3D editor is editor.cpp.
 #include "app.h"
+#include "move_check.h"
 #include "mod_check.h"
 
 #include <shellapi.h>
@@ -32,8 +33,10 @@
 #include "editor.h"
 #include "full_preview.h"
 #include "tool_run.h"
+#include "json.h"
 #include "session_log.h"
 extern "C" {
+#include "../launcher/move_warning.h"
 #include "../launcher/movie_maker.h"
 }
 #include "imgui_impl_dx11.h"
@@ -94,13 +97,37 @@ bool CreateDevice(HWND w) {
   sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
   const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
   D3D_FEATURE_LEVEL got;
-  if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2,
+  // (test aid SVR2011_MM_D3D_DEBUG=1: the D3D11 debug layer, its messages logged - DrainD3DMessages)
+  const UINT flags = _wgetenv(L"SVR2011_MM_D3D_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0;
+  if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 2,
                                            D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx)) &&
       FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, levels, 2, D3D11_SDK_VERSION,
                                            &sd, &g_swap, &g_dev, &got, &g_ctx)))
     return false;
   CreateTarget();
   return true;
+}
+
+// The debug layer's messages (SVR2011_MM_D3D_DEBUG), each kind logged once, 200 at most.
+void DrainD3DMessages() {
+  static ID3D11InfoQueue* q = nullptr;
+  static bool tried = false;
+  static std::set<int> seen;
+  if (!tried && _wgetenv(L"SVR2011_MM_D3D_DEBUG")) {
+    tried = true;
+    if (g_dev) g_dev->QueryInterface(__uuidof(ID3D11InfoQueue), reinterpret_cast<void**>(&q));
+    Log(q ? "d3d11: debug layer on" : "d3d11: no debug layer (Graphics Tools not installed?)");
+  }
+  if (!q) return;
+  for (UINT64 i = 0, n = q->GetNumStoredMessages(); i < n && seen.size() < 200; ++i) {
+    SIZE_T len = 0;
+    q->GetMessage(i, nullptr, &len);
+    std::vector<char> b(len);
+    auto* m = reinterpret_cast<D3D11_MESSAGE*>(b.data());
+    if (FAILED(q->GetMessage(i, m, &len)) || !seen.insert(int(m->ID)).second) continue;
+    Log("d3d11 debug " + std::to_string(int(m->Severity)) + ": " + std::string(m->pDescription, m->DescriptionByteLength ? m->DescriptionByteLength - 1 : 0));
+  }
+  q->ClearStoredMessages();
 }
 
 // ---------------------------------------------------------------- log / work
@@ -116,8 +143,32 @@ std::map<PageId, int> g_touches;  // edits a page reported with Touch()
 
 }  // namespace
 
+namespace {
+// (ReleaseAfterFrame's queue, released after each Present; never destroyed - a picture let go of while the program
+// exits, after the last frame, is left to the process's end)
+std::mutex& ReleaseMutex() { static auto* m = new std::mutex; return *m; }
+std::vector<IUnknown*>& ReleaseQueue() { static auto* q = new std::vector<IUnknown*>; return *q; }
+
+void FlushReleases() {
+  std::vector<IUnknown*> now;
+  {
+    std::lock_guard lock(ReleaseMutex());
+    now.swap(ReleaseQueue());
+  }
+  for (IUnknown* v : now) v->Release();
+}
+}  // namespace
+
+void ReleaseAfterFrame(IUnknown* v) {
+  if (!v) return;
+  std::lock_guard lock(ReleaseMutex());
+  ReleaseQueue().push_back(v);
+}
+
 ID3D11ShaderResourceView* MakeTexture(const Image& img) {
   if (img.rgba.empty() || !g_dev) return nullptr;
+  // (the driver reads w x h pixels from the picture: never more than it has)
+  if (img.w <= 0 || img.h <= 0 || img.rgba.size() < size_t(img.w) * size_t(img.h) * 4) return nullptr;
   D3D11_TEXTURE2D_DESC td = {};
   td.Width = UINT(img.w);
   td.Height = UINT(img.h);
@@ -224,20 +275,74 @@ std::vector<std::string> Values(const std::string& text, const char* key) {
 
 const COMDLG_FILTERSPEC kPictureFilter[1] = {{L"Pictures (*.png, *.jpg, *.tga, *.bmp, *.dds)", L"*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.dds"}};
 const COMDLG_FILTERSPEC kSoundFilter[1] = {{L"Sounds (*.mp3, *.m4a, *.wav, *.flac, *.wma, *.ogg)", L"*.mp3;*.m4a;*.aac;*.wav;*.flac;*.wma;*.ogg"}};
-const COMDLG_FILTERSPEC kBinkFilter[1] = {{L"Bink movie (*.bik)", L"*.bik"}};
+const COMDLG_FILTERSPEC kBinkFilter[1] = {{L"Movies for the game (*.mp4, *.bik)", L"*.mp4;*.bik"}};
 const COMDLG_FILTERSPEC kPacFilter[1] = {{L"Character model pac (*.pac)", L"*.pac"}};
 const COMDLG_FILTERSPEC kModFilter[1] = {{L"SvR2011 mod (*.svrmod)", L"*.svrmod"}};
 const COMDLG_FILTERSPEC kProjectFilter[1] = {{L"Mod Maker project (*.svrproj)", L"*.svrproj"}};
 const COMDLG_FILTERSPEC kOpenFilter[1] = {{L"Projects and mods (*.svrproj, *.svrmod)", L"*.svrproj;*.svrmod"}};
 
+namespace {
+std::wstring g_test_pick;  // --test-pick
+
+// A hidden test can't answer a dialog (it would hang): skipped, or --test-pick's answer.
+std::wstring BehindPick(const char* what, const wchar_t* title, const std::wstring& start) {
+  Log("(test: a " + std::string(what) + " dialog was skipped: " + Utf8(title) + (start.empty() ? "" : " - it opens in " + Utf8(start)) +
+      (g_test_pick.empty() ? "" : " - answered " + Utf8(g_test_pick)) + ")");
+  return std::exchange(g_test_pick, std::wstring());
+}
+
+// The dialog opens at `start`: a folder (a folder picker: in its parent, the folder picked) or a file's folder.
+void StartAt(IFileDialog* dlg, const std::wstring& start, bool folder_picker) {
+  std::error_code ec;
+  if (start.empty() || !fs::exists(start, ec)) return;
+  fs::path in = fs::path(start);
+  const bool dir = fs::is_directory(in, ec);
+  if (!dir || folder_picker) in = in.parent_path();
+  IShellItem* item = nullptr;
+  if (!in.empty() && SUCCEEDED(SHCreateItemFromParsingName(in.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+    dlg->SetFolder(item);
+    item->Release();
+  }
+  if (dir && folder_picker) dlg->SetFileName(fs::path(start).filename().c_str());
+}
+}  // namespace
+
+void TestPick(const std::wstring& path) { g_test_pick = path; }
+
+std::wstring OtherGameStart(const std::string& game) {
+  std::error_code ec;
+  const auto at = [&](const std::string& key) -> std::wstring {
+    for (const auto& [k, p] : g_settings.other_game)
+      if (k == key && fs::exists(p, ec)) return p;
+    return {};
+  };
+  if (!game.empty())
+    if (std::wstring p = at(game); !p.empty()) return p;
+  if (std::wstring p = at(""); !p.empty()) return p;
+  if (!game.empty())
+    if (std::wstring p = disc_list::PathFor(game); !p.empty()) return p;
+  return {};
+}
+
+void OtherGamePicked(const std::wstring& path, const std::string& game) {
+  if (path.empty()) return;
+  auto& v = g_settings.other_game;
+  const auto keep = [&](const std::string& key) {
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& e) { return e.first == key; }), v.end());
+    v.push_back({key, path});
+  };
+  keep("");
+  std::error_code ec;
+  const disc_list::Game* g = game.empty() && fs::is_directory(path, ec) ? disc_list::GameById(disc_list::Identify(path)) : nullptr;
+  if (!game.empty() || g) keep(game.empty() ? g->key : game);
+  SaveSettings();
+}
+
 std::wstring PickFile(bool save, const wchar_t* title, const COMDLG_FILTERSPEC* spec, UINT nspec,
-                      const wchar_t* def_ext, const wchar_t* def_name) {
+                      const wchar_t* def_ext, const wchar_t* def_name, const std::wstring& start) {
   IFileDialog* dlg = nullptr;
   std::wstring out;
-  if (g_behind) {  // (a hidden test can't answer a dialog: it would hang)
-    Log("(test: a file dialog was skipped: " + Utf8(title) + ")");
-    return out;
-  }
+  if (g_behind) return BehindPick("file", title, start);
   if (FAILED(CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                               IID_PPV_ARGS(&dlg))))
     return out;
@@ -245,6 +350,7 @@ std::wstring PickFile(bool save, const wchar_t* title, const COMDLG_FILTERSPEC* 
   if (nspec) dlg->SetFileTypes(nspec, spec);
   if (def_ext) dlg->SetDefaultExtension(def_ext);
   if (def_name) dlg->SetFileName(def_name);
+  StartAt(dlg, start, false);
   IShellItem* item = nullptr;
   PWSTR path = nullptr;
   if (SUCCEEDED(dlg->Show(g_wnd)) && SUCCEEDED(dlg->GetResult(&item)) &&
@@ -285,18 +391,16 @@ std::vector<std::wstring> PickFiles(const wchar_t* title, const COMDLG_FILTERSPE
   return out;
 }
 
-std::wstring PickFolder(const wchar_t* title) {
+std::wstring PickFolder(const wchar_t* title, const std::wstring& start) {
   IFileOpenDialog* dlg = nullptr;
   std::wstring out;
-  if (g_behind) {  // (a hidden test can't answer a dialog: it would hang)
-    Log("(test: a folder dialog was skipped: " + Utf8(title) + ")");
-    return out;
-  }
+  if (g_behind) return BehindPick("folder", title, start);
   if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return out;
   DWORD opt = 0;
   dlg->GetOptions(&opt);
   dlg->SetOptions(opt | FOS_PICKFOLDERS);
   dlg->SetTitle(title);
+  StartAt(dlg, start, true);
   IShellItem* item = nullptr;
   PWSTR path = nullptr;
   if (SUCCEEDED(dlg->Show(g_wnd)) && SUCCEEDED(dlg->GetResult(&item)) &&
@@ -485,6 +589,25 @@ void ReleaseOwnFiles() {
 }  // namespace
 
 bool InstallModFiles(const fs::path& dir, const std::vector<ZipEntry>& files, std::string* why) {
+  {  // (a mod with custom moves - a move pack, or a superstar mod's moves\ pack: asked first, as the launcher does;
+     // a hidden test can't answer: only logged - launcher/move_warning.h)
+    bool moves = false;
+    std::string name;
+    for (const auto& f : files) {
+      moves |= f.name == "pack.txt" || f.name == "moves/pack.txt";
+      if (f.name == "manifest.txt") name = Value(std::string(f.data.begin(), f.data.end()), "name");
+    }
+    if (name.empty()) name = PathStr(dir.filename());
+    if (moves) {
+      const fs::path game = dir.parent_path().parent_path().parent_path();  // (<game>\Mods\<type>\<folder>)
+      Log("install: " + name + " has custom moves (experimental, most likely broken)");
+      if (!move_warning_ask(g_wnd, game.c_str(), Wide(name).c_str(), g_behind)) {
+        if (why) *why = "it has custom moves (you chose not to install it).";
+        Log("install: " + name + " not installed (custom moves: No)");
+        return false;
+      }
+    }
+  }
   std::error_code ec;
   const fs::path stage = dir.parent_path() / (L"." + dir.filename().wstring() + L".new");
   const fs::path old = dir.parent_path() / (L"." + dir.filename().wstring() + L".old");
@@ -526,6 +649,17 @@ bool InstallModFiles(const fs::path& dir, const std::vector<ZipEntry>& files, st
     return false;
   }
   fs::remove_all(old, ec);
+  {  // (the session log, for a report: what was installed, its theme / music / movie files)
+    std::string keys;
+    for (const auto& f : files)
+      if (f.name == "manifest.txt") {
+        const std::string t(f.data.begin(), f.data.end());
+        for (const char* k : {"type", "name", "base", "song", "music", "movie", "theme_gain", "call_gain", "entrance", "victory", "cae", "moves", "pack"})
+          if (const std::string v = Value(t, k); !v.empty()) keys += std::string(" ") + k + "=" + v;
+      }
+    Log("install: " + PathStr(dir.parent_path().filename()) + "/" + PathStr(dir.filename()) + " (" + std::to_string(files.size()) +
+        " files):" + keys);
+  }
   return true;
 }
 
@@ -554,6 +688,56 @@ bool TestFixOn(const std::vector<Problem>& problems) {
   return true;
 }
 int FixesDone() { return g_fixes_done; }
+void FixChanged() { ++g_fixes_done; }
+
+// The mod folders threads_parts.py found no colour masks in, kept in <game>\Mods\.convert\threads_no_masks.txt (one
+// path a line) so the doctor offers making them at once next time.
+std::set<std::wstring> g_threads_no_masks;
+bool g_threads_no_masks_read = false;
+fs::path NoMasksFile() { return fs::path(g_game) / L"Mods" / L".convert" / L"threads_no_masks.txt"; }
+void ReadNoMasks() {
+  if (g_threads_no_masks_read || g_game.empty()) return;
+  g_threads_no_masks_read = true;
+  Bytes t;
+  if (!ReadFile(PathStr(NoMasksFile()), t)) return;
+  const std::string s(t.begin(), t.end());
+  for (size_t at = 0; at < s.size();) {
+    size_t e = s.find('\n', at);
+    if (e == std::string::npos) e = s.size();
+    if (e > at) g_threads_no_masks.insert(Wide(s.substr(at, e - at)));
+    at = e + 1;
+  }
+}
+void WriteNoMasks() {
+  std::string t;
+  for (const auto& d : g_threads_no_masks) t += Utf8(d) + "\n";
+  std::error_code ec;
+  fs::create_directories(NoMasksFile().parent_path(), ec);
+  WriteFile(PathStr(NoMasksFile()), Bytes(t.begin(), t.end()));
+}
+bool ThreadsNoMasks(const fs::path& dir) {
+  ReadNoMasks();
+  std::error_code ec;
+  return g_threads_no_masks.count(fs::absolute(dir).wstring()) > 0 && !fs::exists(dir / "threads.txt", ec);
+}
+void MakeThreadsParts(const fs::path& dir, std::function<void(int, const std::string&)> done, bool make_masks) {
+  const std::wstring d = fs::absolute(dir).wstring();
+  std::vector<std::wstring> args = {d, L"--json", L"--game", g_game};
+  if (make_masks) args.push_back(L"--make-masks");
+  const bool started = RunToolJson(L"threads_parts.py", args, [d, done](int code, const std::string& out) {
+    Json j;
+    const std::string msg = ParseJson(out, j) ? j["message"].Str() : std::string();
+    ReadNoMasks();
+    if (code == 3 && g_threads_no_masks.insert(d).second) WriteNoMasks();
+    if (code == 0 && g_threads_no_masks.erase(d)) WriteNoMasks();
+    for (const auto& m : j["masks"].items)  // (masks painted: which model file, attire, channels)
+      Log("threads parts: masks made: " + m["pac"].Str() + " attire " + std::to_string(m["attire"].Int()) +
+          (m["info"].Str().empty() ? "" : ": " + m["info"].Str()));
+    Log("threads parts: " + Utf8(d) + ": exit " + std::to_string(code) + (msg.empty() ? "" : ": " + msg));
+    if (done) done(code, msg);
+  });
+  if (!started && done) done(-1, "the Mod Maker tools (Python) aren't ready, or another tool is running");
+}
 
 void RunFix(const FixAction& f) {
   if (f.run) f.run();
@@ -1087,7 +1271,7 @@ void ReloadEntrances() {
         if (!e.is_directory(ec) || fs::exists(e.path() / L"disabled", ec)) continue;
         const fs::path pack = std::wstring(where) == L"Moves" ? e.path() : e.path() / L"moves";
         for (auto& i : PackEntrances(pack))
-          if (seen.insert(i.number).second) out.push_back(std::move(i));
+          if (!IsVictoryNumber(i.number) && seen.insert(i.number).second) out.push_back(std::move(i));
       }
     std::sort(out.begin(), out.end(), [](const EntranceInfo& a, const EntranceInfo& b) { return a.number < b.number; });
     g_entrances_next = std::move(out);
@@ -1109,6 +1293,41 @@ bool EntrancesReady() {
 const std::vector<EntranceInfo>& Entrances() {
   static const std::vector<EntranceInfo> kNone;
   return EntrancesReady() ? g_entrances : kNone;
+}
+
+const std::vector<EntranceInfo>& Victories() {
+  static std::vector<EntranceInfo> v;
+  static bool done = false;
+  if (done) return v;
+  done = true;
+  std::set<int> seen;
+  std::error_code ec;
+  std::vector<fs::path> pacs;
+  for (const auto& e : fs::directory_iterator(fs::path(g_game) / L"pac" / L"evt", ec))
+    if (Lower(PathStr(e.path().filename())).rfind("winning", 0) == 0) pacs.push_back(e.path());
+  std::sort(pacs.begin(), pacs.end());
+  for (const auto& p : pacs) {
+    PacIndex idx;
+    if (!ReadPacIndex(p, idx)) continue;
+    for (const auto& e : idx.entries) {
+      if (e.group.rfind("EVP", 0) != 0 || e.name.empty() || !std::isdigit(uint8_t(e.name[0]))) continue;
+      const int n = std::atoi(e.name.c_str());
+      if (n < 6000 || n > 7107 || !seen.insert(n).second) continue;  // (singles: tag, trio, manager scenes are 7150+)
+      Bytes b;
+      EntranceInfo i;
+      i.number = n;
+      if (ReadPacEntry(p, e, b)) i.name = EvpName(b);
+      v.push_back(std::move(i));
+    }
+  }
+  for (const wchar_t* where : {L"Moves", L"Superstars"})
+    for (const auto& e : fs::directory_iterator(fs::path(g_game) / L"Mods" / where, ec)) {
+      if (!e.is_directory(ec) || fs::exists(e.path() / L"disabled", ec)) continue;
+      for (auto& i : PackEntrances(std::wstring(where) == L"Moves" ? e.path() : e.path() / L"moves"))
+        if (IsVictoryNumber(i.number) && seen.insert(i.number).second) v.push_back(std::move(i));
+    }
+  std::sort(v.begin(), v.end(), [](const EntranceInfo& a, const EntranceInfo& b) { return a.number < b.number; });
+  return v;
 }
 
 const std::map<int, MoveInfo>& MoveInfos() {
@@ -1300,6 +1519,41 @@ Image FitFigure(const Image& src, int size) {
   return out;
 }
 
+Image FitLoading(const Image& src) {
+  constexpr int W = 1024, H = 512;
+  if (!src.w || !src.h) return Image();
+  if (src.w == W && src.h == H) return src;
+  const float aspect = float(src.w) / float(src.h);
+  if (aspect > 1.8f && aspect < 2.2f) return Resize(src, W, H);  // (wide: it fills the screen)
+  // the back: the picture covering the whole screen, blurred (down to 32 x 16 and up again) and darkened
+  const float cover = std::max(float(W) / src.w, float(H) / src.h);
+  const int cw = std::max(1, int(src.w * cover + 0.5f)), chh = std::max(1, int(src.h * cover + 0.5f));
+  const Image covered = Resize(src, cw, chh);
+  Image crop;
+  crop.w = W, crop.h = H;
+  crop.rgba.resize(size_t(W) * H * 4);
+  for (int y = 0; y < H; ++y)
+    std::memcpy(&crop.rgba[size_t(y) * W * 4], &covered.rgba[(size_t(y + (chh - H) / 2) * cw + (cw - W) / 2) * 4], size_t(W) * 4);
+  Image out = Resize(Resize(Resize(crop, 128, 64), 32, 16), W, H);
+  for (size_t i = 0; i < out.rgba.size(); i += 4) {
+    for (int c = 0; c < 3; ++c) out.rgba[i + c] = uint8_t(out.rgba[i + c] * 0.55f);
+    out.rgba[i + 3] = 255;
+  }
+  // the picture itself, whole: on the right half when it is square or tall (as the converters place a render), else centred
+  const float fit = std::min(float(W) / src.w, float(H) / src.h);
+  const int fw = std::max(1, int(src.w * fit + 0.5f)), fh = std::max(1, int(src.h * fit + 0.5f));
+  const Image front = Resize(src, fw, fh);
+  const int x0 = fw <= W / 2 + 64 ? std::min(W - fw, W * 3 / 4 - fw / 2) : (W - fw) / 2, y0 = (H - fh) / 2;
+  for (int y = 0; y < fh; ++y)
+    for (int x = 0; x < fw; ++x) {
+      const uint8_t* s = &front.rgba[(size_t(y) * fw + x) * 4];
+      uint8_t* d = &out.rgba[(size_t(y0 + y) * W + x0 + x) * 4];
+      const float a = s[3] / 255.0f;
+      for (int c = 0; c < 3; ++c) d[c] = uint8_t(s[c] * a + d[c] * (1 - a) + 0.5f);
+    }
+  return out;
+}
+
 Image GameLook(const Image& src) {
   // the figure's luminance mean / spread and saturation, moved half way to the stock renders' medians
   double sum = 0, sum2 = 0, sat = 0, n = 0;
@@ -1457,6 +1711,14 @@ void BudgetProblems(const std::wstring& pac, const std::string& who, bool first_
     if (!worst || p.pages > worst->pages) worst = &p;
     if (first_only) break;
   }
+  if (worst && worst->pages > kModelPagesOld && worst->pages <= kModelPagesWarn)
+    out.push_back(Warning(who + "'s model takes " + std::to_string(worst->pages) + " memory pages: version " + kNeedsVersion +
+                       " or newer plays it (older games had " + std::to_string(kModelPagesOld) + " and leave it out).", ""));
+  // (27 Oct: six 1,489-page superstars in one 6-man - 60 fps at 1080p, about 40 at 4x supersampling with 2x AA)
+  if (worst && worst->pages > kModelPagesHeavy)
+    out.push_back(Warning(who + "'s model is very detailed (" + std::to_string(worst->pages) + " memory pages). Fine on its "
+                          "own; six models this detailed in one match play at 60 fps at 1080p, about 40 fps at the "
+                          "highest render scale with anti-aliasing.").Note());
   if (!worst || worst->pages <= kModelPagesWarn) return;
   const int pct = worst->pages * 100 / kModelPages;
   // a lighter copy: the model without its blood, used in its place
@@ -1536,12 +1798,150 @@ void MakeBink(const std::wstring& video, const std::wstring& out, int fit, int s
     CoUninitialize();
     const std::wstring err = job.err;
     const int frames = job.frames;
-    OnUiThread([ok, out, err, frames, done] {
-      if (ok) Status("Bink movie made: " + FileName(out) + " (" + std::to_string(frames) + " frames).");
+    // then an .mp4 of it (the size mods carry; the .bik stays beside it as the game's fallback)
+    std::wstring mp4;
+    std::string why;
+    if (ok) {
+      Progress("Making the mp4 (" + FileName(out) + ") ...");
+      mp4 = fs::path(out).replace_extension(L".mp4").wstring();
+      why = ShrinkMovie(out, mp4);
+      if (!why.empty()) mp4.clear();
+    }
+    OnUiThread([ok, out, mp4, why, err, frames, done] {
+      std::error_code ec;
+      if (ok && !mp4.empty())
+        Status("Movie made: " + FileName(mp4) + " (" + std::to_string(frames) + " frames, " + SizeText(fs::file_size(mp4, ec)) + "; as a Bink it's " +
+               SizeText(fs::file_size(out, ec)) + ").");
+      else if (ok) Status("Bink movie made: " + FileName(out) + " (" + std::to_string(frames) + " frames); no mp4: " + why + ".");
       else Status("The movie could not be made: " + Utf8(err));
-      if (done) done(ok ? out : L"");
+      if (done) done(!ok ? L"" : !mp4.empty() ? mp4 : out);
     });
   });
+}
+
+std::string SizeText(uint64_t bytes) {
+  char b[32];
+  if (bytes >= 1024 * 1024) std::snprintf(b, sizeof b, "%.1f MB", bytes / 1048576.0);
+  else std::snprintf(b, sizeof b, "%llu KB", (unsigned long long)((bytes + 1023) / 1024));
+  return b;
+}
+
+namespace {
+std::mutex g_shrink_mutex;  // (one shrink at a time: the slot's background one and a save's wait for the same file)
+fs::path Mp4Path(const std::wstring& bik) {
+  std::error_code ec;
+  const auto size = fs::file_size(bik, ec);
+  const auto when = fs::last_write_time(bik, ec).time_since_epoch().count();
+  uint32_t h = 2166136261u;
+  for (wchar_t c : Lower(Utf8(bik)) + "|" + std::to_string(size) + "|" + std::to_string(when)) h = (h ^ uint32_t(uint8_t(c))) * 16777619u;
+  char hex[16];
+  std::snprintf(hex, sizeof hex, "%08x", h);
+  return fs::path(g_game) / L"Mods" / L".convert" / L"movies" / (fs::path(bik).stem().wstring() + L"_" + Wide(hex) + L".mp4");
+}
+}  // namespace
+
+std::wstring CachedMp4(const std::wstring& bik) {
+  std::error_code ec;
+  const fs::path p = Mp4Path(bik);
+  return fs::exists(p, ec) ? p.wstring() : std::wstring();
+}
+
+std::wstring ShrunkMovie(const std::wstring& bik, std::string* why) {
+  std::lock_guard lock(g_shrink_mutex);
+  if (std::wstring have = CachedMp4(bik); !have.empty()) return have;
+  const fs::path p = Mp4Path(bik);
+  const std::string err = ShrinkMovie(bik, p.wstring());
+  if (why) *why = err;
+  return err.empty() ? p.wstring() : std::wstring();
+}
+
+std::string ModMovieFiles(const std::wstring& src, const std::string& stem, std::vector<ZipEntry>& files, std::string* why) {
+  std::error_code ec;
+  const std::string ext = Lower(Utf8(fs::path(src).extension().wstring()));
+  auto is_bik = [](const std::wstring& f) {
+    if (FILE* fp = _wfopen(f.c_str(), L"rb")) {
+      char h[3] = {};
+      const bool b = std::fread(h, 1, 3, fp) == 3 && !std::memcmp(h, "BIK", 3);
+      std::fclose(fp);
+      return b;
+    }
+    return false;
+  };
+  std::wstring bik, mp4;
+  if (ext == ".mp4") {
+    mp4 = src;
+    const std::wstring beside = fs::path(src).replace_extension(L".bik").wstring();  // (a movie made here: its Bink beside it)
+    if (fs::exists(beside, ec) && is_bik(beside)) bik = beside;
+  } else {
+    if (is_bik(src)) bik = src;
+    Progress("Making the entrance movie an mp4 (" + FileName(src) + ") ...");
+    std::string err;
+    mp4 = ShrunkMovie(src, &err);
+    if (mp4.empty()) Log("movie: kept as it is (" + err + ")");
+  }
+  Bytes d;
+  if (!mp4.empty() && ReadFile(Utf8(mp4), d)) {
+    files.push_back({stem + ".mp4", std::move(d)});
+    Log("movie: " + stem + ".mp4 " + SizeText(files.back().data.size()) + (bik.empty() ? "" : ", the Bink " + SizeText(fs::file_size(bik, ec))) +
+        (g_settings.keep_bik && !bik.empty() ? " (kept beside it)" : ""));
+    if (g_settings.keep_bik && !bik.empty() && ReadFile(Utf8(bik), d)) files.push_back({stem + ".bik", std::move(d)});
+    return stem + ".mp4";
+  }
+  if (!bik.empty() && ReadFile(Utf8(bik), d)) {  // (no mp4 could be made: the Bink as before)
+    files.push_back({stem + ".bik", std::move(d)});
+    return stem + ".bik";
+  }
+  if (why) *why = ext == ".bk2" || ext == ".bik2" ? "a Bink 2 movie that couldn't be converted" : "not a movie the game can play (a .bik or an .mp4)";
+  return {};
+}
+
+std::wstring ProjectMovie(const std::wstring& movie) {
+  if (movie.empty() || Lower(Utf8(fs::path(movie).extension().wstring())) == ".mp4") return movie;
+  const std::wstring mp4 = CachedMp4(movie);
+  return mp4.empty() ? movie : mp4;
+}
+
+void MovieSizeRow(const std::wstring& movie) {
+  if (movie.empty()) return;
+  static std::atomic<bool> running{false};
+  static std::wstring failed_for;
+  static std::string failed_why;
+  std::error_code ec;
+  const uint64_t size = fs::file_size(movie, ec);
+  if (ec) return;
+  const std::string ext = Lower(Utf8(fs::path(movie).extension().wstring()));
+  ImGui::Indent();
+  if (ext == ".mp4") {
+    const std::wstring beside = fs::path(movie).replace_extension(L".bik").wstring();
+    if (fs::exists(beside, ec))
+      ImGui::TextDisabled("%s as an mp4 (as a Bink: %s)", SizeText(size).c_str(), SizeText(fs::file_size(beside, ec)).c_str());
+    else
+      ImGui::TextDisabled("%s (an mp4)", SizeText(size).c_str());
+  } else {
+    const std::wstring mp4 = CachedMp4(movie);
+    if (!mp4.empty()) {
+      ImGui::TextDisabled("%s as a Bink -> %s as an mp4 (the mod carries the mp4)", SizeText(size).c_str(), SizeText(fs::file_size(mp4, ec)).c_str());
+    } else if (failed_for == movie) {
+      ImGui::TextDisabled("%s as a Bink; no mp4: %s (the mod carries the Bink)", SizeText(size).c_str(), failed_why.c_str());
+    } else {
+      ImGui::TextDisabled("%s as a Bink -> making the mp4 ...", SizeText(size).c_str());
+      if (!running.exchange(true))
+        std::thread([movie] {
+          std::string why;
+          const std::wstring made = ShrunkMovie(movie, &why);
+          OnUiThread([movie, made, why] {
+            if (made.empty()) failed_for = movie, failed_why = why;
+            running = false;
+          });
+        }).detach();
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Keep the Bink too", &g_settings.keep_bik)) SaveSettings();
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Mods carry the movie as an mp4 (much smaller). Ticked, they carry the Bink (.bik) beside it too: the game plays\n"
+                      "the Bink where Windows can't play mp4 (Steam Deck / Proton, Windows N). Bigger mods; for advanced users.");
+  ImGui::Unindent();
 }
 
 int ArenaPacNumber(const std::string& name) {  // (the last "bg" followed by exactly two digits)
@@ -1709,6 +2109,12 @@ void LoadSettings() {
     g_settings.my_discs.push_back({d.substr(0, a), d.substr(a + 1, b - a - 1), Wide(d.substr(b + 1))});
   }
   g_settings.discs_seeded = Value(t, "discs_seeded") == "1";
+  g_settings.keep_bik = Value(t, "keep_bik") == "1";
+  g_settings.moves_warning_off = Value(t, "moves_warning_off") == "1";
+  for (const auto& d : Values(t, "other_game")) {  // <game key or "">|<path>
+    const size_t a = d.find('|');
+    if (a != std::string::npos) g_settings.other_game.push_back({d.substr(0, a), Wide(d.substr(a + 1))});
+  }
 }
 
 }  // namespace
@@ -1724,6 +2130,9 @@ void SaveSettings() {
   if (!g_settings.bink2_tool.empty()) t += "bink2_tool=" + Utf8(g_settings.bink2_tool) + "\n";
   for (const auto& d : g_settings.my_discs) t += "my_disc=" + d.key + "|" + d.id + "|" + Utf8(d.path) + "\n";
   if (g_settings.discs_seeded) t += "discs_seeded=1\n";
+  if (g_settings.keep_bik) t += "keep_bik=1\n";
+  if (g_settings.moves_warning_off) t += "moves_warning_off=1\n";
+  for (const auto& [k, p] : g_settings.other_game) t += "other_game=" + k + "|" + Utf8(p) + "\n";
   WriteFile(PathStr(SettingsDir() / L"settings.txt"), Bytes(t.begin(), t.end()));
 }
 
@@ -1746,7 +2155,14 @@ std::string DiscGameName(const std::string& id) {
       {"SLES_536.76", "SmackDown! vs. Raw 2006 (PS2)"}, {"SLES_544.89", "SmackDown vs. Raw 2007 (PS2)"},
       {"SLES_548.79", "SmackDown vs. Raw 2008 (PS2)"}, {"SLES_552.51", "SmackDown vs. Raw 2009 (PS2)"},
       {"SLES_555.45", "SmackDown vs. Raw 2010 (PS2)"}, {"SLES_556.35", "SmackDown vs. Raw 2011 (PS2)"},
-      {"SLUS_203.85", "Crush Hour (PS2)"},
+      {"SLUS_203.16", "SmackDown! Just Bring It (PS2)"}, {"SLUS_202.69", "SmackDown! Just Bring It (PS2)"},
+      {"SLUS_201.22", "SmackDown! Just Bring It (PS2)"}, {"SLUS_204.83", "SmackDown! Shut Your Mouth (PS2)"},
+      {"SLUS_205.12", "SmackDown! Shut Your Mouth (PS2)"}, {"SLUS_207.87", "SmackDown! Here Comes the Pain (PS2)"},
+      {"SLUS_210.60", "SmackDown! vs. Raw (PS2)"}, {"SLUS_209.36", "SmackDown! vs. Raw (PS2)"},
+      {"SLUS_212.86", "SmackDown! vs. Raw 2006 (PS2)"}, {"SLUS_211.34", "SmackDown! vs. Raw 2006 (PS2)"},
+      {"SLUS_214.27", "SmackDown vs. Raw 2007 (PS2)"}, {"SLUS_216.45", "SmackDown vs. Raw 2008 (PS2)"},
+      {"SLUS_218.10", "SmackDown vs. Raw 2009 (PS2)"}, {"SLUS_219.01", "SmackDown vs. Raw 2010 (PS2)"},
+      {"SLUS_219.39", "SmackDown vs. Raw 2011 (PS2)"}, {"SLUS_203.85", "Crush Hour (PS2)"},
   };
   const auto it = kNames.find(id);
   return it == kNames.end() ? std::string() : it->second;
@@ -1837,14 +2253,15 @@ void SourceCards(const char* file) {
   if (file[0]) {
     if (simple::Card("src_file", "One file", file, lone, w, h)) {
       static const COMDLG_FILTERSPEC kPac[1] = {{L"A game file (*.pac)", L"*.pac"}};
-      const std::wstring f = PickFile(false, L"One file from another game", kPac, 1);
-      if (!f.empty()) port_page::SetSource(f);
+      const std::wstring f = PickFile(false, L"One file from another game", kPac, 1, nullptr, nullptr, OtherGameStart());
+      if (!f.empty()) OtherGamePicked(f), port_page::SetSource(f);
     }
     ImGui::SameLine(0, 8 * g_scale);
   }
   if (simple::Card("src_folder", "A folder of game files", "the game's files you copied off a disc", folder, w, h)) {
-    const std::wstring f = PickFolder(L"A folder with the game's files (the one holding its pac folder)");
-    if (!f.empty()) port_page::SetSource(f);
+    const std::wstring f = PickFolder(L"A folder with the game's files (the one holding its pac folder)", OtherGameStart());
+    if (const std::string why = disc_list::NotGameFiles(f); !why.empty()) Status(why), Log("port: " + Utf8(f) + " - " + why);
+    else if (!f.empty()) OtherGamePicked(f), port_page::SetSource(f);
   }
   ImGui::Spacing();
   ImGui::TextDisabled("Or one of your game discs:");
@@ -1872,6 +2289,7 @@ const PageDesc kPages[] = {
     {PageId::kBackstage, "Backstage", "", &backstage_page::hooks, nullptr},
     {PageId::kStar, "Superstar", "", &star_page::hooks, nullptr},
     {PageId::kAttire, "Attires", "", &attire_page::hooks, nullptr},
+    {PageId::kThreads, "Threads parts", "", nullptr, star_page::ThreadsDraw},
     {PageId::kMoves, "Move pack", "", &moves_page::hooks, nullptr},
     {PageId::kSigns, "Crowd signs", "", &signs_page::hooks, nullptr},
     {PageId::kBackgrounds, "Menu backgrounds", "", &backgrounds_page::hooks, nullptr},
@@ -1899,9 +2317,10 @@ const PageDesc kPages[] = {
      }},
     {PageId::kArenaPort, "Arena from another game", "", nullptr,
      [] {
-       FromAnotherGame("An arena or a backstage room from your other WWE games: pick the disc or one arena file; it opens "
-                       "on the Arena tab to finish.",
-                       port_page::kArenas | port_page::kBackstageKind, other_page::kW13Arena | other_page::kSvr08,
+       FromAnotherGame("An arena, a backstage room or the VS screens from your other WWE games: pick the disc or one "
+                       "arena file; an arena opens on the Arena tab to finish.",
+                       port_page::kArenas | port_page::kBackstageKind | port_page::kVsScreens,
+                       other_page::kW13Arena | other_page::kSvr08,
                        "an arena pac (pac\\bg\\bgNN.pac)");
      }},
     {PageId::kMovesPort, "Moves from another game", "", nullptr,
@@ -1930,7 +2349,8 @@ struct Group {
   std::vector<GroupTab> tabs;
 };
 const Group kGroups[] = {
-    {"Superstar", "Make", {{"Superstar", PageId::kStar}, {"Attires", PageId::kAttire}, {"From another game", PageId::kStarPort}}},
+    {"Superstar", "Make", {{"Superstar", PageId::kStar}, {"Attires", PageId::kAttire}, {"Threads parts", PageId::kThreads},
+                           {"From another game", PageId::kStarPort}}},
     {"Arena", "", {{"Arena", PageId::kArena}, {"Backstage", PageId::kBackstage}, {"3D editor", PageId::kEditor},
                    {"From another game", PageId::kArenaPort}}},
     {"Moves & entrances", "", {{"Moves", PageId::kPortMoves}, {"Taunts", PageId::kPortTaunts}, {"Entrance", PageId::kPortEntrance},
@@ -2017,6 +2437,12 @@ std::map<PageId, std::wstring> g_project_files;
 std::string CurrentState(PageId page) {
   PageHooks* h = Hooks(page);
   std::string s = h && h->state ? h->state() : std::string();
+  if (h && h->write) {  // (and every key the project saves: a change to any of them is unsaved - materials too)
+    ProjectOut out;
+    out.keys_only = true;
+    h->write(out);
+    s += "\n--\n" + out.text;
+  }
   if (page == PageId::kArena || page == PageId::kBackstage) s += "|" + std::to_string(editor::EditCount());
   return s;
 }
@@ -2076,7 +2502,7 @@ bool PageByName(const std::wstring& name, PageId& page) {
       {L"port-moves", PageId::kPortMoves, -1}, {L"moves-entrances", PageId::kPortMoves, -1},
       {L"port-taunts", PageId::kPortTaunts, -1}, {L"taunts", PageId::kPortTaunts, -1},
       {L"superstar-port", PageId::kStarPort, -1}, {L"arena-port", PageId::kArenaPort, -1},
-      {L"moves-port", PageId::kMovesPort, -1}, {L"belts", PageId::kBelts, -1}};
+      {L"moves-port", PageId::kMovesPort, -1}, {L"belts", PageId::kBelts, -1}, {L"threads", PageId::kThreads, -1}};
   for (const auto& n : kNames)
     if (name == n.name) {
       page = n.page;
@@ -2117,7 +2543,7 @@ void ProjectNew(PageId type) {
 // ---- ProjectOut / ProjectIn
 
 std::string ProjectOut::File(const std::string& key, const std::wstring& path, const std::string& as) {
-  if (path.empty()) return {};
+  if (path.empty() || keys_only) return {};
   Bytes d;
   if (!ReadFile(Utf8(path), d)) {
     Log("Could not read " + Utf8(path) + " (left out of the project).");
@@ -2131,7 +2557,7 @@ std::string ProjectOut::File(const std::string& key, const std::wstring& path, c
 }
 
 void ProjectOut::Png(const std::string& key, const Image& img, const std::string& as) {
-  if (img.rgba.empty()) return;
+  if (img.rgba.empty() || keys_only) return;
   // (PNG through WIC needs a file: the project keeps pictures as RGBA DDS instead - lossless, quick)
   files.push_back({as + ".dds", DdsEncode(img, DxtFormat::kArgb, false)});
   text += key + "=" + as + ".dds\n";
@@ -2232,7 +2658,7 @@ bool ProjectOpen(const std::wstring& file) {
 
 // Test aid --ui-script <txt>: ImGui events played into the (hidden) window at given times, inside the app - never
 // real input. One event a line, "<seconds> <what>": "move x y", "click x y" (left down + up, a frame apart),
-// "rclick x y", "wheel n", "type <text>", "key <Escape|Enter|Tab|Backspace|Down|Up>". x / y in the window's pixels
+// "rclick x y", "wheel n", "type <text>", "key <Escape|Enter|Tab|Backspace|Down|Up|A-Z>". x / y in the window's pixels
 // (as in a --shot picture). Lines starting with # are skipped.
 void UiScript(const std::wstring& file) {
   struct Ev {
@@ -2285,7 +2711,8 @@ void UiScript(const std::wstring& file) {
     }
     else if (e.what == "type") io.AddInputCharactersUTF8(e.arg.c_str());
     else if (e.what == "key") {
-      const ImGuiKey k = e.arg == "Escape" ? ImGuiKey_Escape : e.arg == "Enter" ? ImGuiKey_Enter : e.arg == "Tab" ? ImGuiKey_Tab
+      const ImGuiKey k = e.arg.size() == 1 && e.arg[0] >= 'A' && e.arg[0] <= 'Z' ? ImGuiKey(ImGuiKey_A + (e.arg[0] - 'A'))
+                         : e.arg == "Escape" ? ImGuiKey_Escape : e.arg == "Enter" ? ImGuiKey_Enter : e.arg == "Tab" ? ImGuiKey_Tab
                          : e.arg == "Backspace" ? ImGuiKey_Backspace : e.arg == "Down" ? ImGuiKey_DownArrow : ImGuiKey_UpArrow;
       io.AddKeyEvent(k, true);
       io.AddKeyEvent(k, false);
@@ -2311,6 +2738,61 @@ bool ProjectOpenFolder(const std::wstring& dir) {
   return ProjectOpenIn(in, true, (fs::path(dir) / L"manifest.txt").wstring());
 }
 
+namespace {
+// An absolute path inside a value (X:\..., X:/..., \\server\...) cut to its file name; the rest kept.
+std::string StripPaths(const std::string& v) {
+  std::string out;
+  for (size_t i = 0; i < v.size();) {
+    const bool drive = i + 2 < v.size() && std::isalpha(uint8_t(v[i])) && v[i + 1] == ':' && (v[i + 2] == '\\' || v[i + 2] == '/') &&
+                       (i == 0 || !std::isalnum(uint8_t(v[i - 1])));
+    const bool unc = i + 1 < v.size() && v[i] == '\\' && v[i + 1] == '\\';
+    if (!drive && !unc) {
+      out += v[i++];
+      continue;
+    }
+    size_t e = i;  // (a path ends at the value's own separators)
+    while (e < v.size() && v[e] != '\t' && v[e] != '\x1d' && v[e] != '\x1f' && v[e] != '|' && v[e] != ',' && v[e] != '\n') ++e;
+    const std::string p = v.substr(i, e - i);
+    const size_t slash = p.find_last_of("\\/");
+    out += slash == std::string::npos ? p : p.substr(slash + 1);
+    i = e;
+  }
+  return out;
+}
+}  // namespace
+
+std::string ModProjectText(PageId page) {
+  PageHooks* h = Hooks(page);
+  if (!h || !h->write) return {};
+  ProjectOut out;
+  out.keys_only = true;
+  h->write(out);
+  std::string t = "# The Mod Maker's project settings for this mod (materials, FBX steps ...): opening the mod brings "
+                  "them back. Paths are file names only.\n";
+  for (size_t at = 0; at < out.text.size();) {
+    size_t e = out.text.find('\n', at);
+    if (e == std::string::npos) e = out.text.size();
+    const std::string line = out.text.substr(at, e - at);
+    at = e + 1;
+    const size_t eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string key = line.substr(0, eq);
+    if (key.size() > 5 && key.compare(key.size() - 5, 5, ".from") == 0) continue;  // (the author's own folders)
+    t += key + "=" + StripPaths(line.substr(eq + 1)) + "\n";
+  }
+  return t;
+}
+
+void AddModProject(std::vector<ZipEntry>& files, const std::string& text) {
+  if (text.empty()) return;
+  for (auto& f : files)
+    if (f.name == ".mm_project.txt") {
+      f.data.assign(text.begin(), text.end());
+      return;
+    }
+  files.push_back({".mm_project.txt", Bytes(text.begin(), text.end())});
+}
+
 bool ProjectOpenIn(ProjectIn& in, bool mod, const std::wstring& file) {
   const ZipEntry* txt = in.Find(mod ? "manifest.txt" : "project.txt");
   if (!txt) {
@@ -2318,6 +2800,20 @@ bool ProjectOpenIn(ProjectIn& in, bool mod, const std::wstring& file) {
     return false;
   }
   in.text.assign(txt->data.begin(), txt->data.end());
+  if (mod)  // (the mod's own project settings: the keys its manifest doesn't have - an older mod has none)
+    if (const ZipEntry* pt = in.Find(".mm_project.txt")) {
+      const std::string p(pt->data.begin(), pt->data.end());
+      if (!in.text.empty() && in.text.back() != '\n') in.text += '\n';
+      for (size_t at = 0; at < p.size();) {
+        size_t e = p.find('\n', at);
+        if (e == std::string::npos) e = p.size();
+        const std::string line = p.substr(at, e - at);
+        at = e + 1;
+        const size_t eq = line.find('=');
+        if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
+        if (Value(in.text, line.substr(0, eq).c_str()).empty()) in.text += line + "\n";
+      }
+    }
   const std::string type = Value(in.text, "type");
   const PageDesc* page = nullptr;
   for (const auto& d : kPages)
@@ -2603,6 +3099,7 @@ void Draw() {
   if (!g_drop_files.empty() && ++g_drop_frames > 2) g_drop_files.clear();  // (dropped where nothing takes files)
   full_preview::Draw();  // (its own window, over the page)
   ToolsPanel();          // (the Mod Maker tools: found / missing, Install what's missing)
+  MovesWarning();        // (before a move conversion: the experimental warning to accept)
   session::Tick();       // (the session log file, page changes, the Report a problem window)
   // Ctrl+S saves the project
   if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S) && Hooks(g_project_page)) ProjectSave(false);
@@ -2670,6 +3167,7 @@ LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
 using namespace mm;
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+  session::InstallCrashHandler();  // (a crash leaves a file and a log line: session_log.h)
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   LoadSettings();
@@ -2715,7 +3213,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   // --editor-view <0-2> a camera preset, --select <name> an object; --page <n>; the
   // superstar / signs / media pages' --star*, --sign, --media-* and --test-*-save
   int start_editor = -1, start_view = -1, start_new = -1, start_page = -1, start_backstage = -1, test_lib = -1;
-  std::wstring start_mod, start_select, test_save, project, test_project, moves_pack, page_name;
+  std::wstring start_mod, start_select, test_save, project, test_project, test_roundtrip, moves_pack, page_name;
+  std::string test_obj_add, test_obj_export;  // (--test-add-object / --test-export-object: editor::TestObjects)
+  int test_obj_remove = -1;
   bool behind = false;  // --behind: tests - the window is never shown at all (frames still run)
   std::wstring perf_tour;  // --perf-tour <report>: every page in turn, its first-frame and slowest times
   std::vector<std::wstring> run_tool_args;
@@ -2726,9 +3226,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   double shot_after = 6;
   std::vector<std::pair<double, std::wstring>> page_at;  // --page-at <page>@<s>[,...]: page switches at those times (tests)
   int star_id = 0, star_call = -1;
-  float star_height = 0;
-  std::string star_moveset;
+  float star_height = 0, star_call_gain = 0;
+  std::string star_moveset, star_import_moveset;
   int star_entrance = 0;
+  int star_victory = 0;
   std::wstring star_model, star_song, star_movie, star_picture, star_voice, star_save, sign_save, media_save, media_video;
   std::string star_name;
   std::vector<std::wstring> sign_files, media_pictures, background_files;
@@ -2740,9 +3241,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--editor") && more) start_editor = _wtoi(argv[++i]);
     else if (!wcscmp(argv[i], L"--editor-view") && more) start_view = _wtoi(argv[++i]);
     else if (!wcscmp(argv[i], L"--open") && more) start_mod = argv[++i];
+    else if (!wcscmp(argv[i], L"--vs-test") && more) arena_page::SetVsTest(Utf8(argv[++i]));
     else if (!wcscmp(argv[i], L"--project") && more) project = argv[++i];
     else if (!wcscmp(argv[i], L"--behind")) behind = true, g_behind = true;
-    else if (!wcscmp(argv[i], L"--test-report") && more) session::TestReport(Utf8(argv[++i]));  // <what happened>: Report a problem, no window, then quit
+    else if (!wcscmp(argv[i], L"--test-pick") && more) TestPick(argv[++i]);
+    else if (!wcscmp(argv[i], L"--test-report") && more) session::TestReport(Utf8(argv[++i]));
+    else if (!wcscmp(argv[i], L"--test-report-send") && more) session::TestReportSend(Utf8(argv[++i]));  // <answers file>  // <what happened>: Report a problem, no window, then quit
+    else if (!wcscmp(argv[i], L"--watch-strip") && more) anims_page::TestStrip(argv[++i]);
+    else if (!wcscmp(argv[i], L"--move-check") && more) move_check::Test(argv[++i]), g_page = PageId::kMoves;
     else if (!wcscmp(argv[i], L"--watch") && more) {  // <star id>,<dummy id>,<move id>: a match move watched here
       int a[3] = {0, 0, 0};
       swscanf_s(argv[++i], L"%d,%d,%d", &a[0], &a[1], &a[2]);
@@ -2769,6 +3275,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       }
     }
     else if (!wcscmp(argv[i], L"--test-project") && more) test_project = argv[++i];
+    else if (!wcscmp(argv[i], L"--test-roundtrip") && more) test_roundtrip = argv[++i];
     else if (!wcscmp(argv[i], L"--moves-pack") && more) moves_pack = argv[++i];
     else if (!wcscmp(argv[i], L"--test-moves-save") && more) moves_save = argv[++i];
     else if (!wcscmp(argv[i], L"--caw-announcer") && more) caw_page::TestAnnouncer(Utf8(argv[++i]));  // <CLIP> (- clears), with --caw <index>
@@ -2820,6 +3327,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--port-fullpreview")) port_page::TestFullPreview();  // with --port-test on an entrance: its result in the Full preview
     else if (!wcscmp(argv[i], L"--port-test") && more) port_page::TestStart(Utf8(argv[++i])), g_page = PageId::kPort;
     else if (!wcscmp(argv[i], L"--port-clear")) port_page::TestClear(), g_page = PageId::kPort;
+    else if (!wcscmp(argv[i], L"--port-trim")) port_page::TestTrim(), g_page = PageId::kPort;
+    else if (!wcscmp(argv[i], L"--port-as-attire") && more) port_page::TestAsAttire(Utf8(argv[++i]));  // with --port-test on a superstar
     else if (!wcscmp(argv[i], L"--icons") && more) icons_page::TestTab(_wtoi(argv[++i])), g_page = PageId::kIcons;
     else if (!wcscmp(argv[i], L"--fbx-map") && more) {  // <fbx>,<out file>: its skeleton, the rig found and the mapping
       const std::wstring v = argv[++i];
@@ -2866,8 +3375,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       if (a == std::wstring::npos || b == std::wstring::npos) return 1;
       const std::string fbx = Utf8(v.substr(0, a)), tpl = Utf8(v.substr(a + 1, b - a - 1));
       std::string dir = Utf8(v.substr(b + 1));
-      // (test: "<dir>|<mesh>=spec:1.5&tint:1,0.3,0.3&cut:1&both:1&alpha:flat&normal:<png>;..." - the builder's per-mesh material)
+      // (test: "<dir>|<mesh>=spec:1.5&tint:1,0.3,0.3&cut:1&both:1&flip:1&alpha:flat&normal:<png>&shine:<png>;..." - the builder's per-mesh material)
       svrfmt::FbxImportOptions mopts;
+      if (const wchar_t* r = _wgetenv(L"SVR2011_TEST_FBX_REDUCE")) mopts.max_vertices = _wtoi(r), mopts.keep_face = !wcsstr(r, L"all");  // ("<n>[all]")
+      if (const wchar_t* h = _wgetenv(L"SVR2011_TEST_FBX_HAIR")) mopts.hair = _wtoi(h);  // (-1 auto, 0, 1)
       if (const size_t bar = dir.find('|'); bar != std::string::npos) {
         const std::string spec = dir.substr(bar + 1);
         dir.resize(bar);
@@ -2892,6 +3403,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
             if (k == "tint") f.has_tint = std::sscanf(val.c_str(), "%f,%f,%f", &f.tint[0], &f.tint[1], &f.tint[2]) == 3;
             if (k == "cut") f.cutout = std::atoi(val.c_str());
             if (k == "both") f.double_sided = std::atoi(val.c_str());
+            if (k == "flip") f.flip = std::atoi(val.c_str());
+            if (k == "shine") f.shine_mask = val;
             if (k == "alpha") f.specular_alpha = val;
             if (k == "normal") f.normal = val;
           }
@@ -2910,7 +3423,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       char line[256];
       std::snprintf(line, sizeof line, "%s: %d meshes, %d vertices, %d triangles, %d textures (sheet %d), %d bones aimed (worst %.3f deg), %d 2011 bones, scale %.4f, height %.1f cm\n",
                     ok ? "OK" : "FAILED", rep.meshes, rep.vertices, rep.triangles, rep.textures, rep.atlas, rep.aimed, rep.aim_error_deg, rep.bones_used, rep.scale, rep.height_cm);
-      if (rep.reduced_from) out += "  reduced from " + std::to_string(rep.reduced_from) + " vertices\n";
+      if (rep.reduced_from)
+        out += "  reduced from " + std::to_string(rep.reduced_from) + " vertices (" + std::to_string(rep.cross_merges) +
+               " merges across bones)\n";
+      for (const auto& w : rep.reduced_lines) out += "  reduced: " + w + "\n";
       out = out + line + err + (rep.aim_worst.empty() ? "" : "  worst aim: " + rep.aim_worst + "\n");
       for (const auto& w : rep.warnings) out += "  warning: " + w + "\n";
       for (const auto& w : rep.skipped) out += "  skipped: " + w + "\n";
@@ -3012,6 +3528,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       full_preview::TestOpen(e, s, key, cam != 0);
     }
     else if (!wcscmp(argv[i], L"--full-preview-song") && more) full_preview::TestSong(argv[++i]);
+    else if (!wcscmp(argv[i], L"--full-preview-model") && more) full_preview::TestModel(argv[++i]);
     else if (!wcscmp(argv[i], L"--full-preview-movie") && more) full_preview::TestMovie(argv[++i]);
     else if (!wcscmp(argv[i], L"--full-preview-dump") && more) full_preview::TestDump(argv[++i]);
     else if (!wcscmp(argv[i], L"--pose-dump-motion") && more) char_preview::g_test_pose_dump = argv[++i];
@@ -3030,6 +3547,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     }
     else if (!wcscmp(argv[i], L"--page-name") && more) page_name = argv[++i];  // arena editor backstage superstar moves signs media assets anims icons help
     else if (!wcscmp(argv[i], L"--select") && more) start_select = argv[++i];
+    else if (!wcscmp(argv[i], L"--test-picture") && more) editor::TestPicture(Utf8(argv[++i]));
+    else if (!wcscmp(argv[i], L"--test-add-object") && more) test_obj_add = Utf8(argv[++i]);
+    else if (!wcscmp(argv[i], L"--test-export-object") && more) test_obj_export = Utf8(argv[++i]);
+    else if (!wcscmp(argv[i], L"--test-remove-part") && more) test_obj_remove = _wtoi(argv[++i]);
     else if (!wcscmp(argv[i], L"--test-edit-save") && more) test_save = argv[++i];
     else if (!wcscmp(argv[i], L"--new-arena") && more) start_new = _wtoi(argv[++i]);
     else if (!wcscmp(argv[i], L"--test-lib") && more) test_lib = _wtoi(argv[++i]);
@@ -3040,6 +3561,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--star-movie") && more) star_movie = argv[++i];
     else if (!wcscmp(argv[i], L"--star-picture") && more) star_picture = argv[++i];
     else if (!wcscmp(argv[i], L"--star-full") && more) star_page::TestFull(argv[++i]);
+    else if (!wcscmp(argv[i], L"--star-load") && more) star_page::TestLoad(argv[++i]);  // the loading picture (fitted to 1024 x 512)
     else if (!wcscmp(argv[i], L"--star-hometown") && more) star_page::TestHometown(Utf8(argv[++i]));
     else if (!wcscmp(argv[i], L"--star-pose") && more) star_page::TestPose(_wtoi(argv[++i]));
     else if (!wcscmp(argv[i], L"--star-fbx-make")) star_page::TestFbxMake();
@@ -3052,6 +3574,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--simple-ring") && more) star_page::TestSimpleRing(_wtoi(argv[++i]));  // an entrance's walk to the ring in Simple's preview
     else if (!wcscmp(argv[i], L"--simple-capture") && more) star_page::TestSimpleCapture(argv[++i]);  // the 3D view as the select picture -> <png>, quit
     else if (!wcscmp(argv[i], L"--simple-look") && more) star_page::TestSimpleLook(_wtoi(argv[++i]));  // Simple's Look step on way <n>
+    else if (!wcscmp(argv[i], L"--attire-pick") && more) simple_port::AttireTest(Utf8(argv[++i]));  // open | <n,n,...>: the attire picker
+    else if (!wcscmp(argv[i], L"--look-tab") && more) star_page::TestLookTab(_wtoi(argv[++i]));  // Simple's Look step: 0 Model, 1 Materials
+    else if (!wcscmp(argv[i], L"--fbx-step") && more) star_page::TestFbxStep(_wtoi(argv[++i]) - 1);  // the FBX import's step <1-5>
     else if (!wcscmp(argv[i], L"--simple") && more) {  // the Superstar page in Simple mode at <step>[,from]: that step's "From another game"
       const std::wstring a = argv[++i];
       star_page::TestSimple(_wtoi(a.c_str()));
@@ -3078,8 +3603,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     }
     else if (!wcscmp(argv[i], L"--star-call") && more) star_call = _wtoi(argv[++i]);
     else if (!wcscmp(argv[i], L"--star-height") && more) star_height = float(_wtof(argv[++i]));
+    else if (!wcscmp(argv[i], L"--star-call-gain") && more) star_call_gain = float(_wtof(argv[++i]));
     else if (!wcscmp(argv[i], L"--star-moveset") && more) star_moveset = Utf8(argv[++i]);
+    else if (!wcscmp(argv[i], L"--threads-edit") && more) star_page::ThreadsTest(Utf8(argv[++i]));  // <attire>[,make|name][,save]
+    else if (!wcscmp(argv[i], L"--star-cae") && more) star_page::TestCae(Utf8(argv[++i]));  // a created entrance (Mods\.cae id)
+    else if (!wcscmp(argv[i], L"--star-import-moveset") && more) star_import_moveset = Utf8(argv[++i]);  // star:<id> | mod:<folder>
     else if (!wcscmp(argv[i], L"--star-entrance") && more) star_entrance = _wtoi(argv[++i]);
+    else if (!wcscmp(argv[i], L"--star-victory") && more) star_victory = _wtoi(argv[++i]);  // (victory=, the section open)
+    else if (!wcscmp(argv[i], L"--star-victory-port") && more) star_page::TestVictoryPort(Utf8(argv[++i]));  // (<game>,<n>: converted)
     else if (!wcscmp(argv[i], L"--run-fix") && more) g_test_fix = Utf8(argv[++i]);
     else if (!wcscmp(argv[i], L"--install-star")) g_test_install_frames = 0;  // "<text>[|<n>]" (see g_test_fix)
     else if (!wcscmp(argv[i], L"--show-problems")) g_show_problems = true;
@@ -3091,7 +3622,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--star-gear-from") && more) star_page::TestGearFrom(Utf8(argv[++i]));  // <attire>:<donor id>: fit the donor's entrance gear, log, quit
     else if (!wcscmp(argv[i], L"--star-gear") && more) star_page::TestGear(Utf8(argv[++i]));  // <attire>:<off|from<k>>[,...]
     else if (!wcscmp(argv[i], L"--hits")) char_preview::SetHits(true);
-    else if (!wcscmp(argv[i], L"--attire") && more) {  // <star id>,<slot 0=new>,<model pac>[,<save .svrmod>]
+    else if (!wcscmp(argv[i], L"--attire-keep-entrance")) attire_page::TestKeepEntrance();  // (--attire from a superstar mod: its entrance too)
+    else if (!wcscmp(argv[i], L"--attire-from") && more) {  // <n>[,<name>]: --attire takes the source's attire n (and names it)
+      const std::string v = Utf8(argv[++i]);
+      const size_t c = v.find(',');
+      attire_page::TestFrom(std::atoi(v.c_str()), c == std::string::npos ? "" : v.substr(c + 1));
+    }
+    else if (!wcscmp(argv[i], L"--attire") && more) {  // <star id>,<slot 0=new>,<model pac | superstar mod folder / .svrmod / .svrproj>[,<save .svrmod>]
       const std::wstring a = argv[++i];
       const size_t c1 = a.find(L','), c2 = a.find(L',', c1 + 1), c3 = a.find(L',', c2 + 1);
       attire_page::TestStart(_wtoi(a.c_str()), a.substr(c2 + 1, c3 == std::wstring::npos ? std::wstring::npos : c3 - c2 - 1),
@@ -3103,6 +3640,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--star-model") && more) star_model = argv[++i];
     else if (!wcscmp(argv[i], L"--star-mat") && more) star_page::TestMaterials(Utf8(argv[++i]), false);
     else if (!wcscmp(argv[i], L"--open-materials")) star_page::TestMaterials("", true);
+    else if (!wcscmp(argv[i], L"--mat-select") && more) MaterialTestSelect(Utf8(argv[++i])), star_page::TestMaterials("", true);
     else if (!wcscmp(argv[i], L"--tools-panel")) TestToolsPanel(false, L"");
     else if (!wcscmp(argv[i], L"--tools-install")) TestToolsPanel(true, L"");
     else if (!wcscmp(argv[i], L"--tools-install-from") && more) TestToolsPanel(false, argv[++i]);
@@ -3169,6 +3707,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (!MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) x = y = CW_USEDEFAULT;
   }
   if (behind) x = 0, y = 0, w = MulDiv(1280, dpi, 96), h = MulDiv(800, dpi, 96);
+  if (const wchar_t* size = _wgetenv(L"SVR2011_MM_SHOT_SIZE"); behind && size && *size) {  // (test shots: "<w>x<h>")
+    int sw = 0, sh = 0;
+    if (swscanf_s(size, L"%dx%d", &sw, &sh) == 2 && sw >= 640 && sh >= 480) w = MulDiv(sw, dpi, 96), h = MulDiv(sh, dpi, 96);
+  }
   g_wnd = CreateWindowExW(behind ? WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW : 0, wc.lpszClassName, L"SvR2011 Mod Maker",
                           WS_OVERLAPPEDWINDOW, x, y, w, h, nullptr, nullptr, inst, nullptr);
   DragAcceptFiles(g_wnd, TRUE);  // (pictures dropped on the pages' drop targets)
@@ -3223,12 +3765,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   if (star_call >= 0 || !star_song.empty() || !star_movie.empty() || !star_voice.empty())
     star_page::TestFiles(star_song, star_movie, star_voice, star_call);
   if (star_height > 0) star_page::TestHeight(star_height);
+  if (star_call_gain != 0) star_page::TestCallGain(star_call_gain);
   if (!star_moveset.empty()) star_page::TestMoveset(star_moveset);
+  if (!star_import_moveset.empty()) star_page::TestImportMoveset(star_import_moveset);
   if (star_entrance) star_page::TestEntrance(star_entrance);
+  if (star_victory) star_page::TestVictory(star_victory);
   signs_page::TestStart(sign_files, sign_save);
   backgrounds_page::TestStart(background_files, background_save);
   media_page::TestStart(media_arena, media_video, media_pictures, media_save);
   arena_page::SetTestSave(test_save, test_lib);
+  if (!test_obj_add.empty() || !test_obj_export.empty() || test_obj_remove >= 0)
+    editor::TestObjects(test_obj_add, test_obj_export, test_obj_remove);
   if (start_new >= 0 && start_new < 20) arena_page::StartNew(start_new);
   if (start_editor >= 0 && start_editor < 20) arena_page::OpenEditor(start_editor);
   editor::TestStart(start_view, Utf8(start_select));  // (before the arena is set)
@@ -3256,6 +3803,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   // test aid: --test-project <file.svrproj>: the shown page saved as a project, everything
   // reset, the project opened again; its state text goes to <file>.txt, the log to <file>.log
   bool test_project_pending = !test_project.empty();
+  // test aid: --test-roundtrip <in.txt>: a project's keys (type= first) read into their page, then saved as a project
+  // and opened again, and through a mod's .mm_project.txt (a bare manifest + the file) opened again; each state
+  // against the first, the lines that differ listed in <in>.out.txt
+  bool test_roundtrip_pending = !test_roundtrip.empty();
 
   bool done = false;
   while (!done) {
@@ -3311,6 +3862,61 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       }
     }
     ImGui::Render();
+    if (test_roundtrip_pending && !Busy() && ImGui::GetFrameCount() > 3) {
+      test_roundtrip_pending = false;
+      std::string report;
+      auto diff = [&](const std::string& what, const std::string& a, const std::string& b) {
+        auto lines = [](const std::string& s) {
+          std::vector<std::string> v;
+          for (size_t at = 0; at < s.size();) {
+            size_t e = s.find('\n', at);
+            if (e == std::string::npos) e = s.size();
+            v.push_back(s.substr(at, e - at));
+            at = e + 1;
+          }
+          return v;
+        };
+        const auto la = lines(a), lb = lines(b);
+        int n = 0;
+        for (const auto& l : la)
+          if (std::find(lb.begin(), lb.end(), l) == lb.end()) report += what + " lost:  " + l + "\n", ++n;
+        for (const auto& l : lb)
+          if (std::find(la.begin(), la.end(), l) == la.end()) report += what + " new:   " + l + "\n", ++n;
+        report += what + (n ? ": " + std::to_string(n) + " line(s) differ\n" : ": same\n");
+      };
+      Bytes t;
+      ProjectIn in;
+      if (ReadFile(Utf8(test_roundtrip), t)) in.files.push_back({"project.txt", t});
+      const bool read = !in.files.empty() && ProjectOpenIn(in, false, test_roundtrip);
+      const PageId page = g_project_page;
+      const std::string first = CurrentState(page);
+      // as a project
+      const std::wstring proj = test_roundtrip + L".svrproj";
+      g_project_file = proj;
+      g_project_files[page] = proj;
+      const bool saved = read && ProjectSave(false);
+      ProjectReset();
+      const bool opened = saved && ProjectOpen(proj);
+      diff("project", first, CurrentState(page));
+      // as a mod: the page's .mm_project.txt with a bare manifest (its own keys: type and name)
+      ProjectReset();
+      ProjectOpen(proj);
+      const std::string text = ModProjectText(page);
+      PageHooks* h = Hooks(page);
+      const std::string man = std::string("type=") + (h && h->type ? h->type : "") + "\nname=" + Value(first, "name") + "\n";
+      ProjectIn mod;
+      mod.files.push_back({"manifest.txt", Bytes(man.begin(), man.end())});
+      AddModProject(mod.files, text);
+      ProjectReset();
+      const bool mod_opened = ProjectOpenIn(mod, true, test_roundtrip + L".svrmod");
+      diff("mod", first, CurrentState(page));
+      report = std::string("read=") + (read ? "1" : "0") + " saved=" + (saved ? "1" : "0") + " opened=" + (opened ? "1" : "0") +
+               " mod_opened=" + (mod_opened ? "1" : "0") + "\n--- .mm_project.txt\n" + text + "--- differences\n" + report +
+               "--- first state\n" + first + "\n";
+      WriteFile(Utf8(test_roundtrip + L".out.txt"), Bytes(report.begin(), report.end()));
+      WriteLogTo(test_roundtrip + L".log");
+      PostMessageW(g_wnd, WM_CLOSE, 0, 0);
+    }
     if (test_project_pending && !Busy() && ImGui::GetFrameCount() > 3) {
       test_project_pending = false;
       FollowPage();
@@ -3364,8 +3970,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       shot.clear();
       PostMessageW(g_wnd, WM_CLOSE, 0, 0);
     }
-    g_swap->Present(1, 0);
+    DrainD3DMessages();
+    session::PresentResult(g_swap->Present(1, 0));
+    FlushReleases();  // (the textures let go of while this frame was built: drawn now - app.h ReleaseAfterFrame)
   }
+  FlushReleases();
   if (g_worker.joinable()) g_worker.join();
   editor::Shutdown();
   char_preview::Shutdown();

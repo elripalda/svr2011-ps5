@@ -23,6 +23,14 @@ struct Lighting {
   float strength = 1.0f;
   bool crowd = true;              // the people in the seats
   bool Default() const;
+  // In the game (manifest light_scale= / match_light=: the game's arena_lights.cpp): the arena's lights x
+  // game_scale (with the player's ARENA BRIGHTNESS); match_light 0 the game's, 1 the entrance's in the match,
+  // 2 the entrance's with its coloured key light.
+  float game_scale = 1.0f;
+  int match_light = 0;
+  // manifest titantron=live: the video screens show the match camera in the match (the game's arena_mods.cpp
+  // TitantronFile); off, the arena's own screens show then (the entrance video stays either way)
+  bool tron_live = false;
 };
 
 struct Hooks {
@@ -99,6 +107,12 @@ void Shutdown();
 // test aid: a camera preset (0 hard camera, 1 top, 2 from the stage; -1 none)
 // and an object to select (by name) once an arena is set
 void TestStart(int view, const std::string& select);
+// test aid: the selected object gets this picture, as "Use a picture..." gives one
+void TestPicture(const std::string& path);
+// --test-add-object / --test-export-object / --test-remove-part (on the --select object); RunObjectTests runs them in
+// place of the test edit (false: none given)
+void TestObjects(const std::string& add, const std::string& export_dir, int remove_part);
+bool RunObjectTests();
 // test aid: moves the selection 2 m, adds a 2 m box at ringside, red top rope, warmer light
 void TestEdit();
 // test aid: every entrance-zone model of library arena `lib` added in its place

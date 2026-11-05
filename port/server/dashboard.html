@@ -5,141 +5,432 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SvR 2011 Online</title>
 <style>
+/* Colours: light and dark (the system's, or the header's Theme button: kept in this browser). */
 :root {
+  color-scheme: light;
+  --bg: #f3f4f6; --panel: #ffffff; --panel-2: #f0f2f5; --line: #dde1e6; --grid: #e6e9ed;
+  --text: #1d2228; --dim: #5b6470; --faint: #7a838e;
+  --accent: #2f6fe0; --accent-soft: #e5eefc;
+  --ok: #1f8a50; --ok-line: #9fd5b6; --warn: #b8741a; --bad: #c43347; --bad-line: #efb3bb; --bad-bg: #fdecee;
+  --in: #2f6fe0; --out: #1f8a50; --shadow: 0 1px 2px rgba(20, 30, 40, .06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #14161a; --panel: #1c1f24; --panel-2: #23272e; --line: #2d323a; --grid: #2b3038;
+    --text: #e6e8ea; --dim: #959ea8; --faint: #77808b;
+    --accent: #5b95f7; --accent-soft: #1f2b40;
+    --ok: #4cc583; --ok-line: #2a5a3d; --warn: #e0a33f; --bad: #f07685; --bad-line: #5c2a30; --bad-bg: #3a1e22;
+    --in: #5b95f7; --out: #4cc583; --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #14161a; --panel: #1c1f24; --panel-2: #21252c; --line: #2b3038;
-  --text: #e6e8ea; --dim: #8b939d; --faint: #6f7883;
-  --accent: #4c8bf5; --accent-dark: #3f7ae0;
-  --ok: #43c07a; --warn: #e0a33f; --bad: #e0596a; --in: #4c8bf5; --out: #43c07a;
+  --bg: #14161a; --panel: #1c1f24; --panel-2: #23272e; --line: #2d323a; --grid: #2b3038;
+  --text: #e6e8ea; --dim: #959ea8; --faint: #77808b;
+  --accent: #5b95f7; --accent-soft: #1f2b40;
+  --ok: #4cc583; --ok-line: #2a5a3d; --warn: #e0a33f; --bad: #f07685; --bad-line: #5c2a30; --bad-bg: #3a1e22;
+  --in: #5b95f7; --out: #4cc583; --shadow: none;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text);
        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-.wrap { max-width: 1100px; margin: 0 auto; padding: 28px 22px 60px; }
-h1 { font-size: 22px; margin: 0 0 4px; }
-.sub { color: var(--dim); margin: 0 0 18px; font-size: 14px; }
-h2 { font-size: 15px; margin: 30px 0 12px; color: var(--dim); text-transform: uppercase;
-     letter-spacing: .7px; font-weight: 600; display: flex; align-items: center; gap: 12px; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* header + tabs */
+header { background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+.top { max-width: 1180px; margin: 0 auto; padding: 12px 20px 0; display: flex; align-items: center; gap: 12px;
+       flex-wrap: wrap; }
+.top h1 { font-size: 18px; margin: 0; white-space: nowrap; }
+.top .sub { color: var(--faint); font-size: 13px; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden;
+            text-overflow: ellipsis; }
+.tabs { max-width: 1180px; margin: 0 auto; padding: 0 12px; display: flex; gap: 2px; overflow-x: auto;
+        scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs [role=tab] { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--dim);
+                   font: inherit; font-size: 14px; padding: 10px 10px 9px; cursor: pointer; white-space: nowrap;
+                   display: inline-flex; align-items: center; gap: 6px; }
+.tabs [role=tab]:hover { color: var(--text); }
+.tabs [role=tab][aria-selected=true] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.tabs .count { font-size: 11.5px; font-weight: 600; min-width: 18px; padding: 0 6px; border-radius: 9px;
+               background: var(--panel-2); color: var(--dim); text-align: center; }
+.tabs .count.live { background: var(--accent-soft); color: var(--accent); }
+.tabs .count:empty { display: none; }
+main { max-width: 1180px; margin: 0 auto; padding: 20px 20px 60px; }
+[role=tabpanel][hidden] { display: none; }
+
+h2 { font-size: 13px; margin: 26px 0 10px; color: var(--dim); text-transform: uppercase;
+     letter-spacing: .7px; font-weight: 600; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+[role=tabpanel] > h2:first-child { margin-top: 0; }
 h2 .spacer { flex: 1; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
-.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+h2 .note, h2 .filter, h2 .btn { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.intro { color: var(--faint); font-size: 13px; margin: -4px 0 12px; }
+
+/* tiles + charts */
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.tile, .chart, .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+.tile { padding: 14px 16px; }
 .tile .k { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
 .tile .v { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
 .tile .v small { font-size: 14px; color: var(--dim); font-weight: 500; margin-left: 3px; }
 .tile .s { color: var(--faint); font-size: 12.5px; margin-top: 2px; }
+.tile.link { cursor: pointer; }
+.tile.link:hover { border-color: var(--accent); }
 .bar { height: 5px; background: var(--panel-2); border-radius: 3px; margin-top: 8px; overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--accent); width: 0; }
-.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
-.chart { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px 10px; }
-.chart .head { display: flex; justify-content: space-between; font-size: 13px; color: var(--dim); }
-.chart .head b { color: var(--text); font-weight: 600; }
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+.chart { padding: 12px 14px 10px; }
+.chart .head { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--dim); }
+.chart .head b { color: var(--text); font-weight: 600; text-align: right; }
 .chart canvas { width: 100%; height: 120px; display: block; margin-top: 6px; }
 .legend { font-size: 12px; color: var(--faint); }
 .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin: 0 4px 0 10px; }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.netline { margin-top: 12px; padding: 12px 16px; font-size: 13px; color: var(--dim); }
+.netline b { color: var(--text); }
+
+/* controls */
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: var(--panel); }
 .seg button { background: transparent; color: var(--dim); border: 0; padding: 5px 11px; font: inherit;
-              font-size: 13px; cursor: pointer; text-transform: none; letter-spacing: 0; }
-.seg button.on { background: var(--panel-2); color: var(--text); }
-table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line);
-        border-radius: 10px; overflow: hidden; font-size: 14px; }
-th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
-th { color: var(--dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .5px;
-     background: var(--panel-2); }
-tr:last-child td { border-bottom: 0; }
-td.num { font-variant-numeric: tabular-nums; text-align: right; }
-th.num { text-align: right; }
-td .tag { font-size: 11.5px; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); color: var(--dim); }
-td .tag.on { color: var(--ok); border-color: #2a5a3d; }
-td .tag.bad { color: #ffb4bb; border-color: #5c2a30; }
-.btn { padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent;
-       color: var(--dim); font: inherit; font-size: 12.5px; cursor: pointer; margin-left: 4px; }
+              font-size: 13px; cursor: pointer; }
+.seg button[aria-pressed=true] { background: var(--panel-2); color: var(--text); font-weight: 600; }
+.btn { padding: 5px 11px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel);
+       color: var(--dim); font: inherit; font-size: 13px; cursor: pointer; margin-left: 4px; }
 .btn:hover { background: var(--panel-2); color: var(--text); }
-.btn.danger { border-color: #5c2a30; color: #ffb4bb; }
-.btn.danger:hover { background: #3a1e22; }
-.empty { color: var(--faint); text-align: center; padding: 18px; }
+.btn:disabled { opacity: .5; cursor: default; }
+#reports h3 { font-size: 14px; margin: 20px 0 6px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#reports code { white-space: pre-wrap; word-break: break-all; }
+tr.match td { border-top: 0; padding-top: 0; font-size: 13px; color: var(--dim); }
+tr.match b { color: var(--text); font-weight: 600; }
+tr.match .modl { display: inline-block; margin: 2px 10px 2px 0; white-space: nowrap; }
+#modstore.warn { color: var(--bad); }
+#fixed { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 4px 16px 10px; margin: 0 0 22px; }
+#fixed h3 { font-size: 15px; margin: 12px 0 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.fx { border-top: 1px solid var(--line); padding: 12px 0; display: grid; grid-template-columns: 1fr auto; gap: 6px 14px; }
+.fx:first-of-type { border-top: 0; }
+.fx .what { color: var(--dim); font-size: 13px; margin: 2px 0 0; }
+.fx .how { margin: 6px 0 0; font-size: 14px; }
+.fx .how b { color: var(--ok); }
+#fixed h3 .spacer { flex: 1; }
+.fx .meta { font-size: 12px; color: var(--dim); margin-top: 4px; }
+.fx .meta code { font-size: 12px; }
+.fx .pics img { height: 54px; max-width: 110px; object-fit: cover; border-radius: 4px; margin: 6px 6px 0 0; }
+.fx .acts { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+@media (max-width: 600px) { .fx { grid-template-columns: 1fr; } .fx .acts { flex-direction: row; align-items: center; } }
+.btn.danger { border-color: var(--bad-line); color: var(--bad); }
+.btn.danger:hover { background: var(--bad-bg); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .filter { background: var(--panel); border: 1px solid var(--line); color: var(--text); border-radius: 7px;
-          padding: 5px 10px; font: inherit; font-size: 13px; text-transform: none; letter-spacing: 0; }
-.err { color: #ffb4bb; }
-.scroll { max-height: 520px; overflow: auto; border-radius: 10px; }
+          padding: 5px 10px; font: inherit; font-size: 13px; min-width: 0; }
+input.filter { width: 220px; max-width: 100%; }
+
+/* tables */
+.scroll { max-height: 560px; overflow: auto; border: 1px solid var(--line); border-radius: 10px;
+          background: var(--panel); box-shadow: var(--shadow); }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th { color: var(--dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .5px;
+     background: var(--panel-2); position: sticky; top: 0; z-index: 1; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.acts { text-align: right; white-space: nowrap; }
+.tag { font-size: 11.5px; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); color: var(--dim);
+       white-space: nowrap; }
+.tag.on { color: var(--ok); border-color: var(--ok-line); }
+.kind { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .04em; padding: 1px 7px; border-radius: 999px;
+        border: 1px solid var(--line); color: var(--dim); background: var(--panel-2); vertical-align: 1px; }
+.kind.ranked { color: #fff; background: var(--accent); border-color: var(--accent); }
+.tag.bad { color: var(--bad); border-color: var(--bad-line); }
+.tag.place-online, .tag.place-boards { color: var(--accent); border-color: var(--accent); }
+.tag.place-cc, .tag.place-create { color: var(--text); border-color: var(--dim); }
+.tag.warn { color: var(--warn); border-color: var(--warn); }
+.node { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 12px; }
+.node .what { font-weight: 600; }
+.node .facts { color: var(--dim); font-size: 12.5px; flex: 1 1 260px; }
+.node .acts { display: flex; gap: 8px; }
+.id { color: var(--faint); font-size: 11.5px; font-family: ui-monospace, Consolas, monospace; margin-left: 4px; }
+.empty { color: var(--faint); text-align: center; padding: 18px; }
+.err { color: var(--bad); }
+.note { color: var(--faint); font-size: 12.5px; }
+.linkish { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); cursor: pointer; text-align: left; }
+.linkish:hover { text-decoration: underline; }
+
+/* a player */
+.card { padding: 14px 16px; margin-bottom: 12px; }
+.card .name { font-size: 18px; font-weight: 650; }
+.stats { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 8px; }
+.stats div { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+.stats b { display: block; font-size: 20px; color: var(--text); letter-spacing: 0; text-transform: none;
+           font-variant-numeric: tabular-nums; }
+
+/* log, settings, viewer */
+.log { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+       font: 12.5px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all;
+       height: calc(100vh - 230px); min-height: 300px; overflow: auto; color: var(--dim); margin: 0; }
+.set { display: grid; grid-template-columns: minmax(150px, 220px) 140px 1fr; gap: 10px 14px; align-items: center;
+       background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.set .h { color: var(--faint); font-size: 12.5px; }
+.set input[type=number] { width: 120px; }
+.set textarea { grid-column: 2 / 4; width: 100%; min-height: 120px; resize: vertical; }
+.set .wide { grid-column: 2 / 4; }
+.row { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+.names { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
+.names textarea { width: 100%; min-height: 260px; resize: vertical; box-sizing: border-box;
+                  font: 13px/1.45 ui-monospace, Consolas, monospace; }
+.names label { display: block; font-weight: 600; margin-bottom: 4px; }
+.mark { background: var(--bad-bg); color: var(--bad); border-radius: 3px; padding: 0 2px; }
+.row .btn { margin-left: 0; }
 .viewer { position: fixed; inset: 0; background: rgba(0,0,0,.72); display: none; align-items: center;
           justify-content: center; z-index: 10; padding: 16px; }
 .viewer.on { display: flex; }
 .viewer .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px;
                max-width: 100%; text-align: center; }
 .viewer img { width: 512px; max-width: 100%; border-radius: 8px;
-              background: repeating-conic-gradient(#2a2e35 0 25%, #1f2328 0 50%) 50% / 24px 24px; }
+              background: repeating-conic-gradient(var(--panel-2) 0 25%, var(--line) 0 50%) 50% / 24px 24px; }
 .viewer .cap { margin-top: 10px; font-size: 14px; }
-.viewer .cap small { color: var(--dim, #8a93a0); display: block; margin-top: 2px; }
+.viewer .cap small { color: var(--dim); display: block; margin-top: 2px; }
+
+@media (max-width: 640px) {
+  .top { padding: 10px 16px 0; }
+  .top .sub { display: none; }
+  main { padding: 16px 16px 48px; }
+  .tabs { padding: 0 6px; }
+  .set { grid-template-columns: 1fr; }
+  .set textarea, .set .wide { grid-column: auto; }
+  .names { grid-template-columns: 1fr; }
+  .charts { grid-template-columns: 1fr; }
+  .tile .v { font-size: 22px; }
+  input.filter { width: 100%; }
+  th, td { padding: 7px 9px; }
+}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>SvR 2011 Online</h1>
-  <p class="sub">Community Creations server &middot; <span id="since"></span></p>
-
-  <div class="tiles">
-    <div class="tile"><div class="k">Connections</div><div class="v" id="v-conn">&ndash;</div>
-      <div class="s" id="s-conn"></div><div class="bar"><i id="b-conn"></i></div></div>
-    <div class="tile"><div class="k">Players online</div><div class="v" id="v-online">&ndash;</div>
-      <div class="s" id="s-online"></div></div>
-    <div class="tile"><div class="k">Bandwidth (session)</div><div class="v" id="v-bw">&ndash;</div>
-      <div class="s" id="s-bw"></div></div>
-    <div class="tile"><div class="k">Storage</div><div class="v" id="v-disk">&ndash;</div>
-      <div class="s" id="s-disk"></div></div>
-    <div class="tile"><div class="k">Accounts</div><div class="v" id="v-acc">&ndash;</div>
-      <div class="s" id="s-acc"></div></div>
-    <div class="tile"><div class="k">Uploads</div><div class="v" id="v-up">&ndash;</div>
-      <div class="s" id="s-up"></div></div>
-    <div class="tile"><div class="k">Downloads</div><div class="v" id="v-down">&ndash;</div>
-      <div class="s" id="s-down"></div></div>
-    <div class="tile"><div class="k">Online play (relay)</div><div class="v" id="v-relay">&ndash;</div>
-      <div class="s" id="s-relay"></div></div>
-    <div class="tile"><div class="k">Online matches (30 days)</div><div class="v" id="v-net">&ndash;</div>
-      <div class="s" id="s-net"></div></div>
+<header>
+  <div class="top">
+    <h1>SvR 2011 Online</h1>
+    <span class="sub" id="since"></span>
+    <button class="btn" id="theme" title="Colours: the system's, light or dark">Theme: auto</button>
+    <button class="btn" id="signout" hidden>Sign out</button>
   </div>
+  <nav class="tabs" role="tablist" aria-label="Dashboard">
+    <button role="tab" id="tab-overview" aria-controls="p-overview">Overview</button>
+    <button role="tab" id="tab-players" aria-controls="p-players">Players <span class="count" id="n-players"></span></button>
+    <button role="tab" id="tab-invites" aria-controls="p-invites">Invites <span class="count" id="n-invites"></span></button>
+    <button role="tab" id="tab-ping" aria-controls="p-ping">Ping <span class="count live" id="n-ping"></span></button>
+    <button role="tab" id="tab-matches" aria-controls="p-matches">Matches <span class="count live" id="n-matches"></span></button>
+    <button role="tab" id="tab-cc" aria-controls="p-cc">Community Creations <span class="count" id="n-cc"></span></button>
+    <button role="tab" id="tab-discovery" aria-controls="p-discovery">Discovery <span class="count" id="n-discovery"></span></button>
+    <button role="tab" id="tab-names" aria-controls="p-names">Names <span class="count" id="n-names"></span></button>
+    <button role="tab" id="tab-reports" aria-controls="p-reports">Reports <span class="count" id="n-reports"></span></button>
+    <button role="tab" id="tab-settings" aria-controls="p-settings">Settings</button>
+    <button role="tab" id="tab-logs" aria-controls="p-logs">Logs</button>
+  </nav>
+</header>
 
-  <h2>History <span class="spacer"></span>
-    <span class="seg" id="range">
-      <button data-r="hour">Hour</button><button data-r="day" class="on">Day</button><button data-r="week">Week</button><button data-r="month">Month</button>
-    </span>
-  </h2>
-  <div class="charts">
-    <div class="chart"><div class="head"><span>Bandwidth</span><b id="t-bw"></b></div>
-      <canvas id="c-bw"></canvas>
-      <div class="legend"><i style="background:var(--out)"></i>sent<i style="background:var(--in)"></i>received</div></div>
-    <div class="chart"><div class="head"><span>Players online</span><b id="t-players"></b></div>
-      <canvas id="c-players"></canvas></div>
-    <div class="chart"><div class="head"><span>Connections (peak)</span><b id="t-peak"></b></div>
-      <canvas id="c-peak"></canvas></div>
-    <div class="chart"><div class="head"><span>Uploads / downloads</span><b id="t-files"></b></div>
-      <canvas id="c-files"></canvas>
-      <div class="legend"><i style="background:var(--warn)"></i>uploads<i style="background:var(--accent)"></i>downloads</div></div>
-    <div class="chart"><div class="head"><span>Online games (relay)</span><b id="t-games"></b></div>
-      <canvas id="c-games"></canvas>
-      <div class="legend"><i style="background:var(--accent)"></i>games open<i style="background:var(--warn)"></i>games joined</div></div>
-  </div>
+<main>
+  <section role="tabpanel" id="p-overview" aria-labelledby="tab-overview" tabindex="0">
+    <div class="tiles">
+      <div class="tile"><div class="k">Connections</div><div class="v" id="v-conn">&ndash;</div>
+        <div class="s" id="s-conn"></div><div class="bar"><i id="b-conn"></i></div></div>
+      <div class="tile link" data-go="ping"><div class="k">In online mode</div><div class="v" id="v-online">&ndash;</div>
+        <div class="s" id="s-online"></div></div>
+      <div class="tile link" data-go="matches"><div class="k">Sessions now</div><div class="v" id="v-sessions">&ndash;</div>
+        <div class="s" id="s-sessions"></div></div>
+      <div class="tile"><div class="k">Online play (relay)</div><div class="v" id="v-relay">&ndash;</div>
+        <div class="s" id="s-relay"></div></div>
+      <div class="tile"><div class="k">Bandwidth (since start)</div><div class="v" id="v-bw">&ndash;</div>
+        <div class="s" id="s-bw"></div></div>
+      <div class="tile link" data-go="players"><div class="k">Accounts</div><div class="v" id="v-acc">&ndash;</div>
+        <div class="s" id="s-acc"></div></div>
+      <div class="tile link" data-go="cc"><div class="k">Uploads</div><div class="v" id="v-up">&ndash;</div>
+        <div class="s" id="s-up"></div></div>
+      <div class="tile"><div class="k">Downloads</div><div class="v" id="v-down">&ndash;</div>
+        <div class="s" id="s-down"></div></div>
+      <div class="tile"><div class="k">Storage</div><div class="v" id="v-disk">&ndash;</div>
+        <div class="s" id="s-disk"></div></div>
+    </div>
+    <div class="card netline" id="s-net">Online matches (30 days): &ndash;</div>
+    <div class="card node" id="node" hidden>
+      <span class="what">Storage node</span> <span id="node-pill" class="tag">&hellip;</span>
+      <span class="facts" id="node-facts"></span>
+      <span class="acts"><button class="btn danger" id="node-stop">Stop</button>
+        <button class="btn primary" id="node-start">Start</button></span>
+    </div>
 
-  <h2>Leaderboards <span class="spacer"></span><select class="filter" id="lb-view"></select></h2>
-  <div class="scroll"><table>
-    <thead><tr><th class="num">Rank</th><th>Player</th><th class="num">Points</th><th class="num">Rating</th>
-      <th class="num">Matches</th><th class="num">Wins</th><th class="num">Losses</th><th class="num">Draws</th>
-      <th class="num">DQ</th><th class="num">Left</th></tr></thead>
-    <tbody id="lb-rows"><tr><td colspan="10" class="empty">Loading&hellip;</td></tr></tbody>
-  </table></div>
+    <h2>History <span class="spacer"></span>
+      <span class="seg" id="range" role="group" aria-label="History range">
+        <button data-r="hour" aria-pressed="false">Hour</button><button data-r="day" aria-pressed="true">Day</button><button data-r="week" aria-pressed="false">Week</button><button data-r="month" aria-pressed="false">Month</button>
+      </span>
+    </h2>
+    <div class="charts">
+      <div class="chart"><div class="head"><span>Bandwidth</span><b id="t-bw"></b></div>
+        <canvas id="c-bw" aria-label="Bandwidth chart"></canvas>
+        <div class="legend"><i style="background:var(--out)"></i>sent<i style="background:var(--in)"></i>received</div></div>
+      <div class="chart"><div class="head"><span>Players online</span><b id="t-players"></b></div>
+        <canvas id="c-players" aria-label="Players online chart"></canvas></div>
+      <div class="chart"><div class="head"><span>Connections (peak)</span><b id="t-peak"></b></div>
+        <canvas id="c-peak" aria-label="Connections chart"></canvas></div>
+      <div class="chart"><div class="head"><span>Uploads / downloads</span><b id="t-files"></b></div>
+        <canvas id="c-files" aria-label="Uploads and downloads chart"></canvas>
+        <div class="legend"><i style="background:var(--warn)"></i>uploads<i style="background:var(--accent)"></i>downloads</div></div>
+      <div class="chart"><div class="head"><span>Online games (relay)</span><b id="t-games"></b></div>
+        <canvas id="c-games" aria-label="Relay games chart"></canvas>
+        <div class="legend"><i style="background:var(--accent)"></i>games open<i style="background:var(--warn)"></i>games joined</div></div>
+    </div>
+  </section>
 
-  <h2>Uploads <span class="spacer"></span><input class="filter" id="f-up" placeholder="Filter"></h2>
-  <div class="scroll"><table>
-    <thead><tr><th>Title</th><th>Type</th><th>Author</th><th class="num">Size</th><th class="num">Downloads</th><th>Uploaded</th><th></th></tr></thead>
-    <tbody id="uploads"><tr><td colspan="7" class="empty">Loading&hellip;</td></tr></tbody>
-  </table></div>
+  <section role="tabpanel" id="p-players" aria-labelledby="tab-players" tabindex="0" hidden>
+    <h2>Player <span class="spacer"></span><input class="filter" id="f-player" placeholder="A player's name (Enter)" aria-label="Look up a player"></h2>
+    <div id="player"><p class="intro">Type a name, or pick one below or in Ping: their ranked record, ping and recent matches.</p></div>
 
-  <h2>Accounts <span class="spacer"></span><input class="filter" id="f-acc" placeholder="Filter"></h2>
-  <div class="scroll"><table>
-    <thead><tr><th>Name</th><th>Joined</th><th>Last seen</th><th class="num">Uploads</th><th class="num">Storage</th><th></th></tr></thead>
-    <tbody id="users"><tr><td colspan="6" class="empty">Loading&hellip;</td></tr></tbody>
-  </table></div>
-  <p class="err" id="err"></p>
-</div>
+    <h2>Accounts <span class="spacer"></span><input class="filter" id="f-acc" placeholder="Filter" aria-label="Filter accounts"></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Name</th><th>Online access</th><th>Joined</th><th>Last seen</th><th class="num">Uploads</th><th class="num">Storage</th><th></th></tr></thead>
+      <tbody id="users"><tr><td colspan="7" class="empty">Loading&hellip;</td></tr></tbody>
+    </table></div>
+    <p class="note">Online access (once the account_checks setting is on): accounts from before 2.1.6 need the
+      re-activation code you make here - it shows once; give it to that player, it works for that account only. Activate
+      lets an account in without a code. Reset code: for a forgotten password - the player types it in the launcher's
+      Forgot password with a new one (once, for 24 hours; every session of the account ends).</p>
+  </section>
+
+  <section role="tabpanel" id="p-invites" aria-labelledby="tab-invites" tabindex="0" hidden>
+    <p class="note" id="checks-line"></p>
+    <h2>New sign-up codes</h2>
+    <p class="intro">One code per person: it works once, for one new account. Codes show only here, once - copy them
+      now (the server keeps only their hash).</p>
+    <p><input class="filter" id="inv-note" maxlength="80" placeholder="Who it's for (a name, a note)" aria-label="Who the codes are for">
+      <input class="filter" id="inv-count" type="number" min="1" max="50" value="1" style="width:5em" aria-label="How many codes">
+      <button class="btn" id="inv-make">Make codes</button></p>
+    <pre id="inv-new" hidden></pre>
+    <h2>Codes <span class="spacer"></span><input class="filter" id="f-inv" placeholder="Filter" aria-label="Filter codes"></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Kind</th><th>For</th><th>Made</th><th>Used by</th><th>State</th><th></th></tr></thead>
+      <tbody id="invites"><tr><td colspan="6" class="empty">Loading&hellip;</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section role="tabpanel" id="p-ping" aria-labelledby="tab-ping" tabindex="0" hidden>
+    <h2>Online now <span class="spacer"></span><span class="note" id="ping-note"></span>
+      <select class="filter" id="f-place" aria-label="Where"><option value="">Everywhere</option>
+        <option value="match">In a match</option><option value="lobby">In a lobby</option>
+        <option value="online">Online menus / matchmaking</option><option value="cc">Community Creations</option>
+        <option value="boards">Leaderboards</option><option value="create">Creation suites</option>
+        <option value="offline">Offline menus / modes</option></select></h2>
+    <p class="intro">Now is where the player is at this moment: a session from its host's report, else the place their game reports (2.1.7 on; older games show "menus"). Each game sends its network report (the round trip to the other player, the path) when a match <b>ends</b>: a player's first match shows no ping until it's over. Relay now is how the game is on the relay at this moment.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Player</th><th>Now</th><th>Last match ping</th><th>Path</th><th>Match network</th><th>Relay now</th><th>NAT</th><th>Version</th><th>Last match</th></tr></thead>
+      <tbody id="pings"><tr><td colspan="9" class="empty">Loading&hellip;</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section role="tabpanel" id="p-matches" aria-labelledby="tab-matches" tabindex="0" hidden>
+    <h2>Sessions now <span class="spacer"></span><span class="note" id="live-note"></span>
+      <select class="filter" id="f-kind" aria-label="Match kind"><option value="">All matches</option>
+        <option value="ranked">Ranked</option><option value="player">Player</option><option value="?">Not known (older game)</option></select></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Host</th><th>Kind</th><th>Players</th><th>Match</th><th>State</th><th>For</th><th>Session</th></tr></thead>
+      <tbody id="live"><tr><td colspan="7" class="empty">Loading&hellip;</td></tr></tbody>
+    </table></div>
+
+    <h2>Relay now <span class="spacer"></span><span class="note" id="relay-note"></span></h2>
+    <p class="intro">Every game on the relay at this moment, busiest first. Every online game keeps the relay open to find sessions; packets a second counts what it tries to send one other game through it (a match: 60 and more). With the match network on p2p the relay passes a game only a few of those a second, whatever version it is: a busy one there is marked held back. Ban signs the account out and takes its games off the relay and the edge at once.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Player</th><th>Address</th><th>Link</th><th class="num">Packets/s</th><th>Version</th><th>For</th><th>Relay id</th><th></th></tr></thead>
+      <tbody id="relay-rows"><tr><td colspan="8" class="empty">Loading&hellip;</td></tr></tbody>
+    </table></div>
+
+    <h2>Leaderboards <span class="spacer"></span><select class="filter" id="lb-view" aria-label="Leaderboard"></select></h2>
+    <div class="scroll"><table>
+      <thead><tr><th class="num">Rank</th><th>Player</th><th class="num">Points</th><th class="num">Rating</th>
+        <th class="num">Matches</th><th class="num">Wins</th><th class="num">Losses</th><th class="num">Draws</th>
+        <th class="num">DQ</th><th class="num">Left</th></tr></thead>
+      <tbody id="lb-rows"><tr><td colspan="10" class="empty">Loading&hellip;</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section role="tabpanel" id="p-cc" aria-labelledby="tab-cc" tabindex="0" hidden>
+    <h2>Uploads <span class="spacer"></span><input class="filter" id="f-up" placeholder="Filter" aria-label="Filter uploads"></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Title</th><th>Type</th><th>Author</th><th class="num">Size</th><th class="num">Downloads</th><th>Uploaded</th><th></th></tr></thead>
+      <tbody id="uploads"><tr><td colspan="7" class="empty">Loading&hellip;</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section role="tabpanel" id="p-discovery" aria-labelledby="tab-discovery" tabindex="0" hidden>
+    <h2>Mods <span class="spacer"></span><input class="filter" id="f-mod" placeholder="Filter" aria-label="Filter mods"></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Name</th><th>Type</th><th>Author</th><th>Version</th><th class="num">Size</th><th class="num">Downloads</th><th>Uploaded</th><th></th></tr></thead>
+      <tbody id="mods"><tr><td colspan="8" class="empty">Loading&hellip;</td></tr></tbody>
+    </table></div>
+
+    <h2>Storage audit <span class="spacer"></span><span class="note" id="audit-note"></span>
+      <button class="btn" id="audit-run">Run audit</button></h2>
+    <p class="intro">Compares the files where the uploads' bytes live (the storage node) with what the database refers to. An orphan is a file nothing refers to (e.g. a delete while the node was down): it goes only with its Delete. Hidden mods are listed so they aren't mistaken for orphans.</p>
+    <div id="audit"></div>
+  </section>
+
+  <section role="tabpanel" id="p-names" aria-labelledby="tab-names" tabindex="0" hidden>
+    <h2>Name filter <span class="spacer"></span><span class="note" id="nf-note"></span></h2>
+    <p class="intro">Checked on everything players put on the server: Community Creations titles, tags and comments,
+      Discovery mods' names / tags / descriptions, entrance song and movie names, and account names (at sign-up, and an
+      uploader's own name at each upload). A refused upload tells the player why ("That name isn't allowed on Community
+      Creations"); nothing already on the server is changed - see Flagged names below.</p>
+    <p><label class="note"><input type="checkbox" id="nf-on"> <b>Filter on</b> (off: nothing is refused; Flagged names
+      still lists what the list would catch)</label></p>
+    <div class="names">
+      <div><label for="nf-words">Words <span class="note" id="nf-count"></span></label>
+        <textarea class="filter" id="nf-words" spellcheck="false" aria-describedby="nf-help"></textarea>
+        <p class="note" id="nf-help">One per line. Under 5 letters: a whole word only (and "f a g" spelled out), so
+          "Scunthorpe" is fine; 5 or more: inside words too, and across words ("hit ler"). <b>=word</b> whole word
+          only, <b>*word</b> inside words too, <b>two words</b> a phrase, <b># ...</b> a note. Case, leetspeak (h1tl3r,
+          @, $), repeated letters, dots / spaces / underscores between letters and look-alike letters are read
+          through.</p></div>
+      <div><label for="nf-allow">Allow list</label>
+        <textarea class="filter" id="nf-allow" spellcheck="false"></textarea>
+        <p class="note">Words never flagged though a listed word is inside them (e.g. snigger). One per line.</p></div>
+    </div>
+    <div class="row"><button class="btn primary" id="nf-save">Save list</button><span class="note" id="nf-saved"></span></div>
+
+    <h2>Test a name</h2>
+    <p><input class="filter" id="nf-test" placeholder="Would this name pass?" aria-label="A name to test" style="width:320px">
+      <button class="btn" id="nf-try">Test</button> <span id="nf-result" role="status"></span></p>
+
+    <h2>Flagged names <span class="spacer"></span><button class="btn" id="nf-scan">Scan again</button></h2>
+    <p class="intro">What is on the server now that the saved list catches. Nothing is deleted on its own: decide each one
+      (Delete / Hide here are the same as on the Community Creations, Discovery and Players tabs).</p>
+    <div class="scroll"><table>
+      <thead><tr><th>What</th><th>Text</th><th>Matched</th><th>By</th><th></th></tr></thead>
+      <tbody id="nf-flagged"><tr><td colspan="5" class="empty">Open this tab to scan.</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section role="tabpanel" id="p-reports" aria-labelledby="tab-reports" tabindex="0" hidden>
+    <h2>Problem reports <span class="spacer"></span>
+      <label class="note"><input type="checkbox" id="rp-open" checked> Hide done / duplicates</label>
+      <input class="filter" id="f-rp" placeholder="Filter" aria-label="Filter reports"></h2>
+    <div id="fixed" hidden></div>
+    <p class="intro">Sent from Report a problem (launcher, Mod Maker, game, Android). Grouped by signature: the app, version, problem and the first crash / error line in the logs. The files are in the storage node's reports folder.</p>
+    <p class="note" id="modstore"></p>
+    <div id="reports"><span class="empty">Loading&hellip;</span></div>
+  </section>
+
+  <section role="tabpanel" id="p-settings" aria-labelledby="tab-settings" tabindex="0" hidden>
+    <h2>Settings</h2>
+    <div class="set" id="settings"><span class="empty">Loading&hellip;</span></div>
+    <div class="row"><button class="btn primary" id="save-set">Save settings</button>
+      <button class="btn danger" id="restart">Restart online</button><span class="note" id="set-note"></span></div>
+  </section>
+
+  <section role="tabpanel" id="p-logs" aria-labelledby="tab-logs" tabindex="0" hidden>
+    <h2>Server log <span class="spacer"></span><input class="filter" id="f-log" placeholder="Filter (e.g. error, relay, a name)" aria-label="Filter the log">
+      <select class="filter" id="n-log" aria-label="Lines"><option>100</option><option selected>300</option><option>1000</option><option>3000</option></select>
+      <button class="btn" id="r-log">Refresh</button></h2>
+    <pre class="log" id="log" tabindex="0">Loading&hellip;</pre>
+  </section>
+  <p class="err" id="err" role="status"></p>
+</main>
 <div class="viewer" id="viewer"><div class="box"><img id="v-img" alt=""><div class="cap" id="v-cap"></div></div></div>
 <script>
 (function () {
@@ -161,16 +452,102 @@ td .tag.bad { color: #ffb4bb; border-color: #5c2a30; }
     if (s < 129600) return Math.round(s / 3600) + ' h ago';
     return Math.round(s / 86400) + ' days ago';
   }
+  function dur(s) {
+    s = Math.max(0, Math.round(s));
+    return s < 90 ? s + ' s' : s < 5400 ? Math.round(s / 60) + ' min' : (s / 3600).toFixed(1) + ' h';
+  }
+  function store(k, v) {  // (this browser only: the last tab, the theme)
+    try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; }
+  }
+  // (signed in under /svr-admin/: every POST carries the session's CSRF token)
+  var csrf = document.querySelector('meta[name="csrf-token"]');
   function api(path, opts) {
-    return fetch(path, opts || {}).then(function (r) {
+    opts = opts || {};
+    if (csrf && opts.method && opts.method !== 'GET') {
+      opts.headers = Object.assign({}, opts.headers || {}, {'X-CSRF-Token': csrf.content});
+    }
+    return fetch(path, opts).then(function (r) {
+      if (r.status === 401 && csrf) { location.href = 'login?e=expired'; throw new Error('signed out'); }
       if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
       return r.json();
     });
   }
 
+  // ---- theme: auto (the system's) / light / dark
+  var THEMES = ['auto', 'light', 'dark'];
+  function setTheme(t) {
+    if (t === 'auto') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', t);
+    el('theme').textContent = 'Theme: ' + t;
+    store('svr-theme', t);
+    charts();
+  }
+  el('theme').addEventListener('click', function () {
+    var t = store('svr-theme') || 'auto';
+    setTheme(THEMES[(THEMES.indexOf(t) + 1) % THEMES.length]);
+  });
+  if (window.matchMedia) {
+    var mq = window.matchMedia('(prefers-color-scheme: dark)');
+    (mq.addEventListener ? mq.addEventListener.bind(mq, 'change') : mq.addListener.bind(mq))(function () { charts(); });
+  }
+
+  // ---- tabs (arrow keys / Home / End move between them; the last one is kept in this browser and the address)
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('[role=tab]'));
+  var current = null;
+  function tabName(t) { return t.id.replace('tab-', ''); }
+  function show(name, focus) {
+    var tab = el('tab-' + name) || tabs[0];
+    tabs.forEach(function (t) {
+      var on = t === tab;
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.tabIndex = on ? 0 : -1;
+      el(t.getAttribute('aria-controls')).hidden = !on;
+    });
+    if (focus) tab.focus();
+    current = tabName(tab);
+    store('svr-tab', current);
+    if (location.hash !== '#' + current) history.replaceState(null, '', '#' + current);
+    refresh(current);
+  }
+  tabs.forEach(function (t, i) {
+    t.addEventListener('click', function () { show(tabName(t)); });
+    t.addEventListener('keydown', function (e) {
+      var j = e.key === 'ArrowRight' ? i + 1 : e.key === 'ArrowLeft' ? i - 1 : e.key === 'Home' ? 0 :
+              e.key === 'End' ? tabs.length - 1 : null;
+      if (j === null) return;
+      e.preventDefault();
+      show(tabName(tabs[(j + tabs.length) % tabs.length]), true);
+    });
+  });
+  window.addEventListener('hashchange', function () {
+    var h = location.hash.slice(1);
+    if (h && h !== current && el('tab-' + h)) show(h);
+  });
+  document.addEventListener('click', function (e) {
+    var g = e.target.closest('[data-go]');
+    if (g) show(g.getAttribute('data-go'));
+  });
+  // (what each tab loads when it's opened, and what keeps refreshing while it's open)
+  function refresh(name) {
+    if (name === 'overview') { stats(); live(); node(); }
+    else if (name === 'players') loadUsers();
+    else if (name === 'invites') loadInvites();
+    else if (name === 'ping') pings();
+    else if (name === 'matches') { live(); leaderboard(); }
+    else if (name === 'cc') loadUploads();
+    else if (name === 'discovery') loadMods();
+    else if (name === 'names') { loadNames(); loadFlagged(); }
+    else if (name === 'reports') loadReports();
+    else if (name === 'settings') { if (!settingsList.length) settings(); }
+    else if (name === 'logs') log();
+  }
+
+  // ---- overview
+  function cssVar(k) { return getComputedStyle(document.documentElement).getPropertyValue(k).trim(); }
   function draw(id, sets, fmt) {
     var c = el(id), dpr = window.devicePixelRatio || 1;
     var w = c.clientWidth, h = c.clientHeight;
+    if (!w) return;  // (its tab is hidden)
     c.width = w * dpr; c.height = h * dpr;
     var g = c.getContext('2d');
     g.scale(dpr, dpr);
@@ -178,11 +555,11 @@ td .tag.bad { color: #ffb4bb; border-color: #5c2a30; }
     var max = 0;
     sets.forEach(function (s) { s.data.forEach(function (v) { if (v > max) max = v; }); });
     max = max || 1;
-    g.strokeStyle = '#2b3038'; g.lineWidth = 1;
+    g.strokeStyle = cssVar('--grid'); g.lineWidth = 1;
     [0.25, 0.5, 0.75].forEach(function (f) {
       g.beginPath(); g.moveTo(0, Math.round(h * f) + .5); g.lineTo(w, Math.round(h * f) + .5); g.stroke();
     });
-    g.fillStyle = '#6f7883'; g.font = '11px system-ui';
+    g.fillStyle = cssVar('--faint'); g.font = '11px system-ui';
     g.fillText(fmt(max), 4, 11);
     sets.forEach(function (s) {
       var n = s.data.length; if (n < 2) return;
@@ -196,49 +573,84 @@ td .tag.bad { color: #ffb4bb; border-color: #5c2a30; }
       g.globalAlpha = 0.12; g.fillStyle = s.color; g.fill(); g.globalAlpha = 1;
     });
   }
-
   function charts() {
     if (!hist) return;
     var rows = hist.rows, step = hist.step;
     var col = function (k) { var i = hist.columns.indexOf(k); return rows.map(function (r) { return r[i]; }); };
     var perSec = function (a) { return a.map(function (v) { return v / step; }); };
     var sum = function (a) { return a.reduce(function (x, y) { return x + y; }, 0); };
-    var cs = getComputedStyle(document.documentElement);
-    var colIn = cs.getPropertyValue('--in').trim(), colOut = cs.getPropertyValue('--out').trim();
-    draw('c-bw', [{data: perSec(col('bytes_out')), color: colOut}, {data: perSec(col('bytes_in')), color: colIn}],
+    var max = function (a) { return a.length ? Math.max.apply(null, a) : 0; };
+    draw('c-bw', [{data: perSec(col('bytes_out')), color: cssVar('--out')}, {data: perSec(col('bytes_in')), color: cssVar('--in')}],
          function (v) { return bytes(v) + '/s'; });
     el('t-bw').textContent = bytes(sum(col('bytes_out'))) + ' sent · ' + bytes(sum(col('bytes_in'))) + ' received';
-    draw('c-players', [{data: col('players'), color: cs.getPropertyValue('--accent').trim()}], String);
-    el('t-players').textContent = 'peak ' + Math.max.apply(null, col('players'));
-    draw('c-peak', [{data: col('peak'), color: cs.getPropertyValue('--warn').trim()}], String);
-    el('t-peak').textContent = 'peak ' + Math.max.apply(null, col('peak'));
-    draw('c-files', [{data: col('uploads'), color: cs.getPropertyValue('--warn').trim()},
-                     {data: col('downloads'), color: cs.getPropertyValue('--accent').trim()}], String);
+    draw('c-players', [{data: col('players'), color: cssVar('--accent')}], String);
+    el('t-players').textContent = 'peak ' + max(col('players'));
+    draw('c-peak', [{data: col('peak'), color: cssVar('--warn')}], String);
+    el('t-peak').textContent = 'peak ' + max(col('peak'));
+    draw('c-files', [{data: col('uploads'), color: cssVar('--warn')}, {data: col('downloads'), color: cssVar('--accent')}], String);
     el('t-files').textContent = sum(col('uploads')) + ' up · ' + sum(col('downloads')) + ' down';
     if (hist.columns.indexOf('games') >= 0) {
-      draw('c-games', [{data: col('games'), color: cs.getPropertyValue('--accent').trim()},
-                       {data: col('sessions'), color: cs.getPropertyValue('--warn').trim()}], String);
-      el('t-games').textContent = 'peak ' + Math.max.apply(null, col('games')) + ' · ' + sum(col('sessions')) + ' joined';
+      draw('c-games', [{data: col('games'), color: cssVar('--accent')}, {data: col('sessions'), color: cssVar('--warn')}], String);
+      el('t-games').textContent = 'peak ' + max(col('games')) + ' · ' + sum(col('sessions')) + ' joined';
     }
   }
+  // ---- the storage node (the PC behind the VPS): up or not, Stop / Start (its watchdog starts it)
+  function node() {
+    return api('api/admin/storage').then(function (d) {
+      el('node').hidden = !d.node;
+      if (!d.node) return;
+      var i = d.info || {}, since = d.changed ? d.now - d.changed : 1e9, pill, cls;
+      if (d.up && d.wanted === 'stopped') pill = 'stopping…', cls = 'warn';
+      else if (d.up) pill = 'running', cls = 'on';
+      else if (d.wanted === 'stopped') pill = 'stopped', cls = '';
+      else if (since < 300) pill = 'starting… (its watchdog, within 2 min)', cls = 'warn';
+      else pill = 'not answering', cls = 'bad';
+      el('node-pill').className = 'tag ' + cls;
+      el('node-pill').textContent = pill;
+      var facts = [];
+      facts.push('last answered ' + ago(d.answered));
+      if (d.up) {
+        if (i.blobs != null) facts.push(i.blobs + ' files');
+        if (i.free_bytes != null) facts.push(bytes(i.free_bytes) + ' free of ' + bytes(i.total_bytes));
+        if (i.up_s != null) facts.push('up ' + dur(i.up_s));
+      }
+      facts.push(d.watchdog_polled ? 'watchdog asked ' + ago(d.watchdog_polled) : 'the watchdog hasn\'t asked yet');
+      el('node-facts').innerHTML = facts.join(' · ');
+      el('node-stop').disabled = d.wanted === 'stopped';
+      el('node-start').disabled = d.wanted !== 'stopped';
+    }).catch(function () {});
+  }
+  function nodeAction(action) {
+    el('node-stop').disabled = el('node-start').disabled = true;
+    return api('api/admin/storage', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                     body: JSON.stringify({action: action})}).then(node, node);
+  }
+  el('node-stop').addEventListener('click', function () {
+    if (!confirm('Stop the storage node? Community Creations and Discovery downloads and uploads stop until you press Start (it stays stopped after a restart of the PC too).')) return;
+    nodeAction('stop');
+  });
+  el('node-start').addEventListener('click', function () { nodeAction('start'); });
 
   function stats() {
     return api('api/admin/stats?range=' + range).then(function (d) {
       var n = d.now, p = d.players, s = d.storage;
-      el('since').textContent = 'up since ' + new Date(n.since * 1000).toLocaleString();
+      el('since').textContent = 'Online server · up since ' + new Date(n.since * 1000).toLocaleString();
       el('v-conn').innerHTML = n.connections + '<small>/ ' + n.max_connections + '</small>';
       el('s-conn').textContent = 'peak since start ' + n.peak_since_start;
       el('b-conn').style.width = Math.min(100, n.connections / n.max_connections * 100) + '%';
-      el('v-online').textContent = n.players_online;
-      el('s-online').textContent = p.today + ' today · ' + p.week + ' this week · ' + p.month + ' this month';
+      el('v-online').textContent = n.online_mode != null ? n.online_mode : n.players_online;
+      el('s-online').textContent = (n.in_session != null ? n.in_session + ' in a session / match · ' +
+        n.game_running + ' game running · ' : '') + p.today + ' today · ' + p.week + ' this week · ' + p.month + ' this month';
       el('v-bw').textContent = bytes(n.bytes_out + n.bytes_in);
       el('s-bw').textContent = bytes(n.bytes_out) + ' sent · ' + bytes(n.bytes_in) + ' received';
       el('v-disk').textContent = bytes(s.stored + s.database);
-      el('s-disk').textContent = bytes(s.raw) + ' of files stored in ' + bytes(s.stored) + ' · database ' +
+      el('s-disk').textContent = bytes(s.raw) + ' of files in ' + bytes(s.stored) + ' · database ' +
         bytes(s.database) + ' · ' + bytes(s.free) + ' free';
       el('v-acc').textContent = p.accounts;
+      el('n-players').textContent = p.accounts;
       el('s-acc').textContent = p.banned ? p.banned + ' banned' : 'none banned';
       el('v-up').textContent = s.uploads;
+      el('n-cc').textContent = s.uploads;
       el('s-up').textContent = s.files + ' files · ' + s.logos + ' extra logos';
       var t = d.totals || {all: {}, today: {}};
       el('v-down').textContent = t.file_downloads != null ? t.file_downloads : '–';
@@ -248,63 +660,291 @@ td .tag.bad { color: #ffb4bb; border-color: #5c2a30; }
         (t.all.relayed || 0).toLocaleString() + ' packets';
       var g = d.net || {matches: 0, path: {}, nat: {}, rtt: {}, steps: {}};
       function pct(o, k) { return g.matches ? Math.round((o[k] || 0) * 100 / g.matches) + '%' : '0%'; }
-      el('v-net').innerHTML = g.matches + '<small> reported</small>';
-      el('s-net').textContent = 'direct ' + pct(g.path, 'direct') + ' · relay ' + pct(g.path, 'relay') + ' · LAN ' +
-        pct(g.path, 'lan') + ' · NAT: cone ' + pct(g.nat, 'cone') + ', symmetric ' + pct(g.nat, 'symmetric') +
-        ', router-mapped ' + pct(g.nat, 'mapped') + ', unknown ' + pct(g.nat, 'unknown') +
-        (Object.keys(g.steps).length ? ' (symmetric steps ' + Object.keys(g.steps).map(function (k) {
+      el('s-net').innerHTML = 'Online matches (30 days): <b>' + g.matches + '</b> reported · path: direct ' + pct(g.path, 'direct') +
+        ', relay ' + pct(g.path, 'relay') + ', LAN ' + pct(g.path, 'lan') + ' · NAT: cone ' + pct(g.nat, 'cone') +
+        ', symmetric ' + pct(g.nat, 'symmetric') + ', router-mapped ' + pct(g.nat, 'mapped') + ', unknown ' + pct(g.nat, 'unknown') +
+        esc(Object.keys(g.steps).length ? ' (symmetric steps ' + Object.keys(g.steps).map(function (k) {
           return (k === '99' ? 'random' : k) + ': ' + g.steps[k]; }).join(', ') + ')' : '') +
-        ' · ping ' + Object.keys(g.rtt).map(function (k) { return '≤' + (k === '100000' ? '∞' : k) + ' ms: ' + g.rtt[k]; }).join(', ');
+        ' · ping ' + esc(Object.keys(g.rtt).map(function (k) { return '≤' + (k === '100000' ? '∞' : k) + ' ms: ' + g.rtt[k]; }).join(', ') || '-');
       hist = d.history; charts();
       el('err').textContent = '';
     }).catch(function (e) { el('err').textContent = 'Stats: ' + e.message; });
   }
 
-  var uploads = [], users = [];
-  function renderUploads() {
-    var f = el('f-up').value.toLowerCase();
-    var rows = uploads.filter(function (u) { return !f || (u.title + ' ' + u.author).toLowerCase().indexOf(f) >= 0; });
-    el('uploads').innerHTML = rows.length ? rows.map(function (u) {
-      return '<tr><td>' + esc(u.title || '(untitled)') +
-        (u.hidden ? ' <span class="tag bad">hidden</span>' : '') + (u.deleted ? ' <span class="tag">deleted</span>' : '') +
-        '</td><td>' + esc(TYPES[u.type] || u.type) + '</td><td>' + esc(u.author) + '</td><td class="num">' + bytes(u.size) +
-        '</td><td class="num">' + u.downloads + '</td><td>' + ago(u.created) + '</td><td class="num">' +
-        (u.picture ? '<button class="btn" data-view="' + u.id + '">View</button>' : '') +
-        '<button class="btn" data-up="' + u.id + '" data-a="' + (u.hidden ? 'show' : 'hide') + '">' + (u.hidden ? 'Show' : 'Hide') + '</button>' +
-        '<button class="btn danger" data-up="' + u.id + '" data-a="delete">Delete</button></td></tr>';
-    }).join('') : '<tr><td colspan="7" class="empty">No uploads.</td></tr>';
-  }
+  // ---- players: accounts + one player's record
+  var uploads = [], users = [], mods = [];
   function renderUsers() {
     var f = el('f-acc').value.toLowerCase();
     var rows = users.filter(function (u) { return !f || u.name.toLowerCase().indexOf(f) >= 0; });
     el('users').innerHTML = rows.length ? rows.map(function (u) {
-      return '<tr><td>' + esc(u.name) + (u.online ? ' <span class="tag on">online</span>' : '') +
-        (u.banned ? ' <span class="tag bad">banned</span>' : '') + '</td><td>' + ago(u.created) + '</td><td>' +
-        ago(u.last_seen) + '</td><td class="num">' + u.uploads + '</td><td class="num">' + bytes(u.storage) +
-        '</td><td class="num">' +
+      return '<tr><td><button class="linkish" data-player="' + esc(u.name) + '">' + esc(u.name) + '</button>' +
+        (u.online ? ' <span class="tag on">online</span>' : '') + (u.banned ? ' <span class="tag bad">banned</span>' : '') +
+        '</td><td>' + access(u) + '</td><td>' + ago(u.created) + '</td><td>' + ago(u.last_seen) + '</td><td class="num">' + u.uploads +
+        '</td><td class="num">' + bytes(u.storage) + '</td><td class="acts">' +
+        (u.activated ? '' : '<button class="btn" data-user="' + u.id + '" data-a="reactivation-code">Re-activation code</button>' +
+                            '<button class="btn" data-user="' + u.id + '" data-a="activate">Activate</button>') +
+        '<button class="btn" data-user="' + u.id + '" data-a="reset-code">Reset code</button>' +
         '<button class="btn" data-user="' + u.id + '" data-a="' + (u.banned ? 'unban' : 'ban') + '">' + (u.banned ? 'Unban' : 'Ban') + '</button>' +
         '<button class="btn" data-user="' + u.id + '" data-a="reset">Reset password</button>' +
         '<button class="btn danger" data-user="' + u.id + '" data-a="delete">Delete</button></td></tr>';
-    }).join('') : '<tr><td colspan="6" class="empty">No accounts.</td></tr>';
+    }).join('') : '<tr><td colspan="7" class="empty">No accounts.</td></tr>';
   }
-  // the game's leaderboards (ranked matches): LB_01_TOTAL_RANKING -> "Total ranking"
+  // (online, once account_checks is on: an active account - its sign-up code, or its re-activation code, used)
+  function access(u) {
+    return u.activated ? '<span class="tag on">ok</span>' : '<span class="tag bad">needs its re-activation code</span>';
+  }
+  var KIND = {signup: 'Sign-up', reactivate: 'Re-activation', reset: 'Password reset'};
+  var invites = [];
+  function renderInvites() {
+    var f = el('f-inv').value.toLowerCase();
+    var rows = invites.filter(function (i) {
+      return !f || [i.note, i.account_name, i.used_by_name, i.kind].join(' ').toLowerCase().indexOf(f) >= 0;
+    });
+    el('invites').innerHTML = rows.length ? rows.map(function (i) {
+      var state = i.used_by ? '<span class="tag on">used ' + ago(i.used_at) + '</span>' :
+                  i.revoked ? '<span class="tag bad">revoked</span>' :
+                  i.expired ? '<span class="tag bad">expired</span>' : '<span class="tag">open</span>';
+      return '<tr><td>' + (KIND[i.kind] || esc(i.kind)) + '</td><td>' +
+        esc(i.kind !== 'signup' ? (i.account_name || '#' + i.account) : (i.note || '')) + '</td><td>' + ago(i.created) +
+        '</td><td>' + (i.used_by_name ? '<button class="linkish" data-player="' + esc(i.used_by_name) + '">' + esc(i.used_by_name) +
+        '</button>' : '') + '</td><td>' + state + '</td><td class="acts">' + (!i.used_by && !i.revoked && !i.expired ?
+        '<button class="btn danger" data-invite="' + i.id + '">Revoke</button>' : '') + '</td></tr>';
+    }).join('') : '<tr><td colspan="6" class="empty">No codes yet.</td></tr>';
+  }
+  function loadInvites() {
+    checksLine();
+    return api('api/admin/invites').then(function (d) {
+      invites = d.invites || [];
+      el('n-invites').textContent = invites.filter(function (i) { return !i.used_by && !i.revoked && !i.expired; }).length || '';
+      renderInvites();
+    }).catch(function () {});
+  }
+  // (the account_checks setting: what it does now, how many accounts on would keep off online)
+  function checksLine() {
+    return api('api/admin/checks').then(function (d) {
+      el('checks-line').innerHTML = (d.test_open ? '<b>A test server (--test-open-accounts): nobody is ever blocked.</b> ' : '') +
+        'Account checks: <b>' + esc(d.checks.toUpperCase()) + '</b> (Settings: account_checks) - ' +
+        (d.checks === 'on' ? 'new accounts need a sign-up code; ' + d.would_block + ' of ' + d.accounts +
+                             ' accounts are kept off online until their re-activation code.'
+                           : 'nobody is blocked; ' + d.would_block + ' of ' + d.accounts + ' accounts would be, if it were on ' +
+                             '(they need their re-activation code: make them below, on the Players tab).');
+      return d;
+    }).catch(function () {});
+  }
+  el('f-inv').addEventListener('input', renderInvites);
+  el('inv-make').addEventListener('click', function () {
+    var n = Math.max(1, Math.min(50, parseInt(el('inv-count').value, 10) || 1));
+    api('api/admin/invites', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify({note: el('inv-note').value, count: n})}).then(function (r) {
+      el('inv-new').hidden = false;
+      el('inv-new').textContent = 'New code' + (r.codes.length > 1 ? 's' : '') + (el('inv-note').value ? ' for ' + el('inv-note').value : '') +
+        ' (copy now - shown once):\n' + r.codes.map(function (c) { return c.code; }).join('\n');
+      loadInvites();
+    }).catch(function (e) { alert('Not made: ' + e.message); });
+  });
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-invite]');
+    if (!b || !confirm('Revoke this code? It stops working at once.')) return;
+    b.disabled = true;
+    api('api/admin/invite/' + b.dataset.invite + '/revoke', {method: 'POST'}).then(loadInvites)
+      .catch(function (err) { alert(err.message); b.disabled = false; });
+  });
+  function loadUsers() {
+    return api('api/admin/users').then(function (d) { users = d; el('n-players').textContent = d.length; renderUsers(); }).catch(function () {});
+  }
+  function pingCell(ms) {
+    if (ms == null) return '<span class="note">-</span>';
+    return '<span class="tag' + (ms <= 80 ? ' on' : ms > 200 ? ' bad' : '') + '">' + ms + ' ms</span>';
+  }
+  function resultTag(r) {
+    return '<span class="tag' + (r === 'win' ? ' on' : r === 'loss' || r === 'disconnect' ? ' bad' : '') + '">' + esc(r) + '</span>';
+  }
+  document.addEventListener('click', function (e) {
+    var a = e.target.closest('[data-player]');
+    if (!a) return;
+    e.preventDefault();
+    el('f-player').value = a.getAttribute('data-player');
+    if (current !== 'players') show('players');
+    player(a.getAttribute('data-player'));
+    el('player').scrollIntoView({block: 'nearest'});
+  });
+  el('f-player').addEventListener('keydown', function (e) { if (e.key === 'Enter') player(this.value.trim()); });
+  // A player: wins, losses, win rate (Ranked matches: the stats their game wrote), ping, then the recent matches.
+  function player(name) {
+    if (!name) return;
+    api('api/admin/player?name=' + encodeURIComponent(name)).then(function (d) {
+      var t = d.totals || {}, n = function (k) { return t[k] || 0; };
+      var games = n('win') + n('loss') + n('draw') + n('dq') + n('disconnect');
+      var rows = d.matches.map(function (m) {
+        var net = m.net || {};
+        return '<tr><td class="note">' + ago(m.at) + '</td><td title="leaderboard view ' + esc(m.view) + '">' + kindBadge('ranked') + ' ' + esc(m.type) +
+          '</td><td>' + resultTag(m.result) + '</td><td class="num">' + (m.rated > 0 ? '+' : '') + m.rated +
+          '</td><td>' + (m.net ? pingCell(net.rtt) : '<span class="note">-</span>') + '</td><td>' + esc(net.path || '') +
+          '</td><td>' + esc(net.network || '') + '</td></tr>';
+      }).join('');
+      var stat = function (k, v) { return '<div>' + k + '<b>' + v + '</b></div>'; };
+      el('player').innerHTML = '<div class="card"><div class="name">' + esc(d.name) + '</div>' +
+        '<div class="note">joined ' + ago(d.created) + ' · last seen ' + ago(d.last_seen) + '</div><div class="stats">' +
+        stat('Ranked matches', games) + stat('Won', n('win')) + stat('Lost', n('loss')) +
+        (n('draw') ? stat('Drawn', n('draw')) : '') + (n('dq') ? stat('DQ', n('dq')) : '') +
+        (n('disconnect') ? stat('Left', n('disconnect')) : '') +
+        stat('Win rate', d.win_rate == null ? '-' : d.win_rate + '%') + stat('Rating', d.rating != null ? d.rating : '-') +
+        stat('Ping (avg / max)', d.ping.avg == null ? '-' : d.ping.avg + ' / ' + d.ping.max + ' ms') +
+        '</div><p class="note" style="margin:10px 0 0">Ranked matches only (their game writes those results); ping from ' +
+        d.ping.matches + ' match report' + (d.ping.matches === 1 ? '' : 's') + '.</p></div>' +
+        '<div class="scroll"><table><thead><tr><th>When</th><th>Match</th><th>Result</th><th class="num">Rating</th><th>Ping</th><th>Path</th><th>Network</th></tr></thead><tbody>' +
+        (rows || '<tr><td colspan="7" class="empty">No ranked matches recorded yet.</td></tr>') + '</tbody></table></div>';
+    }).catch(function (e) {
+      el('player').innerHTML = '<p class="empty">' + esc(String(e.message).indexOf('404') === 0 ? 'No player called ' + name + '.' : e.message) + '</p>';
+    });
+  }
+
+  // A hosted session's kind (the host's report, 2.1.6+): RANKED (accent) / PLAYER; ? from an older game
+  function kindBadge(k) {
+    return k === 'ranked' ? '<span class="kind ranked" title="Ranked Match">RANKED</span>' :
+      k === 'player' ? '<span class="kind" title="Player Match">PLAYER</span>' :
+      '<span class="kind" title="not known: the host\'s game is older than 2.1.6">?</span>';
+  }
+
+  // ---- ping: who's online now and their last match's network report
+  // (a place token -> its filter group: the game's presence poll, 2.1.7 on)
+  function placeGroup(t) {
+    return !t ? '' : /^match_/.test(t) ? 'match' : /^lobby_/.test(t) ? 'lobby' :
+      t === 'matchmaking' || t === 'online_menu' ? 'online' : /^cc/.test(t) ? 'cc' : t === 'leaderboards' ? 'boards' :
+      /^create_|^paint_tool$|^threads$|^highlight_reel$/.test(t) ? 'create' : 'offline';
+  }
+  function playerGroup(p) {
+    var s = p.session;
+    if (s) return s.state === 'match' ? 'match' : 'lobby';
+    return placeGroup(p.place) || (p.online_mode ? 'online' : 'offline');
+  }
+  var pingData = null;
+  function pings() {
+    return api('api/admin/pings').then(function (d) { pingData = d; renderPings(); }).catch(function () {});
+  }
+  el('f-place').addEventListener('change', renderPings);
+  function renderPings() {
+    var d = pingData;
+    if (!d) return;
+    var want = el('f-place').value, names = d.place_names || {};
+    (function () {
+      var withPing = d.players.filter(function (p) { return p.last; });
+      var playing = d.players.filter(function (p) { return p.session && p.session.state === 'match'; });
+      el('n-ping').textContent = d.players.length || '';
+      el('ping-note').textContent = d.players.length + ' online · ' + playing.length + ' in a match now · ' +
+        withPing.length + ' with a match report';
+      var shown = d.players.filter(function (p) { return !want || playerGroup(p) === want; });
+      el('pings').innerHTML = shown.length ? shown.map(function (p) {
+        var l = p.last || {}, s = p.session, inMatch = s && s.state === 'match';
+        // (what they're in now: a match or a lobby, the path the host sees, for how long; else the place
+        // their game reports - an older game: "menus")
+        var g = placeGroup(p.place);
+        var placeCell = !p.place ? '<span class="note">menus</span>' :
+          '<span class="tag place-' + g + (g === 'match' ? ' on' : '') + '" title="' + esc(p.place) + '">' +
+          esc(names[p.place] || p.place) + '</span>' + (p.kind ? ' ' + kindBadge(p.kind) : '');
+        var nowCell = !s ? placeCell :
+          '<span class="tag' + (inMatch ? ' on' : '') + '" title="' + esc((s.rule_name || s.rule || '') + ' · host ' + s.host) + '">' +
+          (inMatch ? 'in a match' : 'in a lobby') + '</span> ' + kindBadge(s.match_kind) + ' ' + esc(s.path === 'host' ? 'hosting' : s.path) +
+          ' <span class="note">' + dur(d.now - s.since) + '</span>';
+        var lastCell = p.last ? pingCell(l.rtt) : inMatch ?
+          '<span class="note">first match in progress: its report comes when it ends</span>' :
+          '<span class="note">no match finished yet</span>';
+        return '<tr><td><button class="linkish" data-player="' + esc(p.name) + '">' + esc(p.name) + '</button></td><td>' +
+          nowCell + '</td><td>' + lastCell + '</td><td>' + esc(l.path || '') +
+          '</td><td>' + esc(l.network || '') + '</td><td>' + (p.link ? '<span class="tag">' + esc(p.link) + '</span>' : '') +
+          '</td><td>' + esc(l.nat || '') + '</td><td>' + esc(l.version || '') + '</td><td class="note">' +
+          (p.last ? ago(l.at) : '') + '</td></tr>';
+      }).join('') : '<tr><td colspan="9" class="empty">' + (d.players.length ? 'Nobody there right now.' :
+                                                            'Nobody online right now.') + '</td></tr>';
+    })();
+  }
+
+  // ---- matches: sessions now (the hosts' reports) + the leaderboards
+  function matchCell(v) {
+    // (the game's name for the rule; its id small, and in the tooltip)
+    var parts = [];
+    if (v.kind) parts.push(esc(v.kind));
+    if (v.rule) parts.push(v.rule_name ? '<span title="' + esc(v.rule) + '">' + esc(v.rule_name) + '</span><span class="id">' +
+                                         esc(v.rule.replace(/^rule\s*/, '')) + '</span>' : esc(v.rule));
+    // (the arena by name - the game's, or a custom arena's own; its number in the tooltip)
+    if (v.arena) parts.push('<span title="' + esc(v.arena) + (v.arena_mod ? ' (custom arena)' : '') + '">' +
+                            esc(v.arena_name || v.arena) + '</span>');
+    return parts.join(' · ');
+  }
+  function live() {
+    return api('api/admin/live').then(function (d) {
+      var n = d.sessions.length, inMatch = d.sessions.filter(function (v) { return v.state === 'match'; }).length;
+      el('n-matches').textContent = n || '';
+      el('v-sessions').textContent = n;
+      el('s-sessions').textContent = inMatch + ' in a match · ' + (n - inMatch) + ' in a lobby · ' + d.relay.length +
+        ' relay stream' + (d.relay.length === 1 ? '' : 's');
+      el('live-note').textContent = n + ' session' + (n === 1 ? '' : 's') + ' reported · ' + d.relay.length + ' relay stream' +
+        (d.relay.length === 1 ? '' : 's') + ' · ' + d.udp_games + ' UDP relay games · match network: ' + (d.match_network || 'auto');
+      liveData = d; renderLive(); renderRelay();
+    }).catch(function () {});
+  }
+  function renderRelay() {
+    var d = liveData, rows = (d && d.relay_games) || [];
+    el('relay-note').textContent = rows.length + ' game' + (rows.length === 1 ? '' : 's') + ' · match network: ' +
+      (d.match_network || 'auto') + (d.match_network === 'p2p' ? ' (no match data through the relay)' : '');
+    el('relay-rows').innerHTML = rows.length ? rows.map(function (r) {
+      // (whose: an account name; a game whose ticket says no account - from before the server started, or an
+      // older edge - says so instead of "?")
+      var who = r.known ? '<button class="linkish" data-player="' + esc(r.name) + '">' + esc(r.name) + '</button>' +
+                (r.banned ? ' <span class="tag">banned</span>' : '') : '<span class="note">' + esc(r.name) + '</span>';
+      // (what it tries to send: on p2p, more than hellos and search answers = match data, held back by the relay)
+      var busy = d.match_network === 'p2p' && r.rate >= 5;
+      return '<tr><td>' + who + '</td><td>' + esc(r.ip || '') + (r.port ? ':' + r.port : '') + '</td><td><span class="tag">' +
+        esc(r.link) + '</span></td><td class="num">' + (busy ? '<b title="match data on p2p: the relay holds it back">' + r.rate +
+        ' held back</b>' : r.rate) +
+        '</td><td>' + (r.version ? esc(r.version) : '<span class="note">not known</span>') + '</td><td class="note">' +
+        dur(d.now - r.since) + '</td><td class="note">' + esc(r.id) + '</td><td>' + (r.account ?
+          '<button class="btn" data-user="' + r.account + '" data-a="' + (r.banned ? 'unban' : 'ban') + '">' +
+          (r.banned ? 'Unban' : 'Ban') + '</button>' : '') + '</td></tr>';
+    }).join('') : '<tr><td colspan="8" class="empty">Nobody on the relay right now.</td></tr>';
+  }
+  var liveData = null;
+  function renderLive() {
+    var d = liveData;
+    if (!d) return;
+    var want = el('f-kind').value, n = d.sessions.length;
+    var shown = d.sessions.filter(function (v) { return !want || (v.match_kind || '?') === want; });
+    el('live').innerHTML = shown.length ? shown.map(function (v) {
+      var players = v.players.map(function (p) {
+        // ("?": the host has no name for it - an older game, or one whose first ping hasn't come; named from the
+        // relay's account for its id when the host sends it, 2.1.6 on - see Relay now)
+        var who = p.name === '?' ? '<span class="note" title="the host has no name for this player: a game before 2.1.0, or one ' +
+          'just joining">? (no name)</span>' : '<button class="linkish" data-player="' + esc(p.name) + '"' +
+          (p.named_by ? ' title="named from its relay account (the host had no name for it)"' : '') + '>' + esc(p.name) +
+          (p.named_by ? '*' : '') + '</button>';
+        return who + (p.path ? ' <span class="tag' + (p.path === 'relay' ? '' : ' on') + '">' + esc(p.path) + '</span>' : '');
+      }).join(', ');
+      return '<tr><td>' + esc(v.host) + (v.version ? ' <span class="tag">' + esc(v.version) + '</span>' : '') +
+        (v.network ? ' <span class="tag">' + esc(v.network) + '</span>' : '') +
+        '</td><td>' + kindBadge(v.match_kind) + '</td><td>' + players + ' <span class="note">' + v.players.length + (v.slots ? '/' + v.slots : '') + '</span></td><td>' +
+        matchCell(v) + '</td><td><span class="tag' + (v.state === 'match' ? ' on' : '') + '">' + esc(v.state) + '</span> ' +
+        dur(d.now - v.state_since) + '</td><td>' + dur(d.now - v.since) + '</td><td class="note">' + esc(v.session) + '</td></tr>';
+    }).join('') : '<tr><td colspan="7" class="empty">' + (n ? 'No ' + (want === '?' ? 'sessions of an unknown kind' : want + ' matches') +
+      ' right now.' : 'No sessions reported right now (games report while they host).') + '</td></tr>';
+  }
+  el('f-kind').addEventListener('change', renderLive);
   var lbView = 1;
-  function lbName(v) {
-    var n = v.name.replace(/^LB_\d+_/, '').replace(/_RANKING$/, '').replace(/_/g, ' ').toLowerCase();
-    return n.charAt(0).toUpperCase() + n.slice(1) + (v.weekly ? ' (weekly)' : '') + ' - ' + v.rows;
-  }
+  function lbName(v) { return (v.label || v.name) + (v.weekly ? ' (weekly)' : '') + ' - ' + v.rows; }
   function leaderboard() {
-    api('api/admin/leaderboard?view=' + lbView + '&count=200').then(function (d) {
+    return api('api/admin/leaderboard?view=' + lbView + '&count=200').then(function (d) {
       var sel = el('lb-view');
-      if (!sel.options.length || sel.options.length !== d.views.length) {
-        sel.innerHTML = d.views.map(function (v) { return '<option value="' + v.id + '">' + esc(lbName(v)) + '</option>'; }).join('');
+      if (sel.options.length !== d.views.length) {
+        sel.innerHTML = d.views.map(function (v) {
+          return '<option value="' + v.id + '" title="' + esc(v.name) + '">' + esc(lbName(v)) + '</option>';
+        }).join('');
       } else {
         d.views.forEach(function (v, i) { sel.options[i].textContent = lbName(v); });
       }
       sel.value = String(lbView);
       var c = function (r, k) { var v = r.columns[k]; return v ? v[1] : 0; };
       el('lb-rows').innerHTML = d.rows.length ? d.rows.map(function (r) {
-        return '<tr><td class="num">' + r.rank + '</td><td>' + esc(r.name || r.xuid) + '</td><td class="num">' + c(r, 2) +
+        return '<tr><td class="num">' + r.rank + '</td><td><button class="linkish" data-player="' + esc(r.name || '') + '">' +
+          esc(r.name || r.xuid) + '</button></td><td class="num">' + c(r, 2) +
           '</td><td class="num">' + r.rating + '</td><td class="num">' + c(r, 3) + '</td><td class="num">' + c(r, 4) +
           '</td><td class="num">' + c(r, 5) + '</td><td class="num">' + c(r, 6) + '</td><td class="num">' + c(r, 7) +
           '</td><td class="num">' + c(r, 8) + '</td></tr>';
@@ -313,50 +953,508 @@ td .tag.bad { color: #ffb4bb; border-color: #5c2a30; }
   }
   el('lb-view').addEventListener('change', function () { lbView = +this.value; leaderboard(); });
 
-  function lists() {
-    leaderboard();
-    api('api/admin/uploads').then(function (d) { uploads = d; renderUploads(); }).catch(function () {});
-    api('api/admin/users').then(function (d) { users = d; renderUsers(); }).catch(function () {});
+  // ---- Community Creations + Discovery
+  function renderUploads() {
+    var f = el('f-up').value.toLowerCase();
+    var rows = uploads.filter(function (u) { return !f || (u.title + ' ' + u.author).toLowerCase().indexOf(f) >= 0; });
+    el('uploads').innerHTML = rows.length ? rows.map(function (u) {
+      return '<tr><td>' + esc(u.title || '(untitled)') +
+        (u.hidden ? ' <span class="tag bad">hidden</span>' : '') + (u.deleted ? ' <span class="tag">deleted</span>' : '') +
+        '</td><td>' + esc(TYPES[u.type] || u.type) + '</td><td>' + esc(u.author) + '</td><td class="num">' + bytes(u.size) +
+        '</td><td class="num">' + u.downloads + '</td><td>' + ago(u.created) + '</td><td class="acts">' +
+        (u.picture ? '<button class="btn" data-view="' + u.id + '">View</button>' : '') +
+        '<button class="btn" data-up="' + u.id + '" data-a="' + (u.hidden ? 'show' : 'hide') + '">' + (u.hidden ? 'Show' : 'Hide') + '</button>' +
+        '<button class="btn danger" data-up="' + u.id + '" data-a="delete">Delete</button></td></tr>';
+    }).join('') : '<tr><td colspan="7" class="empty">No uploads.</td></tr>';
+  }
+  function loadUploads() {
+    return api('api/admin/uploads').then(function (d) { uploads = d; el('n-cc').textContent = d.length; renderUploads(); }).catch(function () {});
+  }
+  function renderMods() {
+    var f = el('f-mod').value.toLowerCase();
+    var rows = mods.filter(function (m) { return !f || (m.name + ' ' + m.author + ' ' + m.tags.join(' ')).toLowerCase().indexOf(f) >= 0; });
+    el('mods').innerHTML = rows.length ? rows.map(function (m) {
+      return '<tr><td>' + esc(m.name) + (m.hidden ? ' <span class="tag bad">hidden</span>' : '') +
+        (m.updated ? ' <span class="tag on" title="file updated by its owner">updated ' + ago(m.updated) + '</span>' : '') +
+        '</td><td>' + esc(m.types.join(', ')) + '</td><td>' + esc(m.author) + '</td><td>' + esc(m.version) +
+        '</td><td class="num">' + bytes(m.size) + '</td><td class="num">' + m.downloads + '</td><td>' + ago(m.created) +
+        '</td><td class="acts"><button class="btn" data-modview="' + m.id + '">View</button>' +
+        '<button class="btn" data-mod="' + m.id + '" data-a="' + (m.hidden ? 'show' : 'hide') + '">' + (m.hidden ? 'Show' : 'Hide') + '</button>' +
+        '<button class="btn danger" data-mod="' + m.id + '" data-a="delete">Delete</button></td></tr>';
+    }).join('') : '<tr><td colspan="8" class="empty">No mods.</td></tr>';
+  }
+  function loadMods() {
+    return api('api/admin/mods').then(function (d) {
+      mods = d.mods; el('n-discovery').textContent = d.total != null ? d.total : d.mods.length; renderMods();
+    }).catch(function () {});
   }
 
+  // ---- the name filter: its list, a test, what is on the server now that it catches
+  var namesDirty = false;
+  function loadNames() {
+    if (namesDirty) return;  // (an unsaved edit: kept)
+    return api('api/admin/names').then(function (d) {
+      el('nf-on').checked = d.enabled;
+      el('nf-words').value = d.words.join('\n');
+      el('nf-allow').value = d.allow.join('\n');
+      el('nf-count').textContent = d.terms + ' word' + (d.terms === 1 ? '' : 's');
+      el('nf-note').innerHTML = d.enabled ? '<span class="tag on">on</span>' : '<span class="tag bad">off</span>';
+    }).catch(function () {});
+  }
+  ['nf-words', 'nf-allow'].forEach(function (id) {
+    el(id).addEventListener('input', function () { namesDirty = true; el('nf-saved').textContent = 'not saved'; });
+  });
+  function saveNames(body, done) {
+    return api('api/admin/names', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                   body: JSON.stringify(body)}).then(function (d) {
+      namesDirty = false;
+      el('nf-saved').textContent = 'saved - in use now';
+      loadNames(); loadFlagged();
+      if (done) done(d);
+    }).catch(function (e) { alert('Not saved: ' + e.message); loadNames(); });
+  }
+  el('nf-save').addEventListener('click', function () {
+    saveNames({words: el('nf-words').value.split('\n'), allow: el('nf-allow').value.split('\n')});
+  });
+  el('nf-on').addEventListener('change', function () {
+    var on = this.checked;
+    if (!on && !confirm('Turn the name filter off? Uploads with any name are let through until it is on again.')) {
+      this.checked = true; return;
+    }
+    saveNames({enabled: on});
+  });
+  function testName() {
+    var t = el('nf-test').value;
+    if (!t.trim()) { el('nf-result').textContent = ''; return; }
+    api('api/admin/names/test', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                 body: JSON.stringify({text: t})}).then(function (d) {
+      el('nf-result').innerHTML = (d.passes ? '<span class="tag on">passes</span>'
+                                            : '<span class="tag bad">refused</span> matched <b>' + esc(d.term) + '</b>') +
+        ' <span class="note">read as: ' + esc(d.readings.join(' / ')) + (namesDirty ? ' (the saved list)' : '') + '</span>';
+    }).catch(function (e) { el('nf-result').textContent = e.message; });
+  }
+  el('nf-try').addEventListener('click', testName);
+  el('nf-test').addEventListener('keydown', function (e) { if (e.key === 'Enter') testName(); });
+  var KINDS = {upload: 'Community Creations', mod: 'Discovery mod', entrance: 'Entrance', account: 'Account'};
+  function loadFlagged() {
+    el('nf-scan').disabled = true;
+    return api('api/admin/names/flagged').then(function (d) {
+      var rows = d.flagged;
+      el('n-names').textContent = rows.length || '';
+      el('nf-flagged').innerHTML = rows.length ? rows.map(function (r) {
+        var acts = '';
+        if (r.kind === 'upload' || (r.kind === 'entrance' && r.id)) {
+          acts = '<button class="btn" data-up="' + r.id + '" data-a="hide">Hide</button>' +
+                 '<button class="btn danger" data-up="' + r.id + '" data-a="delete">Delete</button>';
+        } else if (r.kind === 'mod') {
+          acts = '<button class="btn" data-mod="' + r.id + '" data-a="hide">Hide</button>' +
+                 '<button class="btn danger" data-mod="' + r.id + '" data-a="delete">Delete</button>';
+        } else if (r.kind === 'account') {
+          acts = '<button class="btn" data-user="' + r.id + '" data-a="' + (r.banned ? 'unban' : 'ban') + '">' +
+                 (r.banned ? 'Unban' : 'Ban') + '</button>' +
+                 '<button class="btn danger" data-user="' + r.id + '" data-a="delete">Delete</button>';
+        }
+        return '<tr><td>' + esc(KINDS[r.kind] || r.kind) + ' <span class="note">' + esc(r.field) + '</span>' +
+          (r.title && r.title !== r.text ? '<div class="note">' + esc(r.title) + '</div>' : '') +
+          '</td><td>' + esc(r.text) + '</td><td><span class="mark">' + esc(r.term) + '</span></td><td>' + esc(r.author || '') +
+          '</td><td class="acts">' + acts + '</td></tr>';
+      }).join('') : '<tr><td colspan="5" class="empty">Nothing on the server matches the list.</td></tr>';
+    }).catch(function (e) {
+      el('nf-flagged').innerHTML = '<tr><td colspan="5" class="empty">' + esc(e.message) + '</td></tr>';
+    }).finally(function () { el('nf-scan').disabled = false; });
+  }
+  el('nf-scan').addEventListener('click', loadFlagged);
+
+  // ---- problem reports, grouped by signature (newest group first)
+  var reportRows = [], reportError = '', modStore = null;
+  // (a report's match: the match folder's summary, its zip, the mods with it, and the replay pack of both)
+  function matchRow(r) {
+    var m = r.match, mods = r.mods || [];
+    if (!m && !r.match_size && !mods.length) return '';
+    var line = [];
+    if (m) {
+      var people = (m.people || []).map(function (p) {
+        return esc(p.name) + (p.mod ? ' <span class="tag">mod</span>' : '') + (p.caw ? ' <span class="tag">CAW</span>' : '') +
+          (p.cpu ? ' <span class="note">(CPU)</span>' : '');
+      }).join(' vs ');
+      line.push('<b>Match:</b> ' + (people || '?') + ' &middot; ' + esc(m.rule_name || (m.rule ? 'rule ' + m.rule : '')) +
+        (m.rule ? '<span class="id">' + esc(m.rule) + '</span>' : '') + ' &middot; ' +
+        esc(m.arena_mod ? m.arena_mod + ' (custom)' : m.arena_name || (m.arena ? 'arena ' + m.arena : '')) +
+        (m.version ? ' &middot; ' + esc(m.version) : '') + (m.fps ? ' &middot; ' + esc(m.fps) + ' fps' : '') +
+        (m.online ? ' &middot; online' : '') + (m.result ? ' &middot; ' + esc(m.result) : '') +
+        (m.complete === false ? ' <span class="tag bad">unfinished</span>' : ''));
+    } else if (r.match_size) line.push('<b>Match:</b> <span class="note">no match.json in it</span>');
+    var acts = (r.match_size ? '<a class="btn" href="' + reportFile(r, 'match.zip') + '">Match zip ' + bytes(r.match_size) + '</a>' : '') +
+      ((r.match_size || mods.length) ? '<a class="btn primary" href="api/admin/report/' + encodeURIComponent(r.id) + '/replay.zip">Get replay pack</a>' : '');
+    var modList = mods.map(function (x) {
+      var label = esc(x.name || x.id || x.hash.slice(0, 12)) + (x.type ? ' <span class="note">' + esc(x.type) + '</span>' : '') +
+        ' <span class="note">' + bytes(x.size) + '</span>';
+      return '<span class="modl">' + (x.stored ? '<a href="api/admin/report-mod/' + x.hash + '?name=' + encodeURIComponent(x.id || x.name || 'mod') +
+        '" title="' + esc(x.hash) + '">' + label + '</a>' : '<span title="not sent: ' + esc(x.hash) + '">' + label + ' <span class="tag">not sent</span></span>') + '</span>';
+    }).join('');
+    return '<tr class="match"><td colspan="6">' + line.join('') +
+      (mods.length ? '<div><b>Mods (' + mods.length + '):</b> ' + modList + '</div>' : '') +
+      (acts ? '<div style="margin-top:6px">' + acts + '</div>' : '') + '</td></tr>';
+  }
+  function renderModStore() {
+    var u = modStore, box = el('modstore');
+    if (!u) { box.textContent = ''; return; }
+    var share = u.quota ? u.bytes / u.quota : 0;
+    box.className = 'note' + (share >= 0.8 ? ' warn' : '');
+    box.textContent = 'Report mods: ' + u.count + ' file' + (u.count === 1 ? '' : 's') + ', ' + bytes(u.bytes) + ' of ' +
+      bytes(u.quota) + ' (' + Math.round(share * 100) + '%)' + (share >= 0.8 ? ' - nearly full: delete fixed reports to free space' +
+      (share >= 1 ? '; new reports come without their mods' : '') : '');
+  }
+  function reportFile(r, name) { return 'api/admin/report/' + encodeURIComponent(r.id) + '/' + encodeURIComponent(name); }
+  // (open: not yet dealt with - new, being looked at, waiting for the player's answer, or answered)
+  function rpOpen(r) { return !r.status || r.status === 'looking' || r.status === 'needs_info' || r.status === 'replied'; }
+  function infoRow(r) {
+    if (!r.info) return '';
+    return '<tr class="sub"><td></td><td colspan="5"><b>' + (r.status === 'replied' ? 'Answered' : 'Asked') + ' (' +
+      esc(r.info.date || '') + '):</b> ' + esc(r.info.question || '') + (r.replies ? ' &middot; <a href="' +
+      reportFile(r, 'replies.jsonl') + '" target="_blank" rel="noopener">' + r.replies + ' answer' + (r.replies === 1 ? '' : 's') +
+      '</a> (pictures: reply&lt;n&gt;_&lt;k&gt; files of the report)' : '') + '</td></tr>';
+  }
+  // (the sender's changes - "Edit / add pictures" in their Reports tab: edits.jsonl, read when the row shows)
+  var editCache = {};
+  function editRow(r) {
+    if (!r.edits) return '';
+    return '<tr class="sub"><td></td><td colspan="5"><b>Edited ' + r.edits + ' time' + (r.edits === 1 ? '' : 's') +
+      ' (last ' + esc(r.edited || '') + '):</b> <span class="rp-edits" data-id="' + esc(r.id) + '" data-n="' + r.edits +
+      '">loading\u2026</span></td></tr>';
+  }
+  function editHtml(r, list) {
+    return list.map(function (e, n) {
+      var parts = [];
+      if (e.what) parts.push('<b>What happened +</b> ' + esc(e.what));
+      if (e.before) parts.push('<b>Before +</b> ' + esc(e.before));
+      if (e.contact) parts.push('<b>Contact:</b> ' + esc(e.contact));
+      var pics = (e.images || []).map(function (name) {
+        return '<a href="' + reportFile(r, name) + '" target="_blank" rel="noopener"><img class="thumb" loading="lazy" alt="' +
+          esc(name) + '" src="' + reportFile(r, name) + '" style="height:48px;max-width:96px;object-fit:cover;margin-right:4px;border-radius:3px"></a>';
+      }).join('');
+      return '<div style="margin-top:4px"><span class="note">' + (n + 1) + '. ' + esc(e.date || '') + '</span> ' +
+        parts.join(' &middot; ') + (pics ? '<div>' + pics + '</div>' : '') + '</div>';
+    }).join('');
+  }
+  function loadEdits() {
+    Array.prototype.forEach.call(document.querySelectorAll('.rp-edits'), function (box) {
+      var id = box.getAttribute('data-id'), key = id + '/' + box.getAttribute('data-n');
+      var r = reportRows.filter(function (x) { return x.id === id; })[0];
+      if (!r) return;
+      if (editCache[key]) { box.innerHTML = editHtml(r, editCache[key]); return; }
+      fetch(reportFile(r, 'edits.jsonl'), {credentials: 'same-origin'}).then(function (res) {
+        if (!res.ok) throw new Error(res.status);
+        return res.text();
+      }).then(function (text) {
+        var list = text.split('\n').filter(function (l) { return l.trim(); }).map(function (l) { return JSON.parse(l); });
+        editCache[key] = list;
+        box.innerHTML = editHtml(r, list);
+      }).catch(function () { box.textContent = 'could not read the changes'; });
+    });
+  }
+  function renderReports() {
+    var f = el('f-rp').value.toLowerCase(), open = el('rp-open').checked;
+    var rows = reportRows.filter(function (r) {
+      return (!open || rpOpen(r)) && (!f || [r.app, r.version, r.problem, r.what, r.signature, r.signature_line, r.platform]
+        .join(' ').toLowerCase().indexOf(f) >= 0);
+    });
+    var groups = [], by = {};
+    rows.forEach(function (r) {
+      var g = by[r.signature];
+      if (!g) { g = by[r.signature] = {sig: r.signature, rows: []}; groups.push(g); }
+      g.rows.push(r);
+    });
+    if (reportError) { el('reports').innerHTML = '<p class="empty">' + esc(reportError) + '</p>'; return; }
+    el('reports').innerHTML = groups.length ? groups.map(function (g) {
+      var a = g.rows[0];
+      return '<h3>' + esc(a.problem) + ' <span class="tag">' + esc(a.app) + ' ' + esc(a.version) + '</span> <span class="tag' +
+        (a.count > 1 ? ' bad' : '') + '">' + a.count + ' report' + (a.count === 1 ? '' : 's') + '</span> <span class="id" title="signature">' +
+        esc(g.sig) + '</span></h3>' + (a.signature_line ? '<p class="note"><code>' + esc(a.signature_line) + '</code></p>' : '') +
+        '<div class="scroll"><table><thead><tr><th>Received</th><th>Platform</th><th>Happens</th><th>What happened</th><th>Pictures</th><th></th></tr></thead><tbody>' +
+        g.rows.map(function (r) {
+          var pics = (r.images || []).map(function (n) {
+            return '<a href="' + reportFile(r, n) + '" target="_blank" rel="noopener"><img class="thumb" loading="lazy" alt="' + esc(n) +
+              '" src="' + reportFile(r, n) + '" style="height:48px;max-width:96px;object-fit:cover;margin-right:4px;border-radius:3px"></a>';
+          }).join('');
+          return '<tr><td title="' + esc(r.received) + '">' + ago(r.received_at) + (r.status ? ' <span class="tag' +
+            (r.status === 'replied' ? ' bad' : ' on') + '">' + esc(r.status === 'needs_info' ? 'asked' : r.status) + '</span>' : '') +
+            (r.edits ? ' <span class="tag bad" title="the player changed it after sending - see the row below">edited</span>' : '') +
+            '</td><td>' + esc(r.platform || '') + '</td><td>' + esc(r.happens || '') + '</td><td>' + esc(r.what || '') +
+            (r.account ? ' <span class="note">(' + esc(r.account) + ')</span>' : '') +
+            (r.updater ? '<br><span class="note" title="the last result in logs/updater.log">Updater: ' + esc(r.updater) + '</span>' : '') +
+            '</td><td>' + pics + '</td><td class="acts">' +
+            '<a class="btn" href="' + reportFile(r, 'report.json') + '" target="_blank" rel="noopener">Details</a>' +
+            (r.zip_size ? '<a class="btn" href="' + reportFile(r, 'report.zip') + '">Zip ' + bytes(r.zip_size) + '</a>' : '') +
+            (rpOpen(r) ? (r.status !== 'looking' ? '<button class="btn" data-rp="' + esc(r.id) + '" data-s="looking" ' +
+              'title="the player sees: we\'re looking at it">Looking</button>' : '') +
+              '<button class="btn" data-rp="' + esc(r.id) + '" data-s="needs_info" title="ask the player a question: ' +
+              'their Reports tab shows it and they can answer">Ask\u2026</button>' +
+              '<button class="btn" data-rp="' + esc(r.id) + '" data-s="done">Done</button>' +
+              '<button class="btn" data-rp="' + esc(r.id) + '" data-s="duplicate">Duplicate</button>' : '') +
+            (r.status ? '<button class="btn" data-rp="' + esc(r.id) + '" data-s="">Reopen</button>' : '') +
+            '</td></tr>' + infoRow(r) + editRow(r) + matchRow(r);
+        }).join('') + '</tbody></table></div>';
+    }).join('') : '<p class="empty">No reports' + (open && reportRows.length ? ' left open' : '') + '.</p>';
+    loadEdits();
+  }
+  // "Fixed while you were away": reports marked fixed (reports.py mark ... --fixed), newest fix first
+  function fixedShown() {
+    var f = el('f-rp').value.toLowerCase();
+    return reportRows.filter(function (r) {
+      return r.status === 'fixed' && (!f || [r.app, r.version, r.problem, r.what, r.fix && r.fix.note, r.fix && r.fix.version]
+        .join(' ').toLowerCase().indexOf(f) >= 0);
+    }).sort(function (a, b) {
+      return ((b.fix && b.fix.date) || '').localeCompare((a.fix && a.fix.date) || '') || b.received_at - a.received_at;
+    });
+  }
+  function renderFixed() {
+    var rows = fixedShown(), box = el('fixed');
+    box.hidden = !rows.length;
+    if (!rows.length) { box.innerHTML = ''; return; }
+    box.innerHTML = '<h3>Fixed while you were away <span class="tag on">' + rows.length + '</span><span class="spacer"></span>' +
+      '<button class="btn danger" data-fxall>Delete all shown</button></h3>' +
+      rows.map(function (r) {
+        var x = r.fix || {}, what = r.what || '';
+        if (what.length > 160) what = what.slice(0, 157) + '…';
+        var pics = (r.images || []).map(function (n) {
+          return '<a href="' + reportFile(r, n) + '" target="_blank" rel="noopener"><img loading="lazy" alt="' + esc(n) +
+            '" src="' + reportFile(r, n) + '"></a>';
+        }).join('');
+        return '<div class="fx"><div><strong>' + esc(r.problem) + '</strong> <span class="tag">' + esc(r.app) + ' ' + esc(r.version) + '</span>' +
+          (what ? '<p class="what">' + esc(what) + '</p>' : '') +
+          '<p class="how"><b>Fixed:</b> ' + esc(x.note || '(no note)') + '</p>' +
+          '<div class="meta">' + (x.version ? 'Ships in <strong>' + esc(x.version) + '</strong>' : 'Version not set') +
+          (x.commit ? ' &middot; commit <code>' + esc(x.commit) + '</code>' : '') + (x.date ? ' &middot; ' + esc(x.date) : '') +
+          ' &middot; reported <span title="' + esc(r.received) + '">' + ago(r.received_at) + '</span></div>' +
+          (pics ? '<div class="pics">' + pics + '</div>' : '') + '</div>' +
+          '<div class="acts"><a class="btn" href="' + reportFile(r, 'report.json') + '" target="_blank" rel="noopener">Details</a>' +
+          '<button class="btn danger" data-fxdel="' + esc(r.id) + '">Delete</button></div></div>';
+      }).join('');
+  }
+  function deleteReports(ids) {
+    return ids.reduce(function (p, id) {
+      return p.then(function () { return api('api/admin/report/' + encodeURIComponent(id) + '/delete', {method: 'POST'}); });
+    }, Promise.resolve()).then(loadReports, loadReports);
+  }
+  // (a Delete asks in place: the first click turns it into "Delete for good?", a second within 5 s deletes)
+  el('fixed').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-fxdel],[data-fxall]');
+    if (!b) return;
+    if (!b.dataset.armed) {
+      b.dataset.armed = '1'; b.dataset.label = b.textContent;
+      b.textContent = b.hasAttribute('data-fxall') ? 'Delete ' + fixedShown().length + ' for good?' : 'Delete for good?';
+      setTimeout(function () { if (b.isConnected && b.dataset.armed) { delete b.dataset.armed; b.textContent = b.dataset.label; } }, 5000);
+      return;
+    }
+    b.disabled = true;
+    deleteReports(b.hasAttribute('data-fxall') ? fixedShown().map(function (r) { return r.id; }) : [b.getAttribute('data-fxdel')]);
+  });
+  function loadReports() {
+    return api('api/admin/reports').then(function (d) {
+      reportRows = d.reports || []; reportError = ''; modStore = d.mod_store || null; renderModStore();
+      el('n-reports').textContent = reportRows.filter(function (r) { return !r.status || r.status === 'replied'; }).length || '';
+      if (current === 'reports') { renderFixed(); renderReports(); }
+    }).catch(function (e) { reportError = 'The reports could not be loaded (' + e.message + ').'; if (current === 'reports') renderReports(); });
+  }
+  el('reports').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-rp]');
+    if (!b) return;
+    var status = b.getAttribute('data-s'), body = {status: status};
+    if (status === 'needs_info') {  // (the question the player sees - plain words, they answer in their Reports tab)
+      var q = window.prompt('The question for the player (their Reports tab shows "We need more information: ..."):');
+      if (!q || !q.trim()) return;
+      body.fix = {question: q.trim()};
+    }
+    b.disabled = true;
+    api('api/admin/report/' + encodeURIComponent(b.getAttribute('data-rp')) + '/mark', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    }).then(loadReports).catch(function () { b.disabled = false; });
+  });
+  el('f-rp').addEventListener('input', function () { renderFixed(); renderReports(); });
+  el('rp-open').addEventListener('change', renderReports);
+
+  // ---- the storage audit (Discovery tab): orphans on the node, hidden mods, missing files
+  function auditRow(f, act) {
+    return '<tr><td><span class="id" title="' + esc(f.sha) + '">' + esc(f.sha.slice(0, 16)) + '</span></td><td>' +
+      esc(f.what || f.name || f.kind || '') + '</td><td class="num">' + (f.size != null ? bytes(f.size) : '') + '</td><td>' +
+      (f.packed ? '<span class="tag">xz</span>' : '') + '</td><td>' + (f.mtime ? ago(f.mtime) : '') + '</td><td class="acts">' + (act || '') + '</td></tr>';
+  }
+  function audit() {
+    el('audit-note').textContent = 'Running…';
+    return api('api/admin/blobs/audit').then(function (d) {
+      el('audit-note').textContent = d.files + ' files, ' + bytes(d.bytes) + ' (' + d.packed + ' packed) · ' + d.referenced +
+        ' referenced · ' + d.orphans.length + ' orphans (' + bytes(d.orphan_bytes) + ') · ' + d.missing.length + ' missing';
+      var head = '<thead><tr><th>Blob</th><th>What</th><th class="num">Size</th><th></th><th>File date</th><th></th></tr></thead>';
+      el('audit').innerHTML =
+        '<h2>Orphans</h2><div class="scroll"><table>' + head + '<tbody>' + (d.orphans.length ? d.orphans.map(function (f) {
+          return auditRow(f, '<button class="btn danger" data-blob="' + f.sha + '">Delete</button>');
+        }).join('') : '<tr><td colspan="6" class="empty">No orphans.</td></tr>') + '</tbody></table></div>' +
+        '<h2>Hidden mods</h2><div class="scroll"><table>' + head + '<tbody>' + (d.hidden_mods.length ?
+          d.hidden_mods.map(function (f) { return auditRow(f); }).join('') :
+          '<tr><td colspan="6" class="empty">No hidden mods.</td></tr>') + '</tbody></table></div>' +
+        (d.missing.length ? '<h2>Missing (referred to, no file)</h2><div class="scroll"><table>' + head + '<tbody>' +
+          d.missing.map(function (f) { return auditRow(f); }).join('') + '</tbody></table></div>' : '');
+    }).catch(function (e) { el('audit-note').textContent = 'Audit failed: ' + e.message; });
+  }
+  el('audit-run').addEventListener('click', audit);
   document.addEventListener('click', function (e) {
-    if (e.target.closest('#viewer')) { el('viewer').classList.remove('on'); return; }
+    var b = e.target.closest('[data-blob]');
+    if (!b) return;
+    if (!confirm('Delete this orphan file from the storage for good? Nothing refers to it.')) return;
+    b.disabled = true;
+    api('api/admin/blobs/' + b.dataset.blob + '/delete', {method: 'POST'}).then(audit)
+      .catch(function (err) { alert(err.message); b.disabled = false; });
+  });
+
+  // ---- settings + log
+  var settingsList = [];
+  function settings() {
+    api('api/admin/settings').then(function (d) {
+      settingsList = d.settings;
+      el('settings').innerHTML = d.settings.map(function (x) {
+        var id = 'set-' + x.key;
+        var input = typeof x.default === 'boolean'
+          ? '<input type="checkbox" id="' + id + '" data-set="' + x.key + '"' + (x.saved ? ' checked' : '') + '>'
+          : x.text ? '<textarea class="filter" id="' + id + '" data-set="' + x.key + '" maxlength="' + x.max_len + '">' + esc(x.saved) +
+            '</textarea>'
+          : x.choices ? '<select class="filter" id="' + id + '" data-set="' + x.key + '">' + x.choices.map(function (c) {
+              return '<option' + (c === x.saved ? ' selected' : '') + '>' + esc(c) + '</option>';
+            }).join('') + '</select>'
+          : '<input class="filter" type="number" id="' + id + '" data-set="' + x.key + '" min="' + x.min + '" max="' + x.max + '" value="' + x.saved + '">';
+        return '<label for="' + id + '"><b>' + esc(x.key.replace(/_/g, ' ')) + '</b></label>' + input + (x.text ? '<span></span>' : '') +
+          '<span class="h' + (x.text ? ' wide' : '') + '">' + esc(x.help) +
+          (x.live ? '' : ' (applies at the next start' + (x.value !== x.saved ? ': now ' + x.value : '') + ')') + '</span>';
+      }).join('');
+      el('restart').disabled = !d.supervised;
+      el('restart').title = d.supervised ? '' : 'No supervisor runs this server (--supervise): it would stay down.';
+    }).catch(function (e) { el('settings').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; });
+  }
+  function log() {
+    return api('api/admin/log?lines=' + el('n-log').value + '&filter=' + encodeURIComponent(el('f-log').value)).then(function (d) {
+      var box = el('log'), atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+      box.textContent = d.lines.join('\n') || '(nothing matches)';
+      if (atEnd) box.scrollTop = box.scrollHeight;
+    }).catch(function (e) { el('log').textContent = e.message; });
+  }
+  el('save-set').addEventListener('click', function () {
+    var body = {};
+    document.querySelectorAll('[data-set]').forEach(function (i) {
+      body[i.dataset.set] = i.type === 'checkbox' ? i.checked : i.tagName === 'SELECT' || i.tagName === 'TEXTAREA' ? i.value : Number(i.value);
+    });
+    function save() {
+      api('api/admin/settings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+        .then(function () { el('set-note').textContent = 'Saved ' + new Date().toLocaleTimeString(); settings(); })
+        .catch(function (e) { el('set-note').textContent = 'Not saved: ' + e.message; });
+    }
+    var was = (settingsList.filter(function (x) { return x.key === 'account_checks'; })[0] || {}).saved;
+    if (body.account_checks !== 'on' || was === 'on') return save();
+    api('api/admin/checks').then(function (d) {
+      if (confirm('Turn account checks ON? At once:\n- ' + d.would_block + ' of ' + d.accounts + ' accounts are kept off ' +
+                  'online until their re-activation code (make them on the Players tab first);\n- new accounts need ' +
+                  'a sign-up code, and 2.1.5 launchers are told to update to 2.1.6.')) save();
+    }).catch(function (e) { el('set-note').textContent = 'Not saved: ' + e.message; });
+  });
+  el('restart').addEventListener('click', function () {
+    if (!confirm('Restart the online service? Players in the menus are back in seconds; matches in progress keep playing (P2P), relayed ones may drop.')) return;
+    api('api/admin/restart', {method: 'POST'}).then(function () {
+      el('set-note').textContent = 'Restarting…';
+    }).catch(function (e) { el('set-note').textContent = 'Not restarted: ' + e.message; });
+  });
+  el('r-log').addEventListener('click', log);
+  el('f-log').addEventListener('change', log);
+  el('n-log').addEventListener('change', log);
+
+  // ---- buttons in the tables, the picture viewer, the history range
+  function closeViewer() { el('viewer').classList.remove('on'); }
+  function openViewer(src, fallback, cap) {
+    var img = el('v-img');
+    img.onerror = fallback ? function () { img.onerror = null; img.src = fallback; } : null;
+    img.src = src;
+    el('v-cap').innerHTML = cap;
+    el('viewer').classList.add('on');
+  }
+  document.addEventListener('click', function (e) {
+    if (e.target.closest('#viewer')) { closeViewer(); return; }
     var b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.view) {
       var u = uploads.filter(function (x) { return String(x.id) === b.dataset.view; })[0] || {};
-      var img = el('v-img');
-      img.onerror = function () { img.onerror = null; img.src = 'api/admin/upload/' + b.dataset.view + '/thumb.png'; };
-      img.src = 'api/admin/upload/' + b.dataset.view + '/full.png';
-      el('v-cap').innerHTML = esc(u.title || '(untitled)') + '<small>' + esc(TYPES[u.type] || '') + ' by ' +
-        esc(u.author || '') + ' &middot; tap to close</small>';
-      el('viewer').classList.add('on');
+      openViewer('api/admin/upload/' + b.dataset.view + '/full.png', 'api/admin/upload/' + b.dataset.view + '/thumb.png',
+        esc(u.title || '(untitled)') + '<small>' + esc(TYPES[u.type] || '') + ' by ' + esc(u.author || '') + ' &middot; tap or Esc to close</small>');
+      return;
+    }
+    if (b.dataset.modview) {
+      var m = mods.filter(function (x) { return String(x.id) === b.dataset.modview; })[0] || {};
+      openViewer('api/admin/mod/' + b.dataset.modview + '/image.jpg', null,
+        esc(m.name || '') + '<small>' + esc((m.types || []).join(', ')) + ' by ' + esc(m.author || '') + ' &middot; tap or Esc to close</small>');
       return;
     }
     if (b.dataset.r) {
       range = b.dataset.r;
-      document.querySelectorAll('#range button').forEach(function (x) { x.classList.toggle('on', x === b); });
+      document.querySelectorAll('#range button').forEach(function (x) { x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
       stats(); return;
     }
-    var a = b.dataset.a, what = b.dataset.up ? 'upload' : b.dataset.user ? 'user' : null;
+    var a = b.dataset.a, what = b.dataset.up ? 'upload' : b.dataset.user ? 'user' : b.dataset.mod ? 'mod' : null;
     if (!what) return;
-    var id = b.dataset.up || b.dataset.user;
-    if (a === 'delete' && !confirm(what === 'user' ? 'Delete this account and everything it uploaded?' : 'Delete this upload?')) return;
+    var id = b.dataset.up || b.dataset.user || b.dataset.mod;
+    if (a === 'delete' && !confirm(what === 'user' ? 'Delete this account and everything it uploaded?' :
+                                   what === 'mod' ? 'Delete this mod from Discovery?' : 'Delete this upload?')) return;
     if (a === 'reset' && !confirm('Give this account a new random password? Its sessions are signed out.')) return;
+    if (a === 'reactivation-code' && !confirm('Make a re-activation code for this account? It shows once; an older one ' +
+                                             'it had stops working.')) return;
+    if (a === 'activate' && !confirm('Let this account play online without a re-activation code?')) return;
+    if (a === 'reset-code' && !confirm('Make a password reset code for this account? It shows once, works once for 24 ' +
+                                      'hours (an older one stops working); the new password ends all its sessions.')) return;
+    var opts = {method: 'POST'};
     b.disabled = true;
-    api('api/admin/' + what + '/' + id + '/' + a, {method: 'POST'}).then(function (r) {
+    api('api/admin/' + what + '/' + id + '/' + a, opts).then(function (r) {
       if (r.password) prompt('New password (give it to the player):', r.password);
-      lists(); stats();
+      if (r.code) prompt(a === 'reset-code' ? 'Reset code (shown once - give it to the player: Forgot password in the ' +
+                                              'launcher, with a new password; 24 hours):'
+                                            : 'Re-activation code (shown once - give it to the player; it works for this ' +
+                                              'account only):', r.code);
+      (what === 'user' ? loadUsers : what === 'mod' ? loadMods : loadUploads)();
+      if (current === 'names') loadFlagged();
+      if (current === 'matches') live();
     }).catch(function (err) { alert(err.message); b.disabled = false; });
   });
   el('f-up').addEventListener('input', renderUploads);
+  el('f-mod').addEventListener('input', renderMods);
   el('f-acc').addEventListener('input', renderUsers);
   window.addEventListener('resize', charts);
-  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') el('viewer').classList.remove('on'); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeViewer(); });
 
-  stats(); lists();
-  setInterval(stats, 5000);
-  setInterval(lists, 30000);
+  if (csrf) {  // (signed in under /svr-admin/)
+    el('signout').hidden = false;
+    el('signout').addEventListener('click', function () {
+      fetch('logout', {method: 'POST', headers: {'X-CSRF-Token': csrf.content}})
+        .finally(function () { location.href = 'login'; });
+    });
+  }
+
+  setTheme(store('svr-theme') || 'auto');
+  var first = location.hash.slice(1);
+  show(el('tab-' + first) ? first : store('svr-tab') || 'overview');
+  // (the counts on the tabs keep up; the open tab refreshes its own part)
+  if (current !== 'ping') pings();
+  if (current !== 'overview' && current !== 'matches') live();
+  if (current !== 'overview') stats();
+  if (current !== 'discovery') loadMods();
+  if (current !== 'reports') loadReports();
+  setInterval(function () { if (current === 'overview') stats(); }, 5000);
+  setInterval(function () { if (current === 'overview') node(); }, 15000);
+  setInterval(function () { if (current === 'overview' || current === 'matches') live(); }, 5000);
+  setInterval(function () { if (current === 'ping') pings(); }, 10000);
+  setInterval(function () { if (current !== 'ping') pings(); if (current !== 'overview' && current !== 'matches') live(); }, 30000);
+  setInterval(function () { if (current === 'logs') log(); }, 15000);
+  setInterval(function () {
+    if (current === 'players') loadUsers();
+    else if (current === 'matches') leaderboard();
+    else if (current === 'cc') loadUploads();
+    else if (current === 'discovery') loadMods();
+    else if (current === 'reports') loadReports();
+  }, 30000);
 })();
 </script>
 </body>

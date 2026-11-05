@@ -13,9 +13,11 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <d3d11.h>
 #include <wrl/client.h>
 
 #include <plume_d3d12.h>
+#include "../util.h"
 
 namespace plume {
 std::unique_ptr<RenderInterface> CreateD3D12Interface();  // (plume_d3d12.cpp; no header declares it)
@@ -53,16 +55,7 @@ ID3D12Device* Native(plume::RenderDevice* device) {
   return device ? static_cast<plume::D3D12Device*>(device)->d3d : nullptr;
 }
 
-bool EnvFlag(const char* name) {
-  char* v = nullptr;
-  size_t n = 0;
-  bool on = false;
-  if (_dupenv_s(&v, &n, name) == 0 && v) {
-    on = v[0] == '1';
-    free(v);
-  }
-  return on;
-}
+using svr2011::EnvFlag;
 
 }  // namespace
 
@@ -76,6 +69,12 @@ std::unique_ptr<plume::RenderInterface> CreateInterface(std::string* device_name
       dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
       dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
     }
+  }
+  // (debug: SVR2011_NATIVE_D3D_DEBUG - the debug layer, its messages logged by DrainDebugMessages; needs Windows'
+  // Graphics Tools)
+  if (EnvFlag("SVR2011_NATIVE_D3D_DEBUG")) {
+    ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
   }
   if (auto* emulator = static_cast<ID3D12Device*>(rex::external_frame::Device())) {
     ComPtr<IDXGIFactory6> factory;
@@ -300,5 +299,38 @@ class D3D12Backend final : public Backend {
 }  // namespace
 
 std::unique_ptr<Backend> CreateD3D12Backend() { return std::make_unique<D3D12Backend>(); }
+
+
+// The adapter the emulator's device is on (by its LUID: the D3D12 device's, or the D3D11 device's DXGI adapter), its
+// local (dedicated) memory use and budget.
+bool DxgiVideoMemory(uint64_t* used, uint64_t* budget) {
+  static std::mutex mutex;
+  static Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
+  static bool tried = false;
+  std::lock_guard lock(mutex);
+  if (!tried) {
+    tried = true;
+    LUID luid = {};
+    bool have = false;
+    if (ActiveApi() == Api::kD3D11) {
+      if (const rex::external_frame::D3D11Device* d = rex::external_frame::GetD3D11Device()) {
+        Microsoft::WRL::ComPtr<IDXGIDevice> dx;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> a;
+        DXGI_ADAPTER_DESC desc = {};
+        if (SUCCEEDED(static_cast<ID3D11Device*>(d->device)->QueryInterface(IID_PPV_ARGS(&dx))) && SUCCEEDED(dx->GetAdapter(&a)) &&
+            SUCCEEDED(a->GetDesc(&desc)))
+          luid = desc.AdapterLuid, have = true;
+      }
+    } else if (auto* d12 = static_cast<ID3D12Device*>(rex::external_frame::Device())) {
+      luid = d12->GetAdapterLuid(), have = true;
+    }
+    Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
+    if (have && SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter));
+  }
+  DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+  if (!adapter || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) return false;
+  *used = info.CurrentUsage, *budget = info.Budget;
+  return true;
+}
 
 }  // namespace svr2011::native::backend

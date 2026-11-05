@@ -44,6 +44,7 @@ namespace {
 std::filesystem::path g_dir;
 std::atomic<bool> g_reported{false};
 void (*g_hook)() = nullptr;
+void (*g_text_hook)(FILE*) = nullptr;
 constexpr int kSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
 struct sigaction g_previous[sizeof(kSignals) / sizeof(kSignals[0])];
 
@@ -155,6 +156,7 @@ void Report(int sig, siginfo_t* info, void* ucontext) {
                   thread->thread_id(), uint32_t(c.lr), c.ctr.u32, c.r1.u32, c.r3.u32, c.r4.u32, c.r5.u32);
     Line(f, buf);
   }
+  if (f && g_text_hook) g_text_hook(f);
   if (f) std::fclose(f);
   REXLOG_ERROR("crash: report in {}", text.string());
   rex::FlushLogging();
@@ -182,6 +184,15 @@ void OnSignal(int sig, siginfo_t* info, void* ucontext) {
 }  // namespace
 
 void SetCrashHook(void (*hook)()) { g_hook = hook; }
+void SetCrashTextHook(void (*hook)(FILE*)) { g_text_hook = hook; }
+
+void ReclaimCrashSignals() {
+  struct sigaction sa = {};
+  sa.sa_sigaction = OnSignal;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  for (int sig : kSignals) sigaction(sig, &sa, nullptr);
+}
 
 void InstallCrashReporter(const std::filesystem::path& dir) {
   g_dir = dir;

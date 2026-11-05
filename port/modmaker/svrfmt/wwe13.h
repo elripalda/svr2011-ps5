@@ -12,6 +12,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,35 @@ std::string RelightByRole13(const std::string& text, const std::map<uint32_t, st
 std::string ConvertVisTree13(const std::string& text, float scale);
 // Crowd seat files of the nested crowd pack (cm -> 10 cm).
 std::string ConvertCrowdText13(const std::string& text, float scale);
+
+// ---- lights (entry 0x7530, the arena's light sets)
+// A set's levels: ground / sky colour (y 0 / 1; 1.0 = full, -1 none) and
+// whether one of its directional lights (y 10-13) has colour.
+struct LightLevel {
+  float ground = -1, sky = -1;
+  bool directional = false, found = false;
+};
+LightLevel LightLevelOf(const Bytes& bank, int id);
+// Sets 10-14 light the wrestlers and the ring in a match (the entrance's
+// light zones switch to 200-202): SvR2011's ground colour there is 0.78,
+// WWE '12 / '13 / 2K14's 0.14 (their lighting model is another) - a match
+// far darker than the entrance. Set 100 lights every model without l(n);
+// WWE '12 / '13 / 2K14's has neither directional light nor much ambient
+// (0.39 + 0.12; RAW 0.79 + 0.79, stock bg67 1.06 + 0.53 without directional
+// light): those parts are flat and dark.
+// -> the sets of `bank` to take from SvR2011's RAW.
+constexpr float kDarkMatchGround = 0.4f, kDarkDefaultAmbient = 1.0f;
+std::set<int> DarkLightSets(const Bytes& bank);
+// `bank` with the sets `ids` taken from `host` (the others kept) -> the ids replaced.
+Bytes ReplaceLightSets(const Bytes& bank, const Bytes& host, const std::set<int>& ids,
+                       std::vector<int>* replaced = nullptr);
+
+// The announce tables' lid (SvR2011 puts set 0x192's ji_top on it): WWE '13's
+// ji_top is the black cloth its separate desk (ji_desk) covers, so on
+// SvR2011's table the whole lid shows black. A dark ji_top is tinted with the
+// desk's colour (mid grey without a brighter ji_desk), its grain and logo
+// kept -> pictures changed (0: none dark).
+int LiftTableLids(Arena& a);
 
 // ---- the whole arena
 struct Wwe13Options {

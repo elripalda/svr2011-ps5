@@ -9,10 +9,17 @@
 // at once too), and LANGUAGE.
 
 #include "frame_rate.h"
+#include "free_cam.h"
 #include "graphics_page.h"
+#include "cpu_difficulty.h"
+#include "display_modes.h"
+#include "arena_lights.h"
 #include "port_map.h"
 #include "backgrounds_page.h"
+#include "report_page.h"
+#include "weapons_page.h"
 #include "mystery_opponent.h"
+#include "vs_styles.h"
 
 #include <algorithm>
 #include <array>
@@ -57,15 +64,13 @@ using Clock = std::chrono::steady_clock;
 
 struct Resolution {
   int w, h;
-  const char* label;
+  std::string label;
 };
-// Window sizes (the render scale follows the window: native_renderer.cpp).
-constexpr Resolution kResolutions[] = {
-    {854, 480, "854 X 480"},     {1280, 720, "1280 X 720"},   {1600, 900, "1600 X 900"},   {1920, 1080, "1920 X 1080"},
-    {2560, 1440, "2560 X 1440"}, {3840, 2160, "3840 X 2160"},
-};
-constexpr int kNumResolutions = int(std::size(kResolutions));
-constexpr int kDefaultResolution = 3;  // (1920 x 1080)
+// Window sizes (the render scale follows the window: native_renderer.cpp):
+// the ones the screen reports to Windows (display_modes.h - 5K, 8K and
+// ultrawide sizes where the screen has them), else this fixed list.
+constexpr int kFixedResolutions[][2] = {{854, 480}, {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
+std::vector<Resolution> g_resolutions;
 // GRAPHICS -> RENDER RESOLUTION: native_max_scale (AUTO: follow the window,
 // up to 4x; the phone's screen is the window), and below the Xbox 360's 720p
 // native_render_scale (360P / 480P: the scene smaller, scaled up); between
@@ -76,9 +81,12 @@ struct Scale {
   int height;  // (native_scene_height; 0: off)
   const char* label;
 };
-constexpr Scale kScales[] = {{4, 1.0, 0, "AUTO"},       {1, 0.5, 0, "360P"},     {1, 2.0 / 3.0, 0, "480P"},
+// (AUTO: up to 8x - 4320 lines, an 8K screen; saves from before it say 4,
+// which the renderer reads as AUTO too. 2880P / 4320P: 4x / 6x exactly.)
+constexpr Scale kScales[] = {{8, 1.0, 0, "AUTO"},       {1, 0.5, 0, "360P"},     {1, 2.0 / 3.0, 0, "480P"},
                              {1, 1.0, 0, "720P (XBOX 360)"}, {2, 1.0, 900, "900P"}, {2, 1.0, 1080, "1080P"},
-                             {2, 1.0, 0, "1440P"},       {3, 1.0, 0, "2160P"}};
+                             {2, 1.0, 0, "1440P"},       {3, 1.0, 0, "2160P"},  {4, 1.0, 2880, "2880P"},
+                             {6, 1.0, 4320, "4320P (8K)"}};
 constexpr int kNumScales = int(std::size(kScales));
 // GRAPHICS -> TEXTURES: native_texture_quality (MEDIUM / LOW: big textures
 // from the game's own half / quarter size mipmaps - native/textures.h).
@@ -109,25 +117,34 @@ enum Row {
   kFastStart,                                                    // DISPLAY (last)
   kPing,                                                         // DISPLAY
   kRouterPort,                                                   // DISPLAY
+  kArenaBrightness,                                              // GRAPHICS
+  kOverlayCorner,                                                // DISPLAY (after PERFORMANCE)
+  kUpscaling,                                                    // GRAPHICS (after ANTI-ALIASING)
+  kCawLimits,                                                    // DISPLAY (last: caw_limits.cpp)
+  kMatchCamera,                                                  // DISPLAY (free_cam.h)
+  kMatFix,                                                       // GRAPHICS (after ARENA BRIGHTNESS)
+  kVsStyle,                                                      // GRAPHICS (after RING MAT: vs_styles.h)
+  kCpuPreset, kCpuReversal, kCpuRates, kCpuDamage, kCpuPin, kCpuMomentum,  // CPU (cpu_difficulty.h)
 };
 // FRAME RATE (frame_rate.h): the choices.
 constexpr int kFrameRates[] = {30, 60};
 constexpr int kNumFrameRates = 2;
-enum Tab { kDisplayTab, kGraphicsTab, kAdvancedTab, kTabs };
-const char* kTabNames[kTabs] = {"DISPLAY", "GRAPHICS", "ADV. GRAPHICS"};
+enum Tab { kDisplayTab, kGraphicsTab, kAdvancedTab, kCpuTab, kTabs };
+const char* kTabNames[kTabs] = {"DISPLAY", "GRAPHICS", "ADV. GRAPHICS", "CPU"};
 #if defined(__PROSPERO__)
 // [ps5 port] (the TV is the window: no window size or mode; one renderer; no touch)
-const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kFpsCounter, kReplays, kFastStart},
+const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kFpsCounter, kOverlayCorner, kMatchCamera, kReplays, kFastStart, kCawLimits},
 #elif defined(__ANDROID__)
 // (the phone: the window is the screen - no window size or mode)
 // (no RENDERER row: the phone draws natively on Vulkan, its only graphics API)
-const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kFpsCounter, kPing, kRouterPort, kTouch, kReplays, kFastStart},
+const std::vector<Row> kTabRowsAll[kTabs] = {{kFrameRate, kFullSpeed, kVsync, kFpsCounter, kOverlayCorner, kMatchCamera, kPing, kRouterPort, kTouch, kReplays, kFastStart, kCawLimits},
 #else
-const std::vector<Row> kTabRowsAll[kTabs] = {{kResolution, kDisplay, kFrameRate, kFullSpeed, kVsync, kFpsCounter, kPing, kRouterPort, kRenderer, kTouch,
-                                              kReplays, kCpuPriority, kFastStart},
+const std::vector<Row> kTabRowsAll[kTabs] = {{kResolution, kDisplay, kFrameRate, kFullSpeed, kVsync, kFpsCounter, kOverlayCorner, kMatchCamera, kPing, kRouterPort, kRenderer, kTouch,
+                                              kReplays, kCpuPriority, kFastStart, kCawLimits},
 #endif
-                                             {kRenderScale, kAntiAliasing, kTextureQuality, kWide, kCutsceneFps},
-                                             {kCrowd, kShadows, kEffects, kDof, kMotionBlur, kSoft, kPrepare}};
+                                             {kRenderScale, kAntiAliasing, kUpscaling, kTextureQuality, kArenaBrightness, kMatFix, kVsStyle, kWide, kCutsceneFps},
+                                             {kCrowd, kShadows, kEffects, kDof, kMotionBlur, kSoft, kPrepare},
+                                             {kCpuPreset, kCpuReversal, kCpuRates, kCpuDamage, kCpuPin, kCpuMomentum}};
 // SHADOWS: only with the renderer's native_shadows setting.
 bool HasShadows() {
   static const bool has = !rex::cvar::GetFlagByName("native_shadows").empty();
@@ -138,7 +155,8 @@ const std::vector<Row>& TabRows(int tab) {
     std::array<std::vector<Row>, kTabs> r;
     for (int t = 0; t < kTabs; ++t)
       for (Row id : kTabRowsAll[t])
-        if (id != kShadows || HasShadows()) r[t].push_back(id);
+        if ((id != kShadows || HasShadows()) && (id != kVsStyle || !svr2011::VsStyles().empty()))
+          r[t].push_back(id);
     return r;
   }();
   return rows[tab];
@@ -386,22 +404,31 @@ class GraphicsPage final : public rex::ui::ImGuiDialog {
   int tab_ = kDisplayTab;
   int mode_ = kGraphicsMode;  // (Mode)
   int row_ = 0;  // (in the tab)
-  int resolution_ = kDefaultResolution;
+  int resolution_ = 0;
   int scale_ = 0;  // (kScales)
   int textures_ = 0;  // (kTextureQualities)
+  int brightness_ = 100;  // ARENA BRIGHTNESS, percent (arena_lights.h)
   bool touch_ = false;  // the on-screen controller
   bool wide_ = true;    // matches as wide as the screen
   bool dof_ = true, blur_ = true, soft_ = false, replays_ = true;  // depth of field, motion blur (post_effects.cpp)
+  bool caw_no_limits_ = true;  // CAW LIMITS: OFF (the port's) / STOCK (caw_limits.cpp)
   int fast_start_ = 0;  // FAST START (fast_start.h): bit 0 skip_intros, bit 1 skip_training
   bool prepare_ = true;  // the known pipelines built ahead in the menus
   bool crowd_ = true, crowd_at_start_ = true;  // arena_crowd (read when the game starts)
   bool shadows_ = true;  // native_shadows
+  bool mat_fix_ = true;  // native_mat_fix
+  int vs_style_ = 0;      // vs_style: 0 2011's, k the k-th installed style (vs_styles.h)
   int language_ = 0;    // kLanguages index (saved; applies at the next start)
   int language_at_start_ = 0;
   int aa_ = 1;  // anti-aliasing level: 1 off, 2-4 supersampling per side
+  // UPSCALING: 0 off, 1-4 FSR 1, 5-8 FSR 2 (experimental: Direct3D 12 / Vulkan), 9-12 DLSS (experimental: NVIDIA
+  // RTX, Direct3D 12) - native_upscale_quality 0-3 (ultra quality .. performance)
+  int upscale_ = 0;
   bool ping_ = true;
   bool router_port_ = true;
-  bool fps_ = true, vsync_ = true, native_ = true, full_speed_ = true;
+  svr2011::CpuTuning cpu_;  // (the CPU tab)
+  int perf_ = 1, corner_ = 0;  // (PERFORMANCE: 0 off, 1 the frame rate, 2 everything; its corner)
+  bool vsync_ = true, native_ = true, full_speed_ = true;
   bool high_priority_ = false;  // (process_priority 1: above normal, perf_hooks.cpp)
   int display_ = kWindowed;  // (DisplayMode)
   bool effects_ = true, fps60_ = true;
@@ -427,13 +454,46 @@ class GraphicsPage final : public rex::ui::ImGuiDialog {
 void GraphicsPage::Load() {
   const int w = rex::cvar::Query<int32_t>("window_width");
   const int h = rex::cvar::Query<int32_t>("window_height");
-  resolution_ = kDefaultResolution;
-  for (int i = 0; i < kNumResolutions; ++i) {
-    if (kResolutions[i].w == w && kResolutions[i].h == h) resolution_ = i;
+  {
+    std::vector<svr2011::DisplaySize> sizes;
+#if defined(_WIN32)
+    sizes = svr2011::DisplaySizes(GameWindow());
+#endif
+    const bool fixed = sizes.empty();
+    if (fixed)
+      for (const auto& f : kFixedResolutions) sizes.push_back({f[0], f[1]});
+    // (the saved size, when the list doesn't have it: kept as a choice)
+    if (w >= 640 && h >= 360 &&
+        std::none_of(sizes.begin(), sizes.end(), [&](const svr2011::DisplaySize& d) { return d.w == w && d.h == h; }))
+      sizes.push_back({w, h});
+    std::sort(sizes.begin(), sizes.end(), [](const auto& a, const auto& b) {
+      return int64_t(a.w) * a.h != int64_t(b.w) * b.h ? int64_t(a.w) * a.h < int64_t(b.w) * b.h : a.w < b.w;
+    });
+    g_resolutions.clear();
+    for (const auto& d : sizes) g_resolutions.push_back({d.w, d.h, std::to_string(d.w) + " X " + std::to_string(d.h)});
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      std::string list;
+      for (const auto& r : g_resolutions) list += (list.empty() ? "" : ", ") + r.label;
+      REXLOG_INFO("[svr2011] graphics: window sizes {}: {}", fixed ? "(fixed list)" : "(the screen's)", list);
+    }
+  }
+  resolution_ = 0;
+  for (int i = 0; i < int(g_resolutions.size()); ++i) {
+    if (g_resolutions[i].w == 1920 && g_resolutions[i].h == 1080) resolution_ = i;  // (the default)
+  }
+  for (int i = 0; i < int(g_resolutions.size()); ++i) {
+    if (g_resolutions[i].w == w && g_resolutions[i].h == h) resolution_ = i;
   }
   {
     const int32_t level = rex::cvar::Query<int32_t>("native_aa");
     aa_ = level > 0 ? std::clamp<int32_t>(level, 1, 4) : (rex::cvar::Query<bool>("native_2x_msaa") ? 2 : 1);
+  }
+  {
+    const std::string kind = rex::cvar::GetFlagByName("native_upscale");
+    const int quality = std::clamp<int32_t>(rex::cvar::Query<int32_t>("native_upscale_quality"), 0, 3);
+    upscale_ = kind == "fsr1" ? quality + 1 : kind == "fsr2" ? quality + 5 : kind == "dlss" ? quality + 9 : 0;
   }
   {
     const int32_t v = rex::cvar::Query<int32_t>("native_max_scale");
@@ -460,6 +520,7 @@ void GraphicsPage::Load() {
       if (q == kTextureQualities[i]) textures_ = i;
   }
   effects_ = rex::cvar::Query<bool>("native_scale_effects");
+  brightness_ = ArenaBrightness();
   fps60_ = rex::cvar::Query<bool>("unlock_30fps");
   native_at_start_ = native::CanSwitch();
   {
@@ -468,15 +529,18 @@ void GraphicsPage::Load() {
   }
   api_ = api_at_start_;
   native_ = true;  // (the game draws only natively)
-  fps_ = FpsCounterVisible();
+  perf_ = PerfOverlayLevel();
+  corner_ = PerfOverlayCorner();
   ping_ = rex::cvar::Query<bool>("show_ping");
   router_port_ = rex::cvar::Query<bool>("p2p_port_mapping");
+  cpu_ = svr2011::LocalCpuTuning();
   touch_ = rex::cvar::Query<bool>("touch_controls");
   wide_ = rex::cvar::Query<bool>("native_widescreen");
   dof_ = rex::cvar::Query<bool>("depth_of_field");
   blur_ = rex::cvar::Query<bool>("motion_blur");
   soft_ = rex::cvar::Query<bool>("soft_filter");
   replays_ = rex::cvar::Query<bool>("replays");
+  caw_no_limits_ = rex::cvar::Query<bool>("caw_no_limits");
   fast_start_ = (rex::cvar::Query<bool>("skip_intros") ? 1 : 0) | (rex::cvar::Query<bool>("skip_training") ? 2 : 0);
   prepare_ = rex::cvar::Query<bool>("native_prepare_pipelines");
   {
@@ -486,6 +550,14 @@ void GraphicsPage::Load() {
     crowd_at_start_ = at_start;
   }
   shadows_ = !HasShadows() || rex::cvar::Query<bool>("native_shadows");
+  mat_fix_ = rex::cvar::Query<bool>("native_mat_fix");
+  {
+    const std::string v = rex::cvar::Query<std::string>("vs_style");
+    const auto& styles = svr2011::VsStyles();
+    vs_style_ = 0;
+    for (size_t i = 0; i < styles.size(); ++i)
+      if (styles[i].first == v) vs_style_ = int(i) + 1;
+  }
   {
     const uint32_t id = rex::cvar::Query<uint32_t>("user_language");
     language_ = 0;
@@ -527,6 +599,27 @@ void GraphicsPage::Change(int row, int dir) {
       rex::cvar::SetFlagByName("native_shadows", shadows_ ? "true" : "false");
       SaveSetting("native_shadows", shadows_ ? "true" : "false");
       break;
+    case kMatFix:
+      mat_fix_ = !mat_fix_;
+      rex::cvar::SetFlagByName("native_mat_fix", mat_fix_ ? "true" : "false");
+      SaveSetting("native_mat_fix", mat_fix_ ? "true" : "false");
+      break;
+    case kVsStyle: {
+      const auto& styles = svr2011::VsStyles();
+      const int n = int(styles.size()) + 1;
+      vs_style_ = (vs_style_ + (dir ? dir : 1) + n) % n;
+      const std::string v = vs_style_ ? styles[size_t(vs_style_ - 1)].first : "";
+      rex::cvar::SetFlagByName("vs_style", v);
+      SaveSetting("vs_style", "\"" + v + "\"");
+      break;
+    }
+    case kArenaBrightness:
+      brightness_ += 10 * (dir ? dir : 1);  // (50-200%, round as the other rows)
+      if (brightness_ > 200) brightness_ = 50;
+      if (brightness_ < 50) brightness_ = 200;
+      SetArenaBrightness(brightness_);
+      SaveSetting("arena_brightness", std::to_string(brightness_));
+      break;
     case kTextureQuality:
       textures_ = (textures_ + dir + kNumTextureQualities) % kNumTextureQualities;
       rex::cvar::SetFlagByName("native_texture_quality", kTextureQualities[textures_]);
@@ -543,8 +636,10 @@ void GraphicsPage::Change(int row, int dir) {
       SaveSetting("unlock_30fps", fps60_ ? "true" : "false");
       break;
     case kResolution: {
-      resolution_ = (resolution_ + dir + kNumResolutions) % kNumResolutions;
-      const Resolution& r = kResolutions[resolution_];
+      const int n = std::max(1, int(g_resolutions.size()));
+      resolution_ = (resolution_ + dir + n) % n;
+      if (g_resolutions.empty()) break;
+      const Resolution& r = g_resolutions[resolution_];
       ResizeWindow(r.w, r.h);
       SaveSetting("window_width", std::to_string(r.w));
       SaveSetting("window_height", std::to_string(r.h));
@@ -559,6 +654,30 @@ void GraphicsPage::Change(int row, int dir) {
       SaveSetting("native_aa", std::to_string(aa_));
       SaveSetting("native_2x_msaa", aa_ >= 2 ? "true" : "false");
       break;
+    case kUpscaling: {
+      // OFF, FSR 1 ULTRA QUALITY .. PERFORMANCE, then FSR 2 and DLSS where they can run (the log says why not)
+      std::vector<int> choices;
+      for (int i = 0; i <= 4; ++i) choices.push_back(i);
+      if (native::UpscalerAvailable("fsr2"))
+        for (int i = 5; i <= 8; ++i) choices.push_back(i);
+      if (native::UpscalerAvailable("dlss"))
+        for (int i = 9; i <= 12; ++i) choices.push_back(i);
+      int at = 0;
+      for (size_t i = 0; i < choices.size(); ++i)
+        if (choices[i] <= upscale_) at = int(i);
+      const int count = int(choices.size());
+      upscale_ = choices[size_t((at + dir + count) % count)];
+      const char* kind = upscale_ == 0 ? "off" : upscale_ <= 4 ? "fsr1" : upscale_ <= 8 ? "fsr2" : "dlss";
+      rex::cvar::SetFlagByName("native_upscale", kind);
+      // (a string: quoted - a bare word made the whole file unreadable, every setting back at its default)
+      SaveSetting("native_upscale", std::string("\"") + kind + "\"");
+      if (upscale_) {
+        const std::string quality = std::to_string((upscale_ - 1) % 4);
+        rex::cvar::SetFlagByName("native_upscale_quality", quality);
+        SaveSetting("native_upscale_quality", quality);
+      }
+      break;
+    }
     case kLanguage:
       language_ = (language_ + dir + kNumLanguages) % kNumLanguages;
       SaveSetting("user_language", std::to_string(kLanguages[language_].id));
@@ -574,6 +693,11 @@ void GraphicsPage::Change(int row, int dir) {
       rex::cvar::SetFlagByName("skip_training", fast_start_ & 2 ? "true" : "false");
       SaveSetting("skip_intros", fast_start_ & 1 ? "true" : "false");
       SaveSetting("skip_training", fast_start_ & 2 ? "true" : "false");
+      break;
+    case kCawLimits:
+      caw_no_limits_ = !caw_no_limits_;
+      rex::cvar::SetFlagByName("caw_no_limits", caw_no_limits_ ? "true" : "false");
+      SaveSetting("caw_no_limits", caw_no_limits_ ? "true" : "false");
       break;
     case kReplays:
       replays_ = !replays_;
@@ -610,6 +734,28 @@ void GraphicsPage::Change(int row, int dir) {
       rex::cvar::SetFlagByName("show_ping", ping_ ? "true" : "false");
       SaveSetting("show_ping", ping_ ? "true" : "false");
       break;
+    case kCpuPreset:  // (AUTO <-> LEGEND+; a hand-made set goes to LEGEND+ first)
+      cpu_ = cpu_ == svr2011::kLegendPlus ? svr2011::CpuTuning{} : svr2011::kLegendPlus;
+      svr2011::SetCpuTuning(cpu_);
+      break;
+    case kCpuReversal:  // (AUTO, 0-200 % in 10s)
+      cpu_.reversal = cpu_.reversal < 0 ? (dir < 0 ? 200 : 0) : cpu_.reversal + 10 * (dir ? dir : 1);
+      if (cpu_.reversal > 200 || cpu_.reversal < 0) cpu_.reversal = -1;
+      svr2011::SetCpuTuning(cpu_);
+      break;
+    case kCpuRates:  // (AUTO, 0-10)
+      cpu_.rates = cpu_.rates < 0 ? (dir < 0 ? 10 : 0) : cpu_.rates + (dir ? dir : 1);
+      if (cpu_.rates > 10 || cpu_.rates < 0) cpu_.rates = -1;
+      svr2011::SetCpuTuning(cpu_);
+      break;
+    case kCpuDamage:
+    case kCpuPin:
+    case kCpuMomentum: {  // (AUTO, EASY - LEGEND)
+      int& v = row == kCpuDamage ? cpu_.damage : row == kCpuPin ? cpu_.pin : cpu_.momentum;
+      v = (v + 1 + (dir ? dir : 1) + 5) % 5 - 1;
+      svr2011::SetCpuTuning(cpu_);
+      break;
+    }
     case kRouterPort:
       router_port_ = !router_port_;
       rex::cvar::SetFlagByName("p2p_port_mapping", router_port_ ? "true" : "false");
@@ -617,9 +763,18 @@ void GraphicsPage::Change(int row, int dir) {
       if (!router_port_) svr2011::StopPortMapping();  // (off: given back now; on: from the next start)
       break;
     case kFpsCounter:
-      fps_ = !fps_;
-      SetFpsCounterVisible(fps_);
-      SaveSetting("show_fps", fps_ ? "true" : "false");
+      perf_ = (perf_ + dir + 3) % 3;
+      SetPerfOverlayLevel(perf_);
+      SaveSetting("perf_overlay", std::to_string(perf_));
+      SaveSetting("show_fps", perf_ ? "true" : "false");  // (older launchers read it)
+      break;
+    case kMatchCamera:
+      SetMatchCamera(MatchCamera() + dir, true);
+      break;
+    case kOverlayCorner:
+      corner_ = (corner_ + dir + 4) % 4;
+      SetPerfOverlayCorner(corner_);
+      SaveSetting("perf_overlay_corner", std::to_string(corner_));
       break;
     case kFrameRate:
       frame_rate_ = (frame_rate_ + dir + kNumFrameRates) % kNumFrameRates;
@@ -648,8 +803,8 @@ void GraphicsPage::Change(int row, int dir) {
     case kDisplay:
       display_ = (display_ + dir + kDisplayModes) % kDisplayModes;
       SetDisplayMode(display_);
-      if (display_ == kWindowed) {
-        const Resolution& r = kResolutions[resolution_];
+      if (display_ == kWindowed && resolution_ < int(g_resolutions.size())) {
+        const Resolution& r = g_resolutions[resolution_];
         ResizeWindow(r.w, r.h);
       }
       break;
@@ -789,6 +944,7 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
     Load();
     tab_ = kDisplayTab;
     row_ = 0;
+    if (const char* v = std::getenv("SVR2011_TEST_GFX_ROW")) row_ = std::atoi(v);  // (test aid: the cursor's row)
     mode_ = g_requested_mode.exchange(kGraphicsMode);
     control_row_ = control_top_ = 0;
     // The A that opened the page is still down: wait for everything to be
@@ -1043,7 +1199,9 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
   const bool restart_crowd = crowd_ != crowd_at_start_;
   auto value = [&](Row id) -> const char* {
     switch (id) {
-      case kResolution: return display_ != kWindowed ? "FULL SCREEN" : kResolutions[resolution_].label;
+      case kResolution:
+        return display_ != kWindowed || resolution_ >= int(g_resolutions.size()) ? "FULL SCREEN"
+                                                                                 : g_resolutions[resolution_].label.c_str();
       case kDisplay: return kDisplayModeNames[display_];
       case kVsync: return vsync_ ? "ON" : "OFF";
       case kFrameRate: {
@@ -1051,9 +1209,35 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
         std::snprintf(fps, sizeof(fps), "%d FPS", kFrameRates[frame_rate_]);
         return fps;
       }
-      case kFpsCounter: return fps_ ? "ON" : "OFF";
+      case kFpsCounter: return perf_ == 2 ? "FULL" : perf_ == 1 ? "FPS" : "OFF";
+      case kMatchCamera: return MatchCameraName(MatchCamera());
+      case kOverlayCorner: {
+        static const char* const kCorners[] = {"TOP LEFT", "TOP RIGHT", "BOTTOM LEFT", "BOTTOM RIGHT"};
+        return kCorners[corner_ & 3];
+      }
       case kPing: return ping_ ? "ON" : "OFF";
       case kRouterPort: return router_port_ ? "ON" : "OFF";
+      case kCpuPreset:
+        return cpu_ == svr2011::CpuTuning{} ? "AUTO" : cpu_ == svr2011::kLegendPlus ? "LEGEND+" : "CUSTOM";
+      case kCpuReversal: {
+        static char b[16];
+        if (cpu_.reversal < 0) return "AUTO";
+        std::snprintf(b, sizeof b, "%d%%", cpu_.reversal);
+        return b;
+      }
+      case kCpuRates: {
+        static char b[16];
+        if (cpu_.rates < 0) return "AUTO";
+        std::snprintf(b, sizeof b, "%d", cpu_.rates * 10);
+        return b;
+      }
+      case kCpuDamage:
+      case kCpuPin:
+      case kCpuMomentum: {
+        static const char* const kLevels[] = {"EASY", "NORMAL", "HARD", "LEGEND"};
+        const int v = id == kCpuDamage ? cpu_.damage : id == kCpuPin ? cpu_.pin : cpu_.momentum;
+        return v < 0 || v > 3 ? "AUTO" : kLevels[v];
+      }
       case kFullSpeed: return full_speed_ ? "ON" : "OFF (AS THE XBOX 360)";
       case kTouch: return touch_ ? "ON" : "OFF";
       case kWide: return wide_ ? "FULL WIDTH" : "16:9";
@@ -1061,6 +1245,7 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
       case kMotionBlur: return blur_ ? "ON" : "OFF";
       case kSoft: return soft_ ? "ON (XBOX 360)" : "OFF";
       case kReplays: return replays_ ? "ON" : "OFF";
+      case kCawLimits: return caw_no_limits_ ? "OFF" : "STOCK";
       case kFastStart: {
         static const char* const kNames[4] = {"OFF", "SKIP INTROS", "SKIP PRACTICE RING", "SKIP BOTH"};
         return kNames[fast_start_ & 3];
@@ -1071,7 +1256,36 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
       case kRenderer: return api_ == 1 ? "VULKAN" : api_ == 2 ? "DIRECT3D 11" : "AUTO";
       case kRenderScale: return kScales[scale_].label;
       case kTextureQuality: return kTextureQualityLabels[textures_];
+      case kMatFix: return mat_fix_ ? "SMOOTH" : "ORIGINAL";
+      case kVsStyle: {
+        static std::string up;
+        const auto& styles = svr2011::VsStyles();
+        up = vs_style_ && vs_style_ <= int(styles.size()) ? styles[size_t(vs_style_ - 1)].second : "SvR 2011";
+        for (char& c : up) c = char(std::toupper(uint8_t(c)));
+        return up.c_str();
+      }
+      case kArenaBrightness: {
+        static char b[16];
+        std::snprintf(b, sizeof b, "%d%%", brightness_);
+        return b;
+      }
       case kAntiAliasing: return aa_ == 1 ? "OFF" : aa_ == 2 ? "2X" : aa_ == 3 ? "3X" : "4X";
+      case kUpscaling: {
+        static const char* const kNames[] = {"OFF",
+                                             "FSR 1 ULTRA QUALITY",
+                                             "FSR 1 QUALITY",
+                                             "FSR 1 BALANCED",
+                                             "FSR 1 PERFORMANCE",
+                                             "FSR 2 ULTRA QUALITY (EXPERIMENTAL)",
+                                             "FSR 2 QUALITY (EXPERIMENTAL)",
+                                             "FSR 2 BALANCED (EXPERIMENTAL)",
+                                             "FSR 2 PERFORMANCE (EXPERIMENTAL)",
+                                             "DLSS ULTRA QUALITY (EXPERIMENTAL)",
+                                             "DLSS QUALITY (EXPERIMENTAL)",
+                                             "DLSS BALANCED (EXPERIMENTAL)",
+                                             "DLSS PERFORMANCE (EXPERIMENTAL)"};
+        return kNames[std::clamp(upscale_, 0, 12)];
+      }
       case kCrowd: return crowd_ ? "ON" : "OFF";
       case kShadows: return shadows_ ? "ON" : "OFF";
       case kEffects: return effects_ ? "HIGH" : "NORMAL";
@@ -1085,9 +1299,17 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
       case kDisplay: return "DISPLAY MODE";
       case kVsync: return "VSYNC";
       case kFrameRate: return "FRAME RATE";
-      case kFpsCounter: return "FPS COUNTER";
+      case kFpsCounter: return "PERFORMANCE";
+      case kOverlayCorner: return "PERFORMANCE CORNER";
+      case kMatchCamera: return "MATCH CAMERA";
       case kPing: return "ONLINE PING";
       case kRouterPort: return "ROUTER PORT (UPNP)";
+      case kCpuPreset: return "PRESET";
+      case kCpuReversal: return "CPU REVERSAL CHANCE";
+      case kCpuRates: return "CPU REVERSAL RATES";
+      case kCpuDamage: return "DAMAGE";
+      case kCpuPin: return "PIN KICK-OUT";
+      case kCpuMomentum: return "MOMENTUM";
       case kFullSpeed: return "FULL SPEED";
       case kTouch: return "TOUCH CONTROLS";
       case kWide: return "WIDE SCREENS";
@@ -1096,13 +1318,18 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
       case kSoft: return "SOFT FILTER";
       case kReplays: return "REPLAYS";
       case kFastStart: return "FAST START";
+      case kCawLimits: return "CAW LIMITS";
       case kCpuPriority: return "CPU PRIORITY";
       case kPrepare: return "PREPARE GRAPHICS";
       case kLanguage: return "LANGUAGE";
       case kRenderer: return "GRAPHICS API";
       case kRenderScale: return "RENDER RESOLUTION";
       case kTextureQuality: return "TEXTURES";
+      case kArenaBrightness: return "ARENA BRIGHTNESS";
+      case kMatFix: return "RING MAT";
+      case kVsStyle: return "VS SCREEN STYLE";
       case kAntiAliasing: return "ANTI-ALIASING";
+      case kUpscaling: return "UPSCALING";
       case kEffects: return "EFFECT DETAIL";
       case kCrowd: return "CROWD";
       case kShadows: return "SHADOWS";
@@ -1119,8 +1346,27 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
                                          : "Play in a window (F11 switches to full screen).";
       case kVsync: return "Waits for the monitor's refresh: no tearing.";
       case kFrameRate: return "Frames a second in matches, at most (menus: 60). The game always runs at its normal speed.";
-      case kFpsCounter: return "Shows the frame rate at the top of the screen (F2).";
+      case kFpsCounter: return "FPS: the frame rate. FULL: also the game's video memory (its textures and render targets). F2 switches it.";
+      case kOverlayCorner: return "Which corner of the screen the performance numbers sit in.";
+      case kMatchCamera:
+        return "The camera in ring matches: NORMAL, FAR, CLOSE, HIGH, LOW or RAMP (the Royal Rumble's view). In a "
+               "match BACK + R3 (F4) changes it.";
       case kRouterPort: return "Online: your router opens the game's port while you play (UPnP), so far-off players connect directly. OFF: never touched.";
+      case kCpuPreset:
+        return "AUTO: the CPU as the DIFFICULTY you pick in the game. LEGEND+: harder than LEGEND - every row below "
+               "at its hard end. Online the host's settings count.";
+      case kCpuReversal:
+        return "How often the CPU takes a chance to reverse. AUTO: the difficulty's (EASY 30%, NORMAL 55%, HARD 80%, "
+               "LEGEND 100%). Over 100%: more than LEGEND.";
+      case kCpuRates:
+        return "The game's A.I. REVERSAL BALANCING sliders for every kind of move (its default 50, most 100). AUTO: "
+               "your own settings there.";
+      case kCpuDamage:
+        return "Damage as on that difficulty (EASY less, LEGEND more). AUTO: the match's difficulty.";
+      case kCpuPin:
+        return "The pin kick-out as on that difficulty (LEGEND: the shortest window). AUTO: the match's difficulty.";
+      case kCpuMomentum:
+        return "Momentum and stamina rates as on that difficulty. AUTO: the match's difficulty.";
       case kPing: return "Online matches: the delay to the other players at the top right (bars: green under 150 ms, yellow under 250, red above).";
       case kFullSpeed:
         return full_speed_ ? "The game keeps its normal speed when the frame rate drops (and at 30 FPS)."
@@ -1131,6 +1377,9 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
       case kMotionBlur: return "Blur and trails on fast moves and replays.";
       case kSoft: return "The game's 720p smoothing filter: blurs wide shots at higher resolutions.";
       case kReplays: return "Instant replays after finishers and the highlights at the end of a match.";
+      case kCawLimits:
+        return caw_no_limits_ ? "CREATE A SUPERSTAR: no points budget, stack any parts (they may clip)."
+                              : "CREATE A SUPERSTAR with the game's own points budget and part counts.";
       case kFastStart:
         return "At launch: no logo movies (straight to the Start Screen) and / or no practice ring (straight to the "
                "main menu). Next start.";
@@ -1142,15 +1391,36 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
                    : "The game's text: changes the next time the game starts.";
       case kRenderer: return "The graphics API the game draws with. AUTO: Direct3D 12, else Vulkan, else Direct3D 11 (older GPUs).";
       case kRenderScale:
-        return "The most the game renders at. AUTO fills the screen; lower is faster (360P / 480P: softer, for weak "
-               "devices; 1080P: sharp on a 1080p screen, lighter than AUTO's 1440P).";
+        return "The game's picture size. AUTO fills the screen; lower is faster (360P / 480P: softer, for weak "
+               "devices; 1080P: sharp on a 1080p screen, lighter than AUTO's 1440P). ANTI-ALIASING draws it bigger.";
       case kCrowd:
         return crowd_ == crowd_at_start_ ? "The people in the seats. OFF: empty seats - faster on weak PCs and phones."
                                          : "Takes effect the next time the game starts.";
       case kShadows: return "The wrestlers', ring's and arena's shadows. OFF: faster.";
       case kAntiAliasing:
-        return "Renders at 2, 3 or 4 times the resolution per side and averages it down (4, 9 or 16 samples a "
-               "pixel): smoother edges, slower. Limited by RENDER SCALE.";
+        return upscale_ ? "Off while UPSCALING is on: FSR / DLSS draw the picture smaller and smooth its edges "
+                          "themselves. Set UPSCALING to OFF to use this."
+                        : "Smoother edges: the picture is drawn 2, 3 or 4 times as tall and wide as your screen and "
+                          "shrunk to it - slower. At most 4x the Xbox 360's 720p, so on a 1080p screen 3X and 4X look "
+                          "the same. Works with every RENDER RESOLUTION.";
+      case kUpscaling:
+        return upscale_ >= 9
+                   ? "NVIDIA DLSS 4 (experimental, RTX GPUs): matches drawn smaller and rebuilt by NVIDIA's AI model "
+                     "over several frames; fast moves can leave faint trails. Menus use FSR 1."
+               : upscale_ >= 5
+                   ? "AMD FSR 2 (experimental): matches drawn smaller and rebuilt over several frames - sharper "
+                     "than FSR 1, smooth edges; fast moves can leave faint trails. Menus use FSR 1."
+                   : "AMD FSR 1: the game drawn smaller (77%, 67%, 59% or 50% of the screen's height) and scaled up "
+                     "sharp - faster on weak PCs and phones. Replaces RENDER SCALE while on.";
+      case kVsStyle:
+        return "The match set-up screen's look: SvR 2011's, or an older game's made by the Mod Maker from your "
+               "disc (From another game). From the next start of the game.";
+      case kMatFix:
+        return "SMOOTH: the game's ring mats without the rows of light patches in their art. ORIGINAL: as on the "
+               "Xbox 360. From the next arena that loads.";
+      case kArenaBrightness:
+        return "The arena's lights - on the wrestlers, the ring and the hall. 100%: the game's own. From the next "
+               "arena that loads.";
       case kTextureQuality:
         return "MEDIUM / LOW: big textures at half / a quarter of their size - less memory, faster loading. "
                "Menus and text stay sharp.";
@@ -1161,13 +1431,33 @@ void GraphicsPage::OnDraw(ImGuiIO& io) {
     return "";
   };
   row_ = std::clamp(row_, 0, n - 1);
-  // (9-10 rows: a little tighter, so the help line below stays clear)
-  const float row_h = n > 9 ? 28.0f : n > 7 ? 30.0f : 34.0f, gap = n > 9 ? 6.0f : n > 7 ? 8.0f : 13.0f;
-  const float top = 310 - (float(n) * (row_h + gap) - gap) * 0.5f;
+  // At most kShown rows on screen (the help line below stays clear on any tab): more scroll with the cursor,
+  // arrows above / below saying so.
+  constexpr int kShown = 9;
+  static int first = 0;
+  if (n <= kShown) first = 0;
+  first = std::clamp(first, std::max(0, row_ - kShown + 1), std::min(row_, std::max(0, n - kShown)));
+  const int shown = std::min(n, kShown);
+  // (9 rows: a little tighter, so the help line below stays clear)
+  const float row_h = shown > 7 ? 30.0f : 34.0f, gap = shown > 7 ? 7.0f : 13.0f;
+  const float top = 310 - (float(shown) * (row_h + gap) - gap) * 0.5f;
   const float fs = 22 * s;
-  for (int i = 0; i < n; ++i) {
+  {
+    const float ah = 7 * s, cx = P(639, 0).x;
+    if (first > 0) {
+      const float ay = P(0, top - 12).y;
+      dl->AddTriangleFilled(ImVec2(cx, ay - ah), ImVec2(cx - ah * 1.4f, ay + ah * 0.6f),
+                            ImVec2(cx + ah * 1.4f, ay + ah * 0.6f), IM_COL32(255, 255, 255, 220));
+    }
+    if (first + shown < n) {
+      const float ay = P(0, top + shown * (row_h + gap) - gap + 12).y;
+      dl->AddTriangleFilled(ImVec2(cx, ay + ah), ImVec2(cx - ah * 1.4f, ay - ah * 0.6f),
+                            ImVec2(cx + ah * 1.4f, ay - ah * 0.6f), IM_COL32(255, 255, 255, 220));
+    }
+  }
+  for (int i = first; i < first + shown; ++i) {
     const Row id = rows[i];
-    const float y = top + i * (row_h + gap);
+    const float y = top + (i - first) * (row_h + gap);
     const bool sel = i == row_;
     const ImVec2 a = P(166, y), b = P(1112, y + row_h);
     if (sel) {
@@ -1230,8 +1520,8 @@ void InstallGraphicsPage(rex::ui::ImGuiDrawer* drawer, rex::ui::Window* window,
     input->SetGuestInputHold(
         [] {
           return g_open.load() || g_wait_release.load() || AchievementsPageHoldsInput() || JukeboxPageHoldsInput() ||
-                 BackgroundsPageHoldsInput() || TouchControlsHoldInput() || OnlineOverlayHoldsInput() ||
-                 MysteryOpponentHoldsInput();
+                 BackgroundsPageHoldsInput() || WeaponsPageHoldsInput() || TouchControlsHoldInput() || OnlineOverlayHoldsInput() ||
+                 MysteryOpponentHoldsInput() || ReportPageHoldsInput();
         });
   }
 }

@@ -60,6 +60,11 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch[6], uint32_t dimension
 // Sampler table index for the fetch constant's filtering and addressing.
 uint32_t Sampler(const Context& ctx, const uint32_t fetch[6]);
 
+// Moves on whenever a Texture or Sampler answer could change: a texture uploaded, changed, replaced or dropped, a
+// resolve registered or forgotten, guest memory written, the quality or the check mode set. Within one frame,
+// while it stays, the same fetch constants get the same answers (the renderer keeps each slot's last one).
+uint64_t Generation();
+
 // false: the GPU can't sample BC (DXT) textures (Mali): they are decoded on
 // the CPU to RGBA8 / RG8 / R8 instead (before any texture is uploaded).
 void SetBlockCompressionSupported(bool supported);
@@ -85,6 +90,13 @@ void ForgetResolved(uint32_t base_address);
 // attire bake draws each mip from the level it just wrote back, and its
 // cached copy could still be the previous bake's at that address.
 void GuestWritten(uint32_t address, uint32_t size);
+// true while the renderer looks up the textures of a Superstar Threads attire
+// bake draw: each is checked against guest memory at every use, even in the
+// same frame. The game builds each attire part's paint layer on the CPU in
+// the same memory before its draw; on a slow PC two parts can come in one
+// frame, and the second part was drawn with the first one's layer (colours
+// on the wrong parts). Bake lookups are logged (threads bake: ...).
+void SetCheckEveryUse(bool on);
 
 // A resolve wrote the guest texture at `base_address` (physical): the image
 // is in `texture` (a copy of the render target, owned by the renderer), not
@@ -126,6 +138,9 @@ struct Stats {
 };
 // The accumulated performance counters (and resets them).
 Stats TakePerf();
+// The game's textures on the GPU now: their host bytes and how many (the performance overlay).
+uint64_t ResidentBytes();
+uint32_t ResidentCount();
 Stats FrameStats();  // and resets the per-frame counters
 
 }  // namespace svr2011::native::textures

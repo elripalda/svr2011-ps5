@@ -46,6 +46,7 @@ GAMES = [
     {'id': 'svr2007', 'name': "WWE SmackDown vs. Raw 2007", 'platform': 'x360', 'disc_hint': '545107E0', 'status': 'ready'},
     {'id': 'svr2008', 'name': "WWE SmackDown vs. Raw 2008", 'platform': 'x360', 'disc_hint': '5451080B', 'status': 'ready'},
     {'id': 'svr2009', 'name': "WWE SmackDown vs. Raw 2009", 'platform': 'x360', 'disc_hint': '54510826', 'status': 'ready'},
+    {'id': 'low', 'name': "WWE Legends of WrestleMania", 'platform': 'x360', 'disc_hint': '54510838', 'status': 'ready'},
     {'id': 'svr2010', 'name': "WWE SmackDown vs. Raw 2010", 'platform': 'x360', 'disc_hint': '54510844', 'status': 'ready'},
     {'id': 'wwe12', 'name': "WWE '12", 'platform': 'x360', 'disc_hint': '54510890', 'status': 'native'},
     {'id': 'wwe13', 'name': "WWE '13", 'platform': 'x360', 'disc_hint': '545108B4', 'status': 'native'},
@@ -68,6 +69,8 @@ KNOWN_CRASHES = {
     ('wwe2k14', 'bg00'): 'crashes at load - 2 of 2 runs, open',
     ('wwe2k14', 'bg12'): 'crashes at load (object motion loader, lr 826AEF18) - 3 of 3 runs, open',
     ('wwe2k14', 'bg17'): 'crashes at load (lr 82188A00) - 3 of 3 runs, open',
+    # (WWE 2K16 bg06 / bg12 / bg15, 78,935-91,476 vertices against the stock 65,450, crashed at load until 2.1.6:
+    # the stage's heap, now given fallback memory - they convert with needs=2.1.6, svrfmt/arena.h)
 }
 
 
@@ -121,6 +124,24 @@ SVR2009 = {
     13: ('Judgment Day', 13), 14: ('Night of Champions', 14), 15: ('The Great American Bash', 15),
     16: ('One Night Stand', None), 17: ('Cyber Sunday', None), 18: ('Vengeance', None),
 }
+# SvR 2008 / 2009: arena number -> its picture on the arena select screen (ScrLayHD.pac SCRL/LSSE arena_<key>,
+# 256 x 256, the arena itself; Legends of WrestleMania's LSSE is 2009's, none of its own arenas)
+SELECT_PICTURE = {
+    'svr2008': {0: 'smack', 1: 'raw', 2: 'ecw', 3: 'heat', 4: 'summer', 5: 'unfor', 6: 'nomercy', 7: 'survive',
+                8: 'armage', 9: 'rumble', 10: 'noway', 11: 'WM23', 12: 'backlash', 13: 'judge', 14: 'ven', 15: 'GAB',
+                16: 'newyear', 17: 'ONS', 18: 'DtoD', 19: 'cybers'},
+    'svr2009': {0: 'smack', 1: 'raw', 2: 'ecw', 3: 'troop', 4: 'summer', 5: 'unfor', 6: 'nomercy', 7: 'survive',
+                8: 'armage', 9: 'rumble', 10: 'noway', 11: 'WM24', 12: 'backlash', 13: 'judge', 15: 'GAB', 16: 'ONS',
+                17: 'cybers', 18: 'ven'},
+}
+# Legends of WrestleMania (SvR 2009's arena format): arena number -> (show, 2011 arena of that show) - names from its
+# string.pac SDB 0100 (674 + n - 200: WrestleMania I - XV), bg216 = MatchHD M D8 I's logoRR08, bg219 its Rumble-match
+# copy (the same textures); bg223 / 224 / 225 / 250 are its Create Moves / prop check / approval stages (not listed).
+# None of them is in 2011: LOW_BASE is the slot each plays as.
+LOW = {**{200 + k: ('WrestleMania %s' % r, None) for k, r in enumerate(
+    'I 2 III IV V VI VII VIII IX X XI XII 13 XIV XV'.split(), 1)},
+    **{216: ('Royal Rumble 2008', None), 219: ('Royal Rumble 2008 (Rumble match)', None)}}
+LOW_BASE = {**{n: 11 for n in range(201, 216)}, 216: 9, 219: 9}
 # SvR 2007: stage number -> (show, 2011 arena of that show). Its arenas are
 # entries STG<k>/00NN of pac/bg/bg<k>.pac (k = NN // 10); 0020+ are copies.
 SVR2007 = {
@@ -130,12 +151,74 @@ SVR2007 = {
     14: ('Vengeance', None), 15: ('The Great American Bash', 15), 16: ("New Year's Revolution", None),
     17: ('One Night Stand', None), 18: ('Cyber Sunday', None), 19: ("Saturday Night's Main Event", None),
 }
-HOST_ENTRIES = (0x192, 0x4E20, 0x4E21, 0x4E22, 0x4E23, 0x4E2A, 0xEE48, 0xEA6C)
+# (0x7922: the arena's motion bank - crowd, ring crew; 2011's adds motion 500, the ring announcer's intro, which
+# SvR 2007-2010 lack: without it he stands in the bind pose in the intro)
+HOST_ENTRIES = (0x192, 0x4E20, 0x4E21, 0x4E22, 0x4E23, 0x4E2A, 0x7922, 0xEE48, 0xEA6C)
+MOTION_BANK = 0x7922
 # SvR 2007-2009 turnbuckle covers (ar_cover10-13): a black logo pad (rin_tb00) inside a white taped
 # shell (rin_tb10) that 2011 draws over the pad - the "white turnbuckles". 2011 RAW's covers are the
 # same black logo pads with no shell, on the same ring.
 HOST_COVERS = (0x3C4, 0x3C5, 0x3C6, 0x3C7)
-MAX_ARENA = 9_400_000  # bytes: the smaller 2011 hosts (a bigger file can run out of the arena heap)
+MAX_ARENA = 9_400_000  # bytes: the smaller 2011 hosts (until 2.1.6 a bigger file than its slot's crashed)
+# Since 2.1.6 an arena may be bigger than its slot's shipped file (the game reads its stage at its own size:
+# src/arena_mods.cpp) - up to ARENA_FILE_MAX (tested 21.5 MB: 1v1 and a 6-man at 60 fps, 27 Oct) - and hold more 3D
+# detail than 2011's own (STOCK_VERTS; src/ring_rules.cpp): such an arena says needs=model_budget.NEEDS_VERSION, older
+# games crash loading it.
+ARENA_FILE_MAX = 21 << 20
+STOCK_VERTS = 65450
+# Meshes (the stage's drawn pieces): the game's own arenas have up to STOCK_MESHES (bg01). Each is drawn with its own
+# render commands every frame; past MAX_MESHES the match's command queue runs full in a 6-man and the game crashes
+# (27 Oct: 1,770 meshes crashed with stock wrestlers; 1,062 held 5 minutes with six 1,489-page superstars) - the same
+# numbers as the Mod Maker's (modmaker/svrfmt/arena.h kMaxArenaMeshes / kMaxArenaMeshesNew).
+STOCK_MESHES = 446
+MAX_MESHES = 900
+
+
+def stage_vertices(data, meshes_out=None):
+    """every JBOY model's vertices in an arena pac's STG entries (and their meshes into meshes_out[0])"""
+    import jboy
+    n = 0
+    for typ, ents in svrfmt.epac_read(data)[1]:
+        if typ != b'STG ':
+            continue
+        for _, blob in ents:
+            if blob[:4] != b'PACH':
+                continue
+            for _, cb in svrfmt.pach_read(blob):
+                raw = svrfmt.bpe_decode(cb) if cb[:4] == b'BPE ' else cb
+                if raw[:4] == b'JBOY':
+                    try:
+                        m = jboy.read(raw)
+                        n += sum(len(s.verts) for s in m.meshes)
+                        if meshes_out is not None:
+                            meshes_out[0] += len(m.meshes)
+                    except Exception:  # noqa: BLE001
+                        pass
+    return n
+
+
+def crowd_area_line(data):
+    """the manifest's crowd_area= line from an SvR 2008 arena's own crowd fighting areas ('' when it has none)"""
+    import crowd_walkway
+    try:
+        area = crowd_walkway.crowd_area(data)
+    except Exception:  # (an arena without the stage text)
+        return ''
+    return 'crowd_area=%s\n' % area if area else ''
+
+
+def needs_line(data, host_size):
+    """the manifest's needs= line for an arena bigger than its slot's file or with more 3D detail ('' when neither);
+    BadInput for more meshes than the game can draw (MAX_MESHES)"""
+    import model_budget
+    meshes = [0]
+    verts = stage_vertices(data, meshes)
+    if meshes[0] > MAX_MESHES:
+        raise BadInput('the arena has %d separate meshes; SvR 2011 can draw up to %d in a match (more crash a 6-man): '
+                       'leave some objects out or join small ones' % (meshes[0], MAX_MESHES))
+    if len(data) > host_size or verts > STOCK_VERTS or meshes[0] > STOCK_MESHES:
+        return 'needs=%s\n' % model_budget.NEEDS_VERSION
+    return ''
 
 
 class BadInput(Exception):
@@ -261,12 +344,43 @@ def svr2010_convert(disc, key, out, base=None, name=None, pac11=None, year='2010
     arena = disc.read(path)
     if arena[:4] != b'EPAC':
         raise RuntimeError('%s: not an EPAC arena' % path)
-    if len(arena) > MAX_ARENA:
-        warnings.append('the arena file is %d bytes; 2011 hosts hold about 9.0-9.6 MB' % len(arena))
+    host_size = os.path.getsize(find_host(pac11, base)) if pac11 else MAX_ARENA
+    if len(arena) > host_size:
+        notes.append('the arena file is %d bytes, bigger than its slot\'s (%d): it needs version 2.1.6 or newer'
+                     % (len(arena), host_size))
     mod = os.path.join(out, mod_id)
     os.makedirs(os.path.join(mod, 'vs'), exist_ok=True)
+    # (its motion bank lacks 2011's motion 500, the ring announcer's intro: 2011 RAW's in its place)
+    if pac11:
+        try:
+            _, graw, _ = svrfmt.epac_read(open(find_host(pac11, 1), 'rb').read())
+            bank = dict(svrfmt.pach_read(graw[0][1][0][1])).get(MOTION_BANK)
+            ha, ga, ta = svrfmt.epac_read(arena)
+            ents = dict(svrfmt.pach_read(ga[0][1][0][1]))
+            if bank is not None and MOTION_BANK in ents:
+                ents[MOTION_BANK] = bank
+                g = [(ga[0][0], [(ga[0][1][0][0], svrfmt.pach_write(sorted(ents.items())))])] + list(ga[1:])
+                arena = svrfmt.epac_write(ha, g, ta)
+                notes.append("motion bank (crowd, ring crew, the announcer's intro) from 2011 RAW")
+        except Exception as e:  # (the arena as it is - logged)
+            warnings.append('motion bank not replaced: %s' % e)
     with open(os.path.join(mod, 'arena.pac'), 'wb') as f:
         f.write(arena)
+    # (SvR 2010's match light sets are far darker than 2011's in some arenas - WrestleMania 25: set 10 ground 0.20 against
+    # RAW's 0.78 - wrestlers and ring dark in the match: those sets from 2011 RAW, as the Mod Maker's "Repair it" and
+    # its WWE '12+ converter do; svrmod lights, which leaves an arena that isn't dark as it is)
+    if pac11:
+        try:
+            import subprocess
+            import wwe13_entrance as WE
+            pac = os.path.join(mod, 'arena.pac')
+            r = subprocess.run([WE.find_svrmod(None), 'lights', pac, find_host(pac11, 1), pac], capture_output=True,
+                               text=True, timeout=120)
+            dark = [ln.split(':', 1)[1].strip() for ln in r.stdout.splitlines() if ln.startswith('dark sets:')]
+            if dark and dark[0]:
+                notes.append('match lighting too dark for SvR 2011 - 2011 RAW\'s sets used: %s' % dark[0])
+        except Exception as e:  # noqa: BLE001 - no svrmod.exe: the arena's own lights (the doctor offers the repair)
+            warnings.append('match lighting not checked: %s' % e)
 
     progress(40, 'pictures')
     match = disc.read('pac/menu/MatchHD.pac') if disc.exists('pac/menu/MatchHD.pac') else None
@@ -310,12 +424,25 @@ def svr2010_convert(disc, key, out, base=None, name=None, pac11=None, year='2010
             notes.append("the VS screen keeps %s's theme (it has no single 1024 x 512 background)" % BASE_NAMES[base])
     else:
         notes.append('no loading or VS picture (no VS theme for this arena on the disc)')
+    # its own VS screen: the disc's whole theme for this arena (vs_port.py; the game shows it in this arena's matches
+    # - games before vs/theme.pac keep the picture above)
+    vs_theme = None
+    if year == '2010' and not lone and pac11 and match:
+        try:
+            import vs_port
+            vs_port.cmd_theme('svr2010', disc.path, pac11, n, os.path.join(mod, 'vs', 'theme.pac'))
+            vs_theme = 'SvR 2010 %s' % show
+            notes[:] = [x for x in notes if not x.startswith('the VS screen keeps')]
+            notes.append("its own VS screen: SvR 2010's %s theme (vs/theme.pac)" % show)
+        except Exception as e:  # (the picture only - logged)
+            warnings.append('no own VS screen: %s' % e)
     if not os.listdir(os.path.join(mod, 'vs')):
         os.rmdir(os.path.join(mod, 'vs'))
 
     with open(os.path.join(mod, 'manifest.txt'), 'w', newline='\n') as f:
         f.write('type=arena\nid=%s\nname=%s\nauthor=SvR %s arena %s, ported by port tools\nversion=1.0\nbase=%s\n'
-                % (mod_id, name, year, 'bg%02d' % n, BASE_NAMES[base]))
+                % (mod_id, name, year, 'bg%02d' % n, BASE_NAMES[base]) + needs_line(arena, host_size)
+                + ('vs_theme=%s\n' % vs_theme if vs_theme else '') + crowd_area_line(arena))
     progress(80, 'packing')
     import wwe13_pack
     svrmod = os.path.join(out, mod_id + '.svrmod')
@@ -325,9 +452,9 @@ def svr2010_convert(disc, key, out, base=None, name=None, pac11=None, year='2010
         wwe13_pack.pack(mod, svrmod, 'Port tools (SvR %s)' % year)
     finally:
         sys.stdout = old
-    notes.append('base %s (tile %d on the custom arena pages); the game renames its stage to the slot\'s' % (BASE_NAMES[base], base))
+    notes.append('base %s (arena %d: it plays as that arena, wherever its tile is on the custom arena pages); the game renames its stage to the slot\'s' % (BASE_NAMES[base], base))
     if n not in (0, 1, 2, 4, 7, 9, 13, 14, 15) and in11 is None:
-        notes.append('2011 has no %s arena: the mod sits on the %s tile' % (show, BASE_NAMES[base]))
+        notes.append('2011 has no %s arena: the mod plays as the %s arena' % (show, BASE_NAMES[base]))
     progress(100, 'done')
     return {'ok': True, 'out': svrmod, 'folder': mod, 'opens': 'arena', 'warnings': warnings, 'dropped': dropped,
             'notes': notes}
@@ -475,8 +602,9 @@ def svr2008_list(disc, table=None):
 
 
 def svr2008_convert(disc, key, out, pac11, base=None, name=None, game='svr2008'):
-    table = {'svr2009': SVR2009, 'svr2007': SVR2007}.get(game, SVR2008)
+    table = {'svr2009': SVR2009, 'svr2007': SVR2007, 'low': LOW}.get(game, SVR2008)
     year = game[3:]
+    label = 'Legends of WrestleMania' if game == 'low' else 'SvR %s' % year
     warnings, notes, dropped = [], [], []
     try:
         n = int(key[2:]) if key.lower().startswith('bg') else int(key)
@@ -484,15 +612,16 @@ def svr2008_convert(disc, key, out, pac11, base=None, name=None, game='svr2008')
         raise BadInput('item %r: expected bgNN' % key)
     lone = getattr(disc, 'lone', False)
     if n not in table and not lone:
-        raise BadInput('item %r: not an arena of SvR %s (story copies are left out)' % (key, year))
+        raise BadInput('item %r: not an arena of %s (story copies are left out)' % (key, label))
     if not pac11:
         raise BadInput('SvR 2007 - 2009 arenas need --pac11 <SvR 2011 game folder> (crowd and table pictures)')
     show, in11 = table.get(n, ('Arena bg%02d' % n, None))
     if base is None:
-        base = in11 if in11 is not None else (n if n in BASE_NAMES else 3)
+        base = in11 if in11 is not None else LOW_BASE.get(n) if game == 'low' else (n if n in BASE_NAMES else 3)
+        base = 3 if base is None else base
     if base not in BASE_NAMES:
         raise BadInput('base %r: 0-19' % base)
-    name = name or '%s (SvR %s)' % (show, year)
+    name = name or ('%s (LoW)' % show if game == 'low' else '%s (SvR %s)' % (show, year))
     mod_id = game + '_' + ''.join(c if c.isalnum() else '_' for c in show.lower()).strip('_')
     progress(3, 'reading bg%02d' % n)
     # the file's layout and size budget: the base slot's arena; the borrowed entries (crowd,
@@ -534,7 +663,7 @@ def svr2008_convert(disc, key, out, pac11, base=None, name=None, game='svr2008')
         # 0.6x - and blew the black turnbuckle pads out to cream in 2011. With SvR 2008's or 2009's
         # set 10 some arenas crashed ~10 s into a match in the code that reads it (sub_822A6BD8,
         # lr 822A6EE8: 2008 bg04 / bg06 / bg07, 2009 bg09 / bg17, run to run): RAW's)
-        added = fill_lights(bank, light_bank(unp(eb[0x7530])), replace=(10,) if game in ('svr2008', 'svr2009') else ())
+        added = fill_lights(bank, light_bank(unp(eb[0x7530])), replace=(10,) if game in ('svr2008', 'svr2009', 'low') else ())
         if added:
             ents[0x7530] = ymks.write_bank(bank)
             notes.append('light sets the game needs, from 2011 RAW: ' + ', '.join(map(str, added)))
@@ -558,7 +687,9 @@ def svr2008_convert(disc, key, out, pac11, base=None, name=None, game='svr2008')
         g = [(gb[0][0], [(gb[0][1][0][0], svrfmt.pach_write(sorted(e.items())))])] + list(gb[1:])
         return svrfmt.epac_write(hb, g, tb)
 
-    budget = len(host)
+    # (bigger than the host - needs= in the manifest - only when the stage is the pac's last entry: the game reads
+    # every entry at the place the host had it, so only the file's end may move)
+    budget = max(len(host), ARENA_FILE_MAX) if len(gb) == 1 else len(host)
     progress(16, 'fitting the textures into the %s file' % BASE_NAMES[base])
     data = build(ents[0x190])
     raw = svrfmt.bpe_decode(ents[0x190])
@@ -591,11 +722,14 @@ def svr2008_convert(disc, key, out, pac11, base=None, name=None, game='svr2008')
     os.makedirs(os.path.join(mod, 'vs'), exist_ok=True)
     with open(os.path.join(mod, 'arena.pac'), 'wb') as f:
         f.write(data)
+    if game == 'svr2008':  # (its crowd area opened for 2011's crowd fighting: a walkway, the climb's area)
+        import crowd_walkway
+        notes.append('crowd area: %s' % crowd_walkway.patch_pac(os.path.join(mod, 'arena.pac')))
     progress(85, 'pictures')
     art = None
     if disc.exists('pac/menu/MatchHD.pac'):
         best = 0
-        for nm, dds in group_textures(disc.read('pac/menu/MatchHD.pac'), 'M%02dI' % n):
+        for nm, dds in group_textures(disc.read('pac/menu/MatchHD.pac'), ('M%02XI' if game == 'low' else 'M%02dI') % n):
             try:
                 im = image(dds)
             except Exception:
@@ -603,7 +737,23 @@ def svr2008_convert(disc, key, out, pac11, base=None, name=None, game='svr2008')
             if im.width >= 256 and im.width * im.height > best:
                 art, best = im, im.width * im.height
     from PIL import Image
-    banner = art
+    # the arena's own picture from its game's arena select (SELECT_PICTURE): the banner, cropped wide
+    photo = None
+    key = SELECT_PICTURE.get(game, {}).get(n)
+    if key and disc.exists('pac/menu/ScrLayHD.pac'):
+        try:
+            got = dict(group_textures(disc.read('pac/menu/ScrLayHD.pac'), 'LSSE')).get('arena_' + key)
+            photo = image(got) if got else None
+            if photo is not None:  # (inside its white frame: 8 of 256 each side)
+                m = max(1, photo.width * 8 // 256)
+                photo = photo.crop((m, m, photo.width - m, photo.height - m))
+        except Exception as e:  # noqa: BLE001 - the VS picture's banner instead
+            warnings.append('arena select picture arena_%s not read: %s' % (key, e))
+    banner = photo if photo is not None else art
+    if photo is not None:
+        notes.append('banner: the arena select picture arena_%s' % key)
+    elif art is not None:
+        notes.append('banner: cut from the VS picture (no arena select picture for this arena)')
     if banner is None:
         banner = host_banner(pac11, base)
         if banner is not None:
@@ -614,28 +764,31 @@ def svr2008_convert(disc, key, out, pac11, base=None, name=None, game='svr2008')
         banner = Image.new('RGBA', (256, 128), (30, 30, 30, 255))
     with open(os.path.join(mod, 'banner.dds'), 'wb') as f:
         f.write(dds_dxt5(fit(banner, 256, 128)))
-    if art is not None:
+    if art is not None or photo is not None:
         with open(os.path.join(mod, 'load.dds'), 'wb') as f:
-            f.write(dds_dxt5(fit(art, 1024, 512)))
+            f.write(dds_dxt5(fit(art if art is not None else photo, 1024, 512)))
+        notes.append('loading picture: %s' % ('the VS picture' if art is not None else 'the arena select picture'))
+    if art is not None:
         if base in VS_BACKGROUND:
             with open(os.path.join(mod, 'vs', VS_BACKGROUND[base] + '.dds'), 'wb') as f:
                 f.write(dds_dxt5(fit(art, 1024, 512)))
     if not os.listdir(os.path.join(mod, 'vs')):
         os.rmdir(os.path.join(mod, 'vs'))
     with open(os.path.join(mod, 'manifest.txt'), 'w', newline='\n') as f:
-        f.write('type=arena\nid=%s\nname=%s\nauthor=SvR %s arena bg%02d, ported by port tools\nversion=1.0\nbase=%s\n'
-                % (mod_id, name, year, n, BASE_NAMES[base]))
+        f.write('type=arena\nid=%s\nname=%s\nauthor=%s arena bg%02d, ported by port tools\nversion=1.0\nbase=%s\n'
+                % (mod_id, name, label, n, BASE_NAMES[base]) + needs_line(data, len(host))
+                + (crowd_area_line(data) if game == 'svr2008' else ''))
     progress(92, 'packing the mod')
     import wwe13_pack
     svrmod = os.path.join(out, mod_id + '.svrmod')
     old = sys.stdout
     sys.stdout = sys.stderr
     try:
-        wwe13_pack.pack(mod, svrmod, 'Port tools (SvR %s)' % year)
+        wwe13_pack.pack(mod, svrmod, 'Port tools (%s)' % label)
     finally:
         sys.stdout = old
     if in11 is None:
-        notes.append('2011 has no %s arena: the mod sits on the %s tile' % (show, BASE_NAMES[base]))
+        notes.append('2011 has no %s arena: the mod plays as the %s arena' % (show, BASE_NAMES[base]))
     progress(100, 'done')
     return {'ok': True, 'out': svrmod, 'folder': mod, 'opens': 'arena', 'warnings': warnings, 'dropped': dropped,
             'notes': notes}
@@ -849,7 +1002,8 @@ def arena_cache_root():
 
 def named_list(disc, game, src, items, cache_root=None, scan=False):
     """WWE '12 - 2K17 'list' items with the game's own arena names ('name', 'bg' keeps bgNN) and, once
-    'scan' has run, 'thumb' (a PNG of the arena's match intro backdrop). Names are cached per disc."""
+    'scan' has run, 'thumb' (a PNG of the arena's match intro backdrop, 320 x 160) and 'picture' (the same backdrop at
+    its own size, 1024 x 512: a banner / loading picture). Names are cached per disc."""
     import arena_names as AN
     path = AN.cache_dir(os.path.abspath(cache_root or arena_cache_root()), game, src)
     cache = None if scan else AN.load_cache(path)
@@ -872,11 +1026,14 @@ def named_list(disc, game, src, items, cache_root=None, scan=False):
         t = cache.get('thumbs', {}).get(str(it['arena']))
         if t and os.path.exists(t):
             it['thumb'] = t
+            if os.path.exists(AN.full_picture(t)):
+                it['picture'] = AN.full_picture(t)
     progress(100, 'done')
     return items, cache.get('scanned', False)
 
 
-FAMILY = {'svr2007': 'svr2007', 'svr2008': 'svr2008', 'svr2009': 'svr2008', 'svr2010': 'svr2010', 'svr2011': 'svr2010'}
+FAMILY = {'svr2007': 'svr2007', 'svr2008': 'svr2008', 'svr2009': 'svr2008', 'low': 'svr2008', 'svr2010': 'svr2010',
+          'svr2011': 'svr2010'}
 LONE_MAGICS = (b'EPAC', b'EPK8', b'HSPC', b'DPAC', b'DPK8', XCOMPRESS)
 
 
@@ -1014,7 +1171,7 @@ def main(argv):
                                'folder, the ISO or one arena pac)')
             if a.cmd in ('list', 'scan'):
                 lists = {'svr2010': svr2010_list, 'svr2008': svr2008_list,
-                         'svr2009': lambda d: svr2008_list(d, SVR2009),
+                         'svr2009': lambda d: svr2008_list(d, SVR2009), 'low': lambda d: svr2008_list(d, LOW),
                          'svr2007': lambda d: svr2008_list(d, SVR2007)}
                 items = lists.get(game_id, bg_list)(disc)
                 if game_id in NATIVE_GAMES:
@@ -1028,7 +1185,7 @@ def main(argv):
                 print(json.dumps(rep))
                 return 3
             os.makedirs(a.out, exist_ok=True)
-            if game_id in ('svr2007', 'svr2008', 'svr2009'):
+            if game_id in ('svr2007', 'svr2008', 'svr2009', 'low'):
                 rep = svr2008_convert(disc, item, a.out, a.pac11, a.base, a.name, game_id)
             else:
                 rep = svr2010_convert(disc, item, a.out, a.base, a.name, a.pac11, '2011' if game_id == 'svr2011' else '2010')

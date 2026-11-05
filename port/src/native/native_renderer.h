@@ -20,6 +20,7 @@
 #include <functional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <cstdint>
 
@@ -42,16 +43,39 @@ std::string FailureReason();
 // game runs (the GRAPHICS page). CanSwitch: started as the main renderer
 // and still working.
 bool CanSwitch();
+
+// Whether an upscaler can run here (the GRAPHICS page's UPSCALING choices): "fsr2" - FSR 2, Direct3D 12 / Vulkan
+// on Windows; "dlss" - NVIDIA DLSS (not in this build yet). `why`: the reason when not (logged once each).
+bool UpscalerAvailable(const std::string& kind, std::string* why = nullptr);
 void SetNativeActive(bool active);
 bool NativeActive();
 
 // What draws the game right now, for the FPS counter: "Native 2x",
 // "Emulated", or "Emulated (native failed)".
 std::string RendererLabel();
+// The renderer's own costs per frame over about the last second (the performance overlay): recording the frame's
+// draws on the CPU, waiting for the GPU to finish the frame before (high: the GPU is the limit), submitting, and the
+// draws; the textures' host memory. Zero before the first frames.
+struct FrameCosts {
+  double draw_ms = 0, gpu_wait_ms = 0, submit_ms = 0, draws = 0, texture_mb = 0;
+  double targets_mb = 0;  // the render targets standing in for the Xbox 360's (colour and depth; scale and wide screen)
+  uint32_t textures = 0;  // the game's textures on the GPU
+};
+FrameCosts LastFrameCosts();
+// The draws of the last frame shown, and how many frames so far (any thread; model_mem.cpp's load watch: a loading
+// screen draws a handful).
+uint32_t LastFrameDraws();
+uint64_t FramesShown();
 
 // Game state (any thread): a match (entrances on) or the menus - on a wide
 // window, matches fill it (native_widescreen), menus stay 16:9.
 void SetMatchScene(bool in_match);
+
+// REPORT A PROBLEM's screenshot (report_page.cpp): the next shown frame's image (the game's, without the port's
+// overlays) kept in memory - previous: the frame shown before the request instead (a pause menu drawn in the frame
+// that read START) - TakeFrameCapture hands it over once (RGB, 3 bytes a pixel; false: none yet).
+void RequestFrameCapture(bool previous = false);
+bool TakeFrameCapture(std::vector<uint8_t>& rgb, uint32_t& width, uint32_t& height);
 
 // 30 fps with the world at 60 Hz (frame_rate.cpp): every other frame is
 // drawn without its draws and clears and not shown. HalfFrames: on, with

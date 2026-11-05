@@ -16,6 +16,8 @@
 #include "disc_list.h"
 #include "full_preview.h"
 #include "json.h"
+#include "move_check.h"
+#include "simple_port.h"
 #include "svrfmt/disc.h"
 #include "tool_run.h"
 
@@ -40,7 +42,11 @@ const Kind kKinds[] = {
     {"Belts", L"belt_port.py", "Title belts' looks, as a texture pack."},
     {"Weapons", L"weapon_port.py", "Weapons' looks, as a texture pack."},
     {"Backstage", L"backstage_port.py", "A backstage room from another game, built into a copy of your own 2011 backstage files and "
-                                        "installed into the game's Mods\\Backstage (its own row in the BACKSTAGE list)."},
+                                        "installed into the game's Mods\\Backstage (its own row in the BACKSTAGE list). Backstage "
+                                        "mods are switched off in the game for now: Backstage Brawl plays the game's own backstage, "
+                                        "so a built room is kept but not loaded."},
+    {"VS screens", L"vs_port.py", "An older game's VS screens (SvR 2008 - 2010: the match set-up page behind the two superstars) as a VS style, "
+                                  "installed into the game's Mods\\VsStyles: pick it in GRAPHICS > VS SCREEN STYLE."},
 };
 constexpr int kKindCount = int(sizeof kKinds / sizeof kKinds[0]);
 
@@ -62,7 +68,9 @@ char g_options[256] = "";      // extra converter options (advanced)
 std::string g_test_item;
 int g_force_kind = -1;  // (the test's tab: ImGui reports the first tab selected until SetSelected takes)
 bool g_same_moves = false;      // (PS2 superstars: --same-moves, no "similar" stand-ins)
+bool g_vs_renders = true;       // (VS screens: --renders, that game's renders for 2011's superstars too)
 bool g_test_fp = false;         // (--port-fullpreview: an entrance test's result opens in the Full preview)
+std::string g_test_as_attire;   // (--port-as-attire <star>,<slot>,<from>[,<name>][;<save .svrmod>]: a superstar result goes on as an attire)
 int g_test_stage = -1;          // 0 list, 1 convert, 2 open, 3 done
 std::string g_test_game;        // (--port-test kind@game: a folder's game, as picked in its combo)
 
@@ -81,6 +89,8 @@ std::vector<std::wstring> g_lone_args;
 // Embedded (a Simple mode's steps): the result is handed back (EmbeddedResult), not opened on its page.
 bool g_embedded = false;
 std::wstring g_embedded_result;
+std::wstring g_embedded_picture;  // (an arena result: the disc's picture of it, from the scan)
+std::string g_embedded_name;      // (an arena result: the game's own name of it, from the scan; "" none)
 
 // ---- the work folder (<game>\Mods\.convert\port): the converters' results and their copies of disc files
 constexpr uint64_t kTrimAbove = 3ull << 30, kTrimTo = 3ull << 29;  // 3 GB -> 1.5 GB
@@ -98,39 +108,55 @@ uint64_t FolderBytes(const fs::path& f) {
   return n;
 }
 
-// Measure (and with keep, trim: oldest folders out until under kTrimTo; "clear": everything) on a thread.
-void CacheJob(bool trim, bool clear_all, fs::path keep = {}) {
+// Measure on a thread; trim: the oldest work data out until under kTrimTo - only the converters' own dot folders in
+// each result's folder (.src_<game>: the disc's files copied, .work_*: steps), never a converted mod (its .svrmod,
+// its folder, report.json): the whole result folders went, oldest first, and a player converting eight 2K14
+// superstars kept the last three (reports 20261101-110225, 20261101-122401). clear_all (Clear it, asked first): every
+// result too; work_only with it: the work data alone.
+void CacheJob(bool trim, bool clear_all, fs::path keep = {}, bool work_only = false) {
   if (g_cache_busy.exchange(true)) return;
-  std::thread([dir = WorkDir(), trim, clear_all, keep] {
+  std::thread([dir = WorkDir(), trim, clear_all, keep, work_only] {
     std::error_code ec;
     struct Item {
       fs::path path;
       fs::file_time_type when;
       uint64_t bytes;
     };
-    std::vector<Item> items;
+    std::vector<Item> results, work;  // (result folders; the work data inside them)
     uint64_t total = 0;
     for (const auto& e : fs::directory_iterator(dir, ec)) {
       if (!e.is_directory(ec)) continue;
       const uint64_t b = FolderBytes(e.path());
-      items.push_back({e.path(), e.last_write_time(ec), b});
+      results.push_back({e.path(), e.last_write_time(ec), b});
       total += b;
+      for (const auto& w : fs::directory_iterator(e.path(), ec))
+        if (w.is_directory(ec) && w.path().filename().wstring().rfind(L".", 0) == 0)
+          work.push_back({w.path(), w.last_write_time(ec), FolderBytes(w.path())});
     }
     std::string removed;
-    if (clear_all || (trim && total > kTrimAbove)) {
-      std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.when < b.when; });
-      for (const auto& it : items) {
+    auto drop = [&](const Item& it) {
+      fs::remove_all(it.path, ec);
+      if (!ec) total -= std::min(total, it.bytes), removed += (removed.empty() ? "" : ", ") + Utf8(it.path.wstring().substr(dir.wstring().size() + 1));
+    };
+    const auto oldest = [](const Item& a, const Item& b) { return a.when < b.when; };
+    if (clear_all && !work_only) {
+      for (const auto& it : results) drop(it);
+    } else if (clear_all || (trim && total > kTrimAbove)) {
+      std::sort(work.begin(), work.end(), oldest);
+      for (const auto& it : work) {
         if (!clear_all && total <= kTrimTo) break;
-        if (!keep.empty() && fs::equivalent(it.path, keep, ec)) continue;
-        fs::remove_all(it.path, ec);
-        if (!ec) total -= it.bytes, removed += (removed.empty() ? "" : ", ") + Utf8(it.path.filename().wstring());
+        if (!clear_all && !keep.empty() && fs::equivalent(it.path.parent_path(), keep, ec)) continue;  // (the one just made)
+        drop(it);
       }
     }
+    const bool over = trim && total > kTrimAbove;  // (results alone over the limit: said, never removed)
     g_cache_bytes = total;
     g_cache_busy = false;
-    OnUiThread([removed] {
+    OnUiThread([removed, over, total] {
       g_cache_known = true;
-      if (!removed.empty()) Log("port: work folder trimmed: " + removed);
+      if (!removed.empty()) Log("port: work data removed: " + removed);
+      if (over) Log("port: the converted mods in Mods\\.convert\\port take " + Human(size_t(total)) +
+                    " - install or save the ones you want, then Clear it (nothing is removed by itself)");
     });
   }).detach();
 }
@@ -141,12 +167,19 @@ void CacheRow() {
   ImGui::TextDisabled("Port work folder: %s", g_cache_busy && !g_cache_known ? "measuring ..." : Human(size_t(b)).c_str());
   ImGui::SameLine();
   Hint("The converters' results and their copies of the disc's files (Mods\\.convert\\port in the game folder). "
-       "Converted mods open from here; once saved or installed they aren't needed. Above 3 GB the oldest are "
-       "removed after a conversion.");
+       "Converted mods open from here; once saved or installed they aren't needed. Above 3 GB the oldest copies "
+       "of disc files are removed after a conversion - never a converted mod.");
   ImGui::SameLine();
   ImGui::BeginDisabled(Busy() || g_cache_busy || !b);
-  if (ImGui::SmallButton("Clear it")) CacheJob(false, true);
+  if (ImGui::SmallButton("Clear it")) ImGui::OpenPopup("##clearwork");
   ImGui::EndDisabled();
+  if (ImGui::BeginPopup("##clearwork")) {  // (asked: a converted mod not yet installed or saved lives only here)
+    ImGui::TextUnformatted("Converted mods you haven't installed or saved are only in this folder.");
+    if (ImGui::Button("Remove the disc copies and work files only")) CacheJob(false, true, {}, true), ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Remove everything, converted mods too")) CacheJob(false, true), ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
 }
 
 std::wstring Source() {
@@ -452,9 +485,12 @@ void Convert(int k, const std::string& game, const Json& item) {
   }
   for (auto& x : SvrmodArgs(k, game)) args.push_back(x);
   if (g_same_moves && game.rfind("ps2_", 0) == 0 && std::wstring(kKinds[k].script) == L"superstar_port.py") args.push_back(L"--same-moves");
+  if (std::wstring(kKinds[k].script) == L"superstar_port.py")  // (the attire picker's choice: which four, in order)
+    if (const std::string at = simple_port::AttireChoice(game, Source(), key); !at.empty()) args.push_back(L"--attires"), args.push_back(Wide(at));
   if (entrance && !g_settings.bink2_tool.empty())  // (its --titantron: Bink 2 movies through the player's tool)
     args.push_back(L"--bink2-tool"), args.push_back(g_settings.bink2_tool);
   if (NeedsPicture(item) && !g_pp.pick.empty()) args.push_back(L"--picture"), args.push_back(Wide(g_pp.pick));
+  if (g_vs_renders && std::wstring(kKinds[k].script) == L"vs_port.py") args.push_back(L"--renders");
   for (auto& o : Options()) args.push_back(o);
   for (auto& o : g_lone_args) args.push_back(o);
   g_result = Json();
@@ -679,7 +715,9 @@ void NativeArenas(int k, const std::string& game, const std::string& game_name) 
   ImGui::EndChild();
   if (!g_native_test.empty() && (!g_list.items.empty() || !g_list_error.empty())) {  // (test: pick by name, once the statuses are in)
     for (int i = 0; i < int(g_native.size()); ++i)
-      if (Lower(g_native[size_t(i)].name) == Lower(g_native_test) && !NativeBlocked(g_native[size_t(i)])) g_native_pick = i;
+      if ((Lower(g_native[size_t(i)].name) == Lower(g_native_test) || Lower(g_native[size_t(i)].name) == Lower(g_native_test) + ".pac") &&
+          !NativeBlocked(g_native[size_t(i)]))  // (bg07 or bg07.pac)
+        g_native_pick = i;
     if (g_native_pick < 0) Log("port test: no arena pac " + g_native_test), g_native_test.clear();
   }
   if (g_native_pick >= 0 && NativeBlocked(g_native[size_t(g_native_pick)])) g_native_pick = -1;  // (its status came in after the pick)
@@ -695,7 +733,21 @@ void NativeArenas(int k, const std::string& game, const std::string& game_name) 
   const std::wstring image = src_folder ? L"" : src, folder = src_folder ? src : L"";
   const fs::path out = WorkDir() / Wide("Arenas_" + game + "_" + p.name);
   const bool embedded = g_embedded;
-  RunInBackground([p, image, folder, out, game, embedded] {
+  // the scan's picture (the full-size backdrop when the scan kept it, else its thumb) as the banner + loading picture,
+  // and the game's own name of the arena with the game's ("RAW (WWE 2K17)": most are SvR2011's own shows too) as the
+  // mod's name
+  const Json& item = NativeItem(p);
+  const std::wstring thumb = Wide(!item["picture"].Str().empty() ? item["picture"].Str() : item["thumb"].Str());
+  const std::string stem = fs::path(p.name).stem().string(), scanned = item["name"].Str();
+  // (the arena select shows about 30 letters: a long one gets "(2K17)", then nothing)
+  const disc_list::Game* from = disc_list::GameByKey(game);
+  std::string title = !scanned.empty() && Lower(scanned) != Lower(stem) && Lower(scanned).rfind("arena bg", 0) != 0 ? scanned : "";
+  if (!title.empty() && from) {
+    const std::string full = from->name, brief = full.rfind("WWE ", 0) == 0 ? full.substr(4) : full;
+    if (title.size() + full.size() + 3 <= 30) title += " (" + full + ")";
+    else if (title.size() + brief.size() + 3 <= 30) title += " (" + brief + ")";
+  }
+  RunInBackground([p, image, folder, out, game, embedded, thumb, title, stem] {
     Progress("Copying " + p.name + " off the disc ...");
     Bytes b;
     bool ok = false;
@@ -708,15 +760,15 @@ void NativeArenas(int k, const std::string& game, const std::string& game_name) 
     std::error_code ec;
     fs::create_directories(out.parent_path(), ec);
     if (!ok || !svrfmt::WriteFile(Utf8(out.wstring()), b)) { Status("Could not copy " + p.name + "."); return; }
-    OnUiThread([out, p, game, embedded] {
+    OnUiThread([out, p, game, embedded, thumb, title, stem] {
       if (embedded) {  // (a Simple mode converts it itself)
-        Log("port: " + p.name + " -> " + Utf8(out.wstring()));
-        g_embedded_result = out.wstring();
+        Log("port: " + p.name + " -> " + Utf8(out.wstring()) + (title.empty() ? "" : " (" + title + ")"));
+        g_embedded_result = out.wstring(), g_embedded_picture = thumb, g_embedded_name = title;
         CacheJob(true, false, out.parent_path());
         return;
       }
       Log("port: " + p.name + " -> " + Utf8(out.wstring()) + " (Arena > From another game)");
-      other_page::UseArenaFile(out.wstring(), IdFrom(game + "_" + fs::path(p.name).stem().string(), "arena"));
+      other_page::UseArenaFile(out.wstring(), !title.empty() ? title : IdFrom(game + "_" + stem, "arena"), thumb);
       GoTo(PageId::kOther);
       CacheJob(true, false, out.parent_path());
     });
@@ -746,6 +798,20 @@ void OpenResult() {
     if (ProjectOpenFolder(p.wstring())) Status("Installed into Mods\\Backstage\\" + Utf8(p.filename().wstring()) + ", opened on the Backstage tab.");
     return;
   }
+  if (opens == "vs_style") {  // a VS style folder: into the game's Mods\VsStyles\<game id> (vs_port.py)
+    const std::string as = g_result["install_as"].Str().empty() ? Utf8(p.filename().wstring()) : g_result["install_as"].Str();
+    const fs::path dst = fs::path(g_game) / L"Mods" / L"VsStyles" / Wide(as);
+    fs::create_directories(dst, ec);
+    for (const wchar_t* f : {L"manifest.txt", L"vs.pac"})
+      if (!ec) fs::copy_file(p / f, dst / f, fs::copy_options::overwrite_existing, ec);
+    if (!ec && fs::exists(p / L"renders", ec)) {  // (its renders: a media pack of their own)
+      const fs::path media = fs::path(g_game) / L"Mods" / L"Media" / Wide(as + "_renders");
+      fs::copy(p / L"renders", media, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    }
+    Status(ec ? "Could not install the style: " + ec.message()
+              : "Installed into Mods\\VsStyles\\" + as + ": pick it in the game's GRAPHICS > VS SCREEN STYLE (from the next start).");
+    return;
+  }
   if (opens == "belt" || opens == "weapon") {  // a texture pack folder: into the game's Texture Packs
     const fs::path dst = fs::path(g_game) / L"Texture Packs" / p.filename();
     fs::create_directories(dst.parent_path(), ec);
@@ -767,8 +833,10 @@ void OpenResult() {
 
 std::wstring PickOneFile() {
   static const COMDLG_FILTERSPEC kPac[1] = {{L"An arena, entrance or character file (*.pac)", L"*.pac"}};
-  return PickFile(false, L"One file from another game: an arena (pac\\bg\\bgNN.pac), an entrance (Nyujyo0.pac, Entrance01.pac) "
-                         L"or a character (pac\\ch\\chNNN.pac, a PS2 game's CH.PAC)", kPac, 1);
+  const std::wstring f = PickFile(false, L"One file from another game: an arena (pac\\bg\\bgNN.pac), an entrance (Nyujyo0.pac, Entrance01.pac) "
+                         L"or a character (pac\\ch\\chNNN.pac, a PS2 game's CH.PAC)", kPac, 1, nullptr, nullptr, OtherGameStart());
+  if (!f.empty()) OtherGamePicked(f);
+  return f;
 }
 bool CharacterName(const std::string& stem);
 // the one-file source, read as a character file (not named like an arena or entrance pac)
@@ -972,6 +1040,7 @@ void LoneStar(int k, const std::string& game) {
     Hint("The file's name doesn't say it: the number in the game's own name for it (chNNN.pac).");
     if (g_lone_id > 0) key = std::to_string(g_lone_id);
   }
+  if (ps2 && !key.empty()) simple_port::AttirePicker(game, Source(), key);
   ImGui::SetNextItemWidth(260 * g_scale);
   ImGui::InputTextWithHint("Name", "the file's name if left empty", g_lone_name, sizeof g_lone_name);
   if (game.rfind("ps2_", 0) == 0) {
@@ -1051,8 +1120,9 @@ void DiscRow() {
         g_disc = i, g_folder.clear(), g_image.clear(), g_file.clear(), g_list = Json(), g_list_for.clear(), g_result = Json();
     ImGui::Separator();
     if (ImGui::Selectable("An extracted folder ...")) {
-      const std::wstring f = PickFolder(L"A folder with another game's files (an extracted disc)");
-      if (!f.empty()) g_folder = f, g_image.clear(), g_file.clear(), g_list = Json(), g_list_for.clear(), g_result = Json();
+      const std::wstring f = PickFolder(L"A folder with another game's files (an extracted disc)", OtherGameStart());
+      if (const std::string why = disc_list::NotGameFiles(f); !why.empty()) Status(why), Log("port: " + Utf8(f) + " - " + why);
+      else if (!f.empty()) OtherGamePicked(f), g_folder = f, g_image.clear(), g_file.clear(), g_list = Json(), g_list_for.clear(), g_result = Json();
     }
     if (ImGui::Selectable("One file: an arena, an entrance or a character (.pac) ...")) {
       const std::wstring f = PickOneFile();
@@ -1070,7 +1140,9 @@ void DiscRow() {
 }  // namespace
 
 void TestClear() { CacheJob(false, true); }
+void TestTrim() { CacheJob(true, false); }  // (--port-trim: the after-conversion trim, nothing kept)
 void TestFullPreview() { g_test_fp = true; }
+void TestAsAttire(const std::string& spec) { g_test_as_attire = spec; }
 // The ported entrance (g_result: its move pack and number), played whole by `who` before it is installed.
 int g_fp_who = 139;
 void PortedEntrancePreview(const Json& item) {
@@ -1169,7 +1241,16 @@ void KindBody(int k) {
     if (g_result_error.empty()) {
       if (g_test_fp && std::wstring(kKinds[k].script) == L"entrance_port.py" && g_pick >= 0 && g_pick < int(g_list.items.size()))
         PortedEntrancePreview(g_list.items[size_t(g_pick)]);
-      else
+      else if (!g_test_as_attire.empty() && g_result["opens"].Str() == "superstar") {
+        const std::string& t = g_test_as_attire;
+        const size_t semi = t.find(';');
+        const std::string a = t.substr(0, semi), save = semi == std::string::npos ? "" : t.substr(semi + 1);
+        const size_t c1 = a.find(','), c2 = a.find(',', c1 + 1), c3 = a.find(',', c2 + 1);
+        attire_page::TestStart(std::atoi(a.c_str()), Wide(g_result["out"].Str()), std::atoi(a.c_str() + c1 + 1), Wide(save));
+        attire_page::TestFrom(std::atoi(a.c_str() + c2 + 1), c3 == std::string::npos ? "" : a.substr(c3 + 1));
+        Log("port test: the superstar goes on " + a + " as an attire");
+        GoTo(PageId::kAttire);
+      } else
         OpenResult();
     }
   }
@@ -1234,10 +1315,16 @@ void KindBody(int k) {
     Hint("Ticked: only the moves 2011 has too come over; a move it lacks keeps the fighting style's. Unticked: a "
          "similar 2011 move stands in for one it lacks (marked \"similar\" in the moveset, to swap if you like).");
   }
+  if (std::wstring(kKinds[k].script) == L"vs_port.py") {
+    ImGui::Checkbox("That game's renders for 2011's superstars too", &g_vs_renders);
+    Hint("Ticked: the superstars both games have (the same name) show this game's renders - on the VS screen and "
+         "everywhere 2011 shows renders - as a media pack of their own (Mods\Media, off there to go back).");
+  }
   if (NeedsPicture(item)) {
     AskPictures(k, game, item);
     PicturePicker();
   }
+  if (std::wstring(kKinds[k].script) == L"superstar_port.py") simple_port::AttirePicker(game, Source(), ItemKey(item));
   ImGui::SetNextItemWidth(360 * g_scale);
   const bool room = std::wstring(kKinds[k].script) == L"backstage_port.py";
   ImGui::InputTextWithHint("Options (advanced)", room ? "e.g. --name \"Parking Lot\" (the row's name)" : "e.g. --height 1.05 --no-moves", g_options, sizeof g_options);
@@ -1273,7 +1360,19 @@ void KindBody(int k) {
   if (!g_result_error.empty()) ImGui::TextColored(kBad, "%s", g_result_error.c_str());
   if (g_result.type == Json::Type::kObject && g_result["ok"].Truthy()) {
     ImGui::SameLine();
-    if (ImGui::Button(g_result["opens"].Str() == "belt" || g_result["opens"].Str() == "weapon" ? "Install the pack" : g_embedded ? "5. Use it" : "5. Open it to finish")) OpenResult();
+    if (ImGui::Button(g_result["opens"].Str() == "belt" || g_result["opens"].Str() == "weapon" ? "Install the pack" :
+                      g_result["opens"].Str() == "vs_style" ? "Install the style" : g_embedded ? "5. Use it" : "5. Open it to finish")) OpenResult();
+    if (g_result["opens"].Str() == "superstar" && !g_embedded) {  // (or onto a superstar of the game: one of its attires)
+      ImGui::SameLine();
+      if (ImGui::Button("Or put it on a game superstar as an attire...")) {
+        attire_page::UseStarMod(Wide(g_result["out"].Str()));
+        GoTo(PageId::kAttire);
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The Attires page with this superstar's model taken in: pick the game superstar, the attire\n"
+                          "number and which of the ported attires (once per attire). Its entrance can come along; its\n"
+                          "moveset, theme and ratings belong to a superstar, not to an attire, so they stay the game's.");
+    }
     if (const int t = std::atoi(g_result["template"].Str().c_str()); t > 0)  // (moves: what it was built on)
       ImGui::TextDisabled("Built on the 2011 move %s (%d)%s; record %s. Not right? Pick a template above and convert again.",
                           MoveName(t).c_str(), t, g_template > 0 ? "" : ", picked automatically", g_result["id"].Str().c_str());
@@ -1297,6 +1396,13 @@ void KindBody(int k) {
       for (const auto& w : v.items)
         ImGui::TextColored(std::string(list) == "warnings" ? kWarn : ImVec4(0.65f, 0.65f, 0.7f, 1), "%s%s",
                            std::string(list) == "dropped" ? "left out: " : "", w.Str().c_str());
+    }
+    // a ported move: the inspector and "Will it work in-game?" before it goes in a moveset (move_check.h)
+    if (g_result["opens"].Str() == "moves" && std::wstring(kKinds[k].script) == L"moves_port.py") {
+      const int id = std::atoi(g_result["id"].Str().c_str());
+      const fs::path pack = Wide(g_result["out"].Str());
+      std::error_code ec;
+      if (id > 0 && fs::exists(pack / L"pack.txt", ec)) move_check::DrawPanel(pack, id);
     }
   }
 }
@@ -1444,7 +1550,9 @@ std::string KindsFor(const std::string& disc_id) {
 }
 
 std::wstring EmbeddedResult() { return g_embedded_result; }
-void ClearEmbeddedResult() { g_embedded_result.clear(); }
+std::wstring EmbeddedPicture() { return g_embedded_picture; }
+std::string EmbeddedName() { return g_embedded_name; }
+void ClearEmbeddedResult() { g_embedded_result.clear(), g_embedded_picture.clear(), g_embedded_name.clear(); }
 
 }  // namespace port_page
 }  // namespace mm

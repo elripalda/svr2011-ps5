@@ -23,14 +23,23 @@
 // - owned: DLC-flagged ids must be owned (sub_828C1288 / sub_82589198):
 //   mods are.
 // The select screen shows them in the EXTRA list (managers.cpp, the M tile).
+#include "big_roster.h"
 #include "cae_mod_motions.h"
+#include "no_mods.h"
+#include "caw_limits.h"
+#include "mem_trace.h"
 #include "superstar_mods.h"
+#include "mod_transfer.h"
+#include "p2p.h"
+#include "match_box.h"
+#include "superstar_threads.h"
 #include "universe_mods.h"
 #include "universe_welcome.h"
 #include "move_packs.h"
 #include "startup_pump.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -38,6 +47,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -49,10 +61,12 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/vfs.h>
+#include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
 #include <rex/system/xmemory.h>
+#include <rex/thread.h>
 
 #include "generated/default/svr2011_init.h"
 #include "../modmaker/svrfmt/pac.h"
@@ -60,11 +74,19 @@
 #include "crowd_signs.h"
 #include "jukebox.h"
 #include "media_mods.h"
+#include "vs_styles.h"
 #include "music.h"
 #include "hd_movies.h"
 #include "user_movies.h"
+#include "ascii_fold.h"  // (launcher/)
+#include "../modmaker/svrfmt/bytes.h"
+#include "util.h"
 
 namespace fs = std::filesystem;
+
+REXCVAR_DEFINE_BOOL(per_mod_saves, false, "Gameplay",
+                    "Experimental: each superstar mod's save data (record, moves, entrance) in Saves/.mods/<mod>.dat instead "
+                    "of SaveData.dat - an uninstalled mod leaves the save clean, a reinstalled one gets its data back");
 
 namespace {
 
@@ -98,6 +120,8 @@ static_assert(std::size(kPool) == 137);
 constexpr uint32_t kOwnId = 32, kOwnId2 = 218;  // u16 own id in the record
 constexpr uint32_t kSignIds = 210;               // u16[4]: the crowd signs its fans hold (id*10 + 1..4)
 constexpr uint32_t kSelectTile = 226;            // u16: its tile in the select grid's portrait table
+constexpr int kMinUsableMoves = 40;  // (EnsureMoveset: fewer usable moves than this - the move-set doesn't work)
+bool g_moves_checked = false;        // (CheckModProfiles: the mods' moves checked since the profiles were set up)
 constexpr uint32_t kIdToIndex = 0x82DB3610;  // u16 per id
 constexpr uint32_t kRecords = 0x82E407C0, kRecordSize = 260;
 constexpr uint32_t kProfiles = 0x82E7C920, kProfileSize = 1056;
@@ -107,7 +131,12 @@ constexpr uint32_t kSelectable = 221, kDlc = 257, kSamePerson = 228, kAbilities 
 
 struct Mod {
   std::string folder, name, short_name;
+  fs::path dir;       // its folder (Mods/Superstars/<folder>, or OnlineMods/Superstars/<folder>@<crc>)
+  bool temp = false;  // fetched from a session's host for this run (OnlineMods): never in saves, Universe, Threads
   uint32_t base = 0, slot = 0;
+  // its key (Mods/Superstars/keys.txt, 400-999, never changes): its overlay files are named and their entries stamped
+  // with it, whatever id the mod holds - the id's model / render lookups are answered with the key's entries (KeyAlias)
+  uint32_t key = 0;
   std::string ch_guest, ssf_guest;  // the overlay files, as the game opens them
   std::vector<std::string> attire_guests;  // extra attires' pacs (manifest attire<N>=)
   uint32_t attires = 1;                    // attires it has (its pacs' EMD models)
@@ -132,9 +161,14 @@ struct Mod {
   bool styled = false;
   int ratings[7] = {-1, -1, -1, -1, -1, -1, -1};
   fs::path voice;  // its own recorded name for the ring announcer (manifest voice=)
+  // its loading picture (manifest loading=<file>, else the folder's load.dds; 1024 x 512 DXT5): the NOW LOADING
+  // screen of a match it is in (arena_mods.cpp SetSuperstarLoading)
+  fs::path loading;
+  float call_gain = 0.0f;  // call_gain=<dB>: its level against the game's own calls (0 = as loud as they are)
   // a superstar the game's sound banks still have (manifest announcer=<NAME>,
   // e.g. JEFFHARDY): the ring announcer says it with the game's own
   // RA_*_<NAME>_* clips, in the categories where the base says its own name
+  std::string version;  // (manifest version=)
   std::string announcer;
   // its hometown for the ring announcer (manifest hometown=<CITY>[,<STATE>]:
   // the game's own clips, RA_*_HTC_<CITY>_0 / RA_*_HTS_<STATE>_0, e.g.
@@ -146,6 +180,16 @@ struct Mod {
   std::vector<std::pair<uint16_t, uint16_t>> moves;
   int entrance = -1;            // entrance number (manifest entrance=; profile +0x1C0 +0x14..+0x18)
   int attire_entrance[4] = {-1, -1, -1, -1};  // per attire (manifest attire<N>_entrance=; EntranceForAttire)
+  int victory = -1;  // its victory scene when it wins a singles match (manifest victory=; VictoryOfWinner)
+  // a created entrance (manifest cae=<file>: a whole 284-byte entrance block as the game holds it, big-endian -
+  // its five scene parts are copied in: motion, pyro and the rest per scene, as CREATE AN ENTRANCE's ADVANCED
+  // CREATION makes them); its parts' hash (.applied cae=) so a player's own later edit stays
+  std::vector<uint8_t> cae;
+  uint32_t cae_hash = 0;
+  // what it puts into a profile (base, own moves, entrance numbers, created entrance, theme, movie, victory):
+  // a save's profile for the slot made for another mod - or this one before an update - isn't kept (CheckSavedProfiles)
+  uint32_t fingerprint = 0;
+  std::vector<uint32_t> caes_set;
   std::vector<uint8_t> abilities;  // (manifest abilities=a,b,...; record +230.., up to 8)
   // its height: a factor of the base's (manifest height=1.05; 0 = the base's)
   double height = 0;
@@ -162,10 +206,7 @@ fs::path g_game;
 bool g_mounted = false;
 
 uint32_t Rd16(const uint8_t* p) { return uint32_t(p[0]) << 8 | p[1]; }
-uint32_t Rd32(const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
-void Wr32(uint8_t* p, uint32_t v) {
-  p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
-}
+using svrfmt::Rd32, svrfmt::Wr32;
 
 // A model pac's EMD entry names ("%06d%02d": character id, attire*10 + kind)
 // get the slot's id, whichever character the pac was made for (the base's
@@ -342,7 +383,33 @@ std::vector<std::pair<std::string, uint32_t>> ReadSlots(const fs::path& file) {
       const size_t tab = l.rfind('\t');
       if (tab == std::string::npos) continue;
       const uint32_t id = uint32_t(std::atoi(l.c_str() + tab + 1));
-      if (std::find(std::begin(kPool), std::end(kPool), id) != std::end(kPool)) out.push_back({l.substr(0, tab), id});
+      if (std::find(std::begin(kPool), std::end(kPool), id) != std::end(kPool) ||
+          (svr2011::BigRosterOn() && id >= svr2011::kFirstHighId && id <= svr2011::kLastHighId))  // (big_roster: past 322)
+        out.push_back({l.substr(0, tab), id});
+    }
+    std::fclose(t);
+  }
+  return out;
+}
+
+// Each mod's key (Mods/Superstars/keys.txt: "<folder>\t<key>"): ids its overlay files are stamped with, outside
+// the game's (0-321) and under 1000 (a render's name is attire * 1000 + id, SSFA/%04d) - a mod can then hold any id,
+// or none, with its files mounted once.
+constexpr uint32_t kFirstKey = 400, kLastKey = 999;
+// A mod's own crowd signs: 10000 + key * 10 + 1..4 (as a character's, id * 10 + n - but the game's own signs and the
+// sign packs use 1-9991)
+constexpr uint32_t kModSignBase = 10000;
+std::vector<std::pair<std::string, uint32_t>> ReadKeys(const fs::path& file) {
+  std::vector<std::pair<std::string, uint32_t>> out;
+  if (FILE* t = std::fopen(file.string().c_str(), "rb")) {
+    char line[512];
+    while (std::fgets(line, sizeof line, t)) {
+      std::string l = line;
+      while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+      const size_t tab = l.rfind('\t');
+      if (tab == std::string::npos) continue;
+      const uint32_t k = uint32_t(std::atoi(l.c_str() + tab + 1));
+      if (k >= kFirstKey && k <= kLastKey) out.push_back({l.substr(0, tab), k});
     }
     std::fclose(t);
   }
@@ -362,6 +429,23 @@ std::string FileName(std::string s) {
   return s;
 }
 
+// The movie's file name: plain letters ("Demon Finn Bálor" -> "Demon Finn Balor") - the game's paths are 8-bit and
+// USER MOVIES skips a name with accents, so such a mod's entrance played titantron 999 (2.1.7 report, Discovery 36 /
+// 103). The folder's, or "mod <hash of the folder>", where the name has no plain letters at all.
+std::string MovieName(const std::string& name, const std::string& folder) {
+  const auto plain = [](const std::string& utf8) {
+    std::string s;
+    for (wchar_t c : fs::u8path(utf8).wstring()) {
+      const wchar_t f = ascii_fold_char(c);
+      if (f >= 32 && f < 127) s += char(f);
+    }
+    return s.find_first_not_of(" ._-") == std::string::npos ? std::string() : FileName(s);
+  };
+  std::string n = plain(name);
+  if (n.empty()) n = plain(folder);
+  return n.empty() ? fmt::format("mod {:08X}", uint32_t(std::hash<std::string>{}(folder))) : n;
+}
+
 bool CopyIfChanged(const fs::path& from, const fs::path& to) {
   std::error_code ec, e1, e2;
   // (same size and not older: kept - a re-encoded theme can keep its size)
@@ -372,14 +456,77 @@ bool CopyIfChanged(const fs::path& from, const fs::path& to) {
   return fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
 }
 
+// The Music folder's playlist names the port gave mods' themes (Music\.mod_themes: "<name>\t<mod folder>"): a
+// playlist name is both what USER PLAYLIST shows and what an entrance keeps, so two mods - or a mod and a player's
+// own song - with the same name played one file (2.1.3 report: themes swapped between converted superstars).
+std::map<std::string, std::string> g_theme_owner;
+bool g_theme_owner_read = false;
+
+fs::path ThemeOwnersFile() {
+  const fs::path music = svr2011::UserMusicFolder();
+  return music.empty() ? fs::path() : music / ".mod_themes";
+}
+
+void ReadThemeOwners() {
+  if (g_theme_owner_read) return;
+  g_theme_owner_read = true;
+  std::ifstream in(ThemeOwnersFile());
+  for (std::string l; std::getline(in, l);) {
+    if (!l.empty() && l.back() == '\r') l.pop_back();
+    if (const size_t t = l.find('\t'); t != std::string::npos) g_theme_owner[l.substr(0, t)] = l.substr(t + 1);
+  }
+}
+
+void WriteThemeOwners() {
+  std::ofstream out(ThemeOwnersFile(), std::ios::trunc);
+  for (const auto& [name, folder] : g_theme_owner) out << name << '\t' << folder << '\n';
+}
+
+bool SameBytes(const fs::path& a, const fs::path& b) {
+  std::error_code ec;
+  if (fs::file_size(a, ec) != fs::file_size(b, ec) || ec) return false;
+  std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+  char x[65536], y[65536];
+  while (fa && fb) {
+    fa.read(x, sizeof x), fb.read(y, sizeof y);
+    if (fa.gcount() != fb.gcount() || std::memcmp(x, y, size_t(fa.gcount()))) return false;
+  }
+  return true;
+}
+
+// The playlist name a mod's theme gets: the mod's name, unless another mod owns it or the player has a song /
+// playlist of that name - then "<name> [<mod folder>]" (39 characters, as the entrance keeps). A song file the port
+// wrote before this list existed (the same bytes as the mod's theme) is the mod's own.
+std::string ThemeName(const Mod& m, const fs::path& music, const fs::path& theme) {
+  ReadThemeOwners();
+  const std::string plain = FileName(m.name);
+  auto taken = [&](const std::string& n) {
+    if (const auto it = g_theme_owner.find(n); it != g_theme_owner.end()) return it->second != m.folder;
+    std::error_code ec;
+    if (fs::is_directory(music / n, ec)) return true;
+    for (const auto& e : fs::directory_iterator(music, ec)) {
+      if (!e.is_regular_file(ec) || e.path().stem().string() != n) continue;
+      return !SameBytes(e.path(), theme);  // (a player's own song - or the port's, from before the list)
+    }
+    return false;
+  };
+  std::string name = plain;
+  if (taken(name)) {
+    const std::string tag = " [" + m.folder.substr(0, 30) + "]";
+    name = FileName(plain.substr(0, plain.size() + tag.size() > 39 ? 39 - tag.size() : plain.size()) + tag);
+  }
+  if (g_theme_owner[name] != m.folder) g_theme_owner[name] = m.folder, WriteThemeOwners();
+  return name;
+}
+
 void InstallMedia(Mod& m, const fs::path& folder, const std::string& song, const std::string& movie, float song_gain) {
   std::error_code ec;
-  const std::string name = FileName(m.name);
   if (!song.empty() && fs::exists(folder / song, ec)) {
     const fs::path music = svr2011::UserMusicFolder();
-    const fs::path to = music / (name + fs::path(song).extension().string());
+    const std::string theme = music.empty() ? std::string() : ThemeName(m, music, folder / song);
+    const fs::path to = music / (theme + fs::path(song).extension().string());
     if (!music.empty() && CopyIfChanged(folder / song, to)) {
-      m.song = name;
+      m.song = theme;
       svr2011::SetSongGain(to, song_gain);
     }
   }
@@ -389,7 +536,7 @@ void InstallMedia(Mod& m, const fs::path& folder, const std::string& song, const
   const std::string bik = mp4 ? fs::path(movie).replace_extension(".bik").string() : movie;
   if (!movie.empty() && fs::path(bik).extension() == ".bik") {
     const fs::path movies = svr2011::UserMoviesFolder();
-    const std::string file = name + ".bik";
+    const std::string file = MovieName(m.name, m.folder) + ".bik";
     bool ok = !movies.empty() && fs::exists(folder / bik, ec) && CopyIfChanged(folder / bik, movies / file);
     if (mp4 && !movies.empty() && fs::exists(folder / movie, ec) && svr2011::RegisterHdMovie(file, folder / movie)) ok = true;
     if (ok) {
@@ -438,6 +585,51 @@ void SetOwnMoves(uint8_t* profile, const Mod& m) {
       profile[kEntrance + k] = uint8_t(m.entrance >> 8), profile[kEntrance + k + 1] = uint8_t(m.entrance);
 }
 
+// The mod's fingerprint (Mod::fingerprint): FNV-1a over what SetOwnMoves / SetEntranceMedia / SetCaeParts put in.
+uint32_t Fingerprint(const Mod& m) {
+  uint32_t h = 2166136261u;
+  const auto add = [&](const void* p, size_t n) {
+    for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<const uint8_t*>(p)[i]) * 16777619u;
+  };
+  const auto add_int = [&](int64_t v) { add(&v, sizeof v); };
+  add_int(m.base);
+  for (const auto& [off, id] : m.moves) add_int(int64_t(off) << 16 | id);
+  add_int(m.entrance);
+  for (int e : m.attire_entrance) add_int(e);
+  add(m.cae.data(), m.cae.size());
+  add(m.song.data(), m.song.size());
+  add_int(m.movie);
+  add_int(m.music);
+  add_int(m.victory);
+  return h;
+}
+
+// A created entrance's part of the entrance block (docs/ENTRANCE_ATTIRES.md 1): the five scene parts (34 bytes each
+// from +0x1C: motion +14, pyro +10 (5000 = none), ...) and the created-entrance flags +0xC6..+0xC9 (+0xC7 != 0: the
+// per-scene parts play instead of the single number at +0x14).
+constexpr uint32_t kCaeSize = 284, kCaeFrom = 0x1C, kCaeTo = 0xCA;
+uint32_t CaeHash(const uint8_t* e) {
+  uint32_t h = 2166136261u;
+  for (uint32_t k = kCaeFrom; k < kCaeTo; ++k) h = (h ^ e[k]) * 16777619u;
+  return h;
+}
+
+// The mod's created entrance (cae=) into the profile while the slot's parts are the base's or one the port set
+// before: a player's own CREATE AN ENTRANCE edit stays.
+void SetCaeParts(uint8_t* e, const Mod& m, const uint8_t* b) {
+  if (m.cae.size() != kCaeSize) return;
+  const uint32_t now = CaeHash(e);
+  if (now == m.cae_hash) return;
+  if (std::memcmp(e + kCaeFrom, b + kCaeFrom, kCaeTo - kCaeFrom) &&
+      std::find(m.caes_set.begin(), m.caes_set.end(), now) == m.caes_set.end())
+    return;
+  std::memcpy(e + kCaeFrom, m.cae.data() + kCaeFrom, kCaeTo - kCaeFrom);
+  REXLOG_INFO("[svr2011] superstar mods: id {} entrance: created entrance from the mod (scene motions {} {} {} {} {})", m.slot,
+              e[kCaeFrom + 14] << 8 | e[kCaeFrom + 15], e[kCaeFrom + 48] << 8 | e[kCaeFrom + 49],
+              e[kCaeFrom + 82] << 8 | e[kCaeFrom + 83], e[kCaeFrom + 116] << 8 | e[kCaeFrom + 117],
+              e[kCaeFrom + 150] << 8 | e[kCaeFrom + 151]);
+}
+
 // The profile's entrance music and movie follow the mod's manifest while they
 // are still what the port set before or the base's (`base_profile`): a new
 // theme or movie added to an installed mod reaches a slot a save already has.
@@ -482,6 +674,7 @@ void SetEntranceMedia(uint8_t* profile, const Mod& m, const uint8_t* base_profil
       for (uint32_t k : {0x14u, 0x16u, 0x18u})
         e[k] = uint8_t(m.entrance >> 8), e[k + 1] = uint8_t(m.entrance);
   }
+  SetCaeParts(e, m, b);
   if (std::memcmp(before, e, sizeof before))
     REXLOG_INFO("[svr2011] superstar mods: id {} entrance: music {}{}, movie {}", m.slot,
                 int(e[kMusic] << 8 | e[kMusic + 1]), m.song.empty() ? "" : " (" + m.song + ")",
@@ -499,6 +692,7 @@ void ReadApplied(Mod& m, const fs::path& folder) {
       if (l.rfind("movie=", 0) == 0) m.movies_set.push_back(std::atoi(l.c_str() + 6));
       if (l.rfind("music=", 0) == 0) m.musics_set.push_back(std::atoi(l.c_str() + 6));
       if (l.rfind("entrance=", 0) == 0) m.entrances_set.push_back(std::atoi(l.c_str() + 9));
+      if (l.rfind("cae=", 0) == 0) m.caes_set.push_back(uint32_t(std::strtoul(l.c_str() + 4, nullptr, 16)));
     }
     std::fclose(t);
   }
@@ -507,12 +701,14 @@ void ReadApplied(Mod& m, const fs::path& folder) {
   bool add_entrance = m.entrance >= 0 &&
                       std::find(m.entrances_set.begin(), m.entrances_set.end(), m.entrance) == m.entrances_set.end();
   bool add_music = m.music && std::find(m.musics_set.begin(), m.musics_set.end(), m.music) == m.musics_set.end();
-  if (!add_song && !add_movie && !add_entrance && !add_music) return;
+  bool add_cae = m.cae_hash && std::find(m.caes_set.begin(), m.caes_set.end(), m.cae_hash) == m.caes_set.end();
+  if (!add_song && !add_movie && !add_entrance && !add_music && !add_cae) return;
   if (FILE* t = std::fopen((folder / ".applied").string().c_str(), "ab")) {
     if (add_song) std::fprintf(t, "song=%s\n", m.song.c_str()), m.songs_set.push_back(m.song);
     if (add_movie) std::fprintf(t, "movie=%d\n", m.movie), m.movies_set.push_back(m.movie);
     if (add_entrance) std::fprintf(t, "entrance=%d\n", m.entrance), m.entrances_set.push_back(m.entrance);
     if (add_music) std::fprintf(t, "music=%d\n", m.music), m.musics_set.push_back(m.music);
+    if (add_cae) std::fprintf(t, "cae=%08x\n", m.cae_hash), m.caes_set.push_back(m.cae_hash);
     std::fclose(t);
   }
 }
@@ -548,8 +744,8 @@ uint32_t AttireMask(const fs::path& pac, uint32_t id) {
 // gets nothing and the match load crashes (an unchecked null). The largest
 // stock models fill it exactly. A mod's model over it: its blood overlays
 // (children 0x7532, 0x7531, 0x7530; stock ch164 has none) are left out of the
-// overlay copy until it fits, else the mod is left out - with a log line.
-constexpr uint32_t kModelPageLimit = 192;
+// overlay copy until it fits, else the mod is left out - with a log line. With the big-model memory (model_mem.cpp:
+// a full window takes fallback memory) the limit is ModelPageLimit() pages (caw_limits.h), not 192.
 
 uint32_t JboyPages(const svrfmt::Bytes& d) {
   if (d.size() < 0x48 || std::memcmp(d.data(), "JBOY", 4)) return 0;
@@ -594,7 +790,7 @@ bool FitModelBudget(svrfmt::Bytes& pac, std::string& notes) {
       uint32_t pages = EntryPages(en.data, &kids);
       const uint32_t before = pages;
       for (uint32_t drop : {0x7532u, 0x7531u, 0x7530u}) {
-        if (pages <= kModelPageLimit) break;
+        if (pages <= svr2011::ModelPageLimit()) break;
         const auto it = std::find_if(kids.begin(), kids.end(), [&](const svrfmt::PachEntry& c) { return c.id == drop; });
         if (it == kids.end()) continue;
         pages -= JboyPages(svrfmt::Unpack(it->data));
@@ -605,7 +801,7 @@ bool FitModelBudget(svrfmt::Bytes& pac, std::string& notes) {
       if (pages != before)
         notes += " attire " + std::to_string((en.name[6] - '0') + 1) + ": " + std::to_string(before) + " -> " +
                  std::to_string(pages) + " pages (blood overlays left out);";
-      if (pages > kModelPageLimit) {
+      if (pages > svr2011::ModelPageLimit()) {
         fits = false;
         notes += " attire " + std::to_string((en.name[6] - '0') + 1) + ": " + std::to_string(pages) + " pages;";
       }
@@ -616,6 +812,7 @@ bool FitModelBudget(svrfmt::Bytes& pac, std::string& notes) {
 }
 
 void LoadMods() {
+  if (svr2011::NoMods()) return;  // (Start Without Mods: no_mods.h)
   std::error_code ec;
   const fs::path dir = g_game / "Mods" / "Superstars";
   if (!fs::is_directory(dir, ec)) return;
@@ -628,10 +825,39 @@ void LoadMods() {
     if (e.is_directory() && fs::exists(e.path() / "ch.pac", ec) && !fs::exists(e.path() / "disabled", ec))
       folders.push_back(e.path());
   std::sort(folders.begin(), folders.end());
+  // (then the mods fetched from a session's host, this run only: RESTART AND REJOIN - mod_transfer.h)
+  std::vector<std::pair<fs::path, bool>> sources;
+  for (const auto& f : folders) sources.push_back({f, false});
   const fs::path overlay = g_game / "Mods" / "SuperstarOverlay";
+  const fs::path online_overlay = overlay / "online";  // (smods:\online\..., cleared at every start)
+  fs::remove_all(online_overlay, ec);
+  if (svr2011::OnlineModsLoad()) {
+    std::vector<fs::path> fetched;
+    for (const auto& e : fs::directory_iterator(svr2011::OnlineModsRoot() / "Superstars", ec))
+      if (e.is_directory() && fs::exists(e.path() / "ch.pac", ec)) fetched.push_back(e.path());
+    std::sort(fetched.begin(), fetched.end());
+    for (const auto& f : fetched) sources.push_back({f, true});
+    if (!fetched.empty()) fs::create_directories(online_overlay, ec);
+  }
   fs::create_directories(overlay, ec);
   auto slots = ReadSlots(dir / "slots.txt");
   bool slots_changed = false;
+  auto keys = ReadKeys(dir / "keys.txt");
+  bool keys_changed = false;
+  std::set<uint32_t> keys_taken;  // (this run's, the fetched mods' too)
+  for (const auto& k : keys) keys_taken.insert(k.second);
+  auto key_of = [&](const std::string& folder, bool temp) -> uint32_t {
+    if (!temp)
+      for (const auto& k : keys)
+        if (k.first == folder) return k.second;
+    for (uint32_t k = kFirstKey; k <= kLastKey; ++k) {
+      if (keys_taken.count(k)) continue;
+      keys_taken.insert(k);
+      if (!temp) keys.push_back({folder, k}), keys_changed = true;  // (a fetched mod's: this run only)
+      return k;
+    }
+    return 0;
+  };
   std::vector<std::string> left_out;  // (over the limit: Mods/Superstars/left_out.txt, for the launcher)
   auto slot_of = [&](const std::string& folder) -> uint32_t {
     for (const auto& s : slots)
@@ -644,6 +870,16 @@ void LoadMods() {
       slots_changed = true;
       return id;
     }
+    // (big_roster: the pool taken - ids past the game's 322, entries past its 242)
+    if (svr2011::BigRosterOn())
+      for (uint32_t id = svr2011::kFirstHighId; id <= svr2011::kLastHighId; ++id) {
+        bool taken = false;
+        for (const auto& s : slots) taken |= s.second == id;
+        if (taken) continue;
+        slots.push_back({folder, id});
+        slots_changed = true;
+        return id;
+      }
     // All ids taken: one held by a mod whose folder is gone (removed by hand,
     // or by an older launcher that left its line) or switched off ("disabled":
     // the player's way to choose which mods play when there are more than
@@ -664,10 +900,34 @@ void LoadMods() {
     }
     return 0;
   };
-  for (const auto& f : folders) {
+  // (a fetched mod's id: a free one of the pool - none the player's slots hold, so a player's mod never meets
+  // its edits; this run only, never written)
+  std::set<uint32_t> temp_taken;
+  auto temp_slot = [&]() -> uint32_t {
+    for (uint32_t id : kPool) {
+      bool taken = temp_taken.count(id) != 0;
+      for (const auto& s : slots) taken |= s.second == id;
+      if (taken) continue;
+      temp_taken.insert(id);
+      return id;
+    }
+    return 0;
+  };
+  for (const auto& [f, temp] : sources) {
     svr2011::KeepWindowAlive();  // (startup_pump.h)
+    const fs::path& ov = temp ? online_overlay : overlay;
+    const std::string guest = temp ? "smods:\\online\\" : "smods:\\";
     Mod m;
     m.folder = f.filename().string();
+    m.dir = f, m.temp = temp;
+    if (temp) {
+      m.folder = m.folder.substr(0, m.folder.rfind('@'));
+      if (std::any_of(g_mods.begin(), g_mods.end(), [&](const Mod& o) { return o.folder == m.folder; })) {
+        REXLOG_INFO("[svr2011] superstar mods: {} fetched from the host, but this game has its own - its own plays",
+                    m.folder);
+        continue;
+      }
+    }
     m.name = m.short_name = m.folder;
     std::string song, movie, moves;
     float song_gain = 0.0f;  // theme_gain=<dB>: the theme's level (-20..+6, the Mod Maker's loudness match)
@@ -682,8 +942,10 @@ void LoadMods() {
         if (l.rfind("base=", 0) == 0) m.base = uint32_t(std::atoi(l.c_str() + 5));
         if (l.rfind("song=", 0) == 0) song = l.substr(5);
         if (l.rfind("theme_gain=", 0) == 0) song_gain = std::clamp(float(std::atof(l.c_str() + 11)), -20.0f, 6.0f);
+        if (l.rfind("call_gain=", 0) == 0) m.call_gain = std::clamp(float(std::atof(l.c_str() + 10)), -20.0f, 12.0f);
         if (l.rfind("movie=", 0) == 0) movie = l.substr(6);
         if (l.rfind("voice=", 0) == 0 && l.size() > 6) m.voice = f / l.substr(6);
+        if (l.rfind("loading=", 0) == 0 && l.size() > 8) m.loading = f / l.substr(8);
         if (l.rfind("style=", 0) == 0) m.styled = true;
         if (l.rfind("ratings=", 0) == 0) {
           const char* q = l.c_str() + 8;
@@ -716,6 +978,14 @@ void LoadMods() {
         }
         if (l.rfind("pose=", 0) == 0) m.pose = uint32_t(std::clamp(std::atoi(l.c_str() + 5), 0, 65535));
         if (l.rfind("entrance=", 0) == 0) m.entrance = std::clamp(std::atoi(l.c_str() + 9), 0, 65535);
+        if (l.rfind("victory=", 0) == 0) m.victory = std::clamp(std::atoi(l.c_str() + 8), 0, 65535);
+        if (l.rfind("cae=", 0) == 0) {  // (a created entrance's block: CaeParts)
+          std::ifstream in(f / fs::u8path(l.substr(4)), std::ios::binary);
+          std::vector<uint8_t> b((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+          if (b.size() == kCaeSize) m.cae = std::move(b), m.cae_hash = CaeHash(m.cae.data());
+          else REXLOG_WARN("[svr2011] superstar mods: {}: cae={} is not a {}-byte entrance block ({} bytes): left out", m.folder,
+                           l.substr(4), kCaeSize, b.size());
+        }
         if (l.rfind("music=", 0) == 0) {  // (1-253: the game's own themes; 254 is the user playlist, 255 none)
           const int v = std::atoi(l.c_str() + 6);
           if (v >= 1 && v <= 253) m.music = v;
@@ -730,6 +1000,7 @@ void LoadMods() {
           }
         }
         if (l.rfind("moves=", 0) == 0 && l.size() > 6) moves = l.substr(6);
+        if (l.rfind("version=", 0) == 0) m.version = l.substr(8);  // (per-mod saves: written in its file)
       }
       std::fclose(t);
     }
@@ -760,21 +1031,34 @@ void LoadMods() {
       // (added below, once the mod has its id)
       m.sign_files = std::move(signs);
     }
-    InstallMedia(m, f, song, movie, song_gain);
+    if (!temp) InstallMedia(m, f, song, movie, song_gain);  // (a fetched mod's theme / movie: not copied in)
     ReadApplied(m, f);
-    m.slot = slot_of(m.folder);
+    m.slot = temp ? temp_slot() : slot_of(m.folder);
     if (!m.slot) {
       REXLOG_WARN("[svr2011] superstar mods: only {} fit, {} left out (switch another mod off to make room)",
                   std::size(kPool), m.folder);
-      left_out.push_back(m.folder);
+      if (!temp) left_out.push_back(m.folder);
+      continue;
+    }
+    if (m.slot >= svr2011::kFirstHighId &&
+        svr2011::BigRosterGiveIndex(g_memory->virtual_membase(), m.slot, m.base) >= svr2011::kMaxIndices) {
+      REXLOG_WARN("[svr2011] superstar mods: big roster - no table entry left for {} (id {}) - left out", m.folder,
+                  m.slot);
+      if (!temp) left_out.push_back(m.folder);
+      continue;
+    }
+    m.key = key_of(m.folder, temp);
+    if (!m.key) {
+      REXLOG_WARN("[svr2011] superstar mods: no key left for {} ({} at most) - left out", m.folder, kLastKey - kFirstKey + 1);
+      if (!temp) left_out.push_back(m.folder);
       continue;
     }
     char nm[32];
     uint32_t drop = 0;
     for (int a = 0; a < 4; ++a)
       if (!attires[a].empty() && fs::exists(f / attires[a], ec)) drop |= 1u << a;
-    std::snprintf(nm, sizeof nm, "ch%03u.pac", m.slot);
-    if (!Current(overlay / nm, {f / "ch.pac", f / "manifest.txt"})) {
+    std::snprintf(nm, sizeof nm, "ch%03u.pac", m.key);
+    if (!Current(ov / nm, {f / "ch.pac", f / "manifest.txt"})) {
       svrfmt::Bytes ch;
       if (!svrfmt::ReadFile((f / "ch.pac").string(), ch)) {
         REXLOG_WARN("[svr2011] superstar mods: {}: ch.pac is not a character model pac (EPK8 with EMD models)", m.folder);
@@ -784,24 +1068,24 @@ void LoadMods() {
       if (!FitModelBudget(ch, notes)) {
         REXLOG_WARN("[svr2011] superstar mods: {}: model over the match's 768 KB per-wrestler budget ({} pages "
                     "at most):{} - left out, it would crash the match load (tools/model_budget.py)",
-                    m.folder, kModelPageLimit, notes);
+                    m.folder, svr2011::ModelPageLimit(), notes);
         left_out.push_back(m.folder);
         continue;
       }
       if (!notes.empty()) REXLOG_INFO("[svr2011] superstar mods: {}: vertex memory:{}", m.folder, notes);
-      if (!RenameModel(ch, m.slot, -1, 0, drop) || !svrfmt::WriteFile((overlay / nm).string(), ch)) {
+      if (!RenameModel(ch, m.key, -1, 0, drop) || !svrfmt::WriteFile((ov / nm).string(), ch)) {
         REXLOG_WARN("[svr2011] superstar mods: {}: ch.pac is not a character model pac (EPK8 with EMD models)", m.folder);
         continue;
       }
-      MarkCurrent(overlay / nm, {f / "ch.pac", f / "manifest.txt"});
+      MarkCurrent(ov / nm, {f / "ch.pac", f / "manifest.txt"});
     }
-    m.ch_guest = std::string("smods:\\") + nm;
+    m.ch_guest = guest + nm;
     for (int a = 0; a < 4; ++a) {
       if (!(drop >> a & 1)) continue;
       char an[32];
-      std::snprintf(an, sizeof an, "ch%03u_a%d.pac", m.slot, a + 1);
+      std::snprintf(an, sizeof an, "ch%03u_a%d.pac", m.key, a + 1);
       const fs::path src = f / attires[a];
-      if (!Current(overlay / an, {src, f / "manifest.txt"})) {
+      if (!Current(ov / an, {src, f / "manifest.txt"})) {
         svrfmt::Bytes d;
         std::string notes;
         if (svrfmt::ReadFile(src.string(), d) && !FitModelBudget(d, notes)) {
@@ -809,39 +1093,41 @@ void LoadMods() {
                       m.folder, attires[a], notes);
           continue;
         }
-        if (d.empty() || !RenameModel(d, m.slot, 0, a) || !svrfmt::WriteFile((overlay / an).string(), d)) {
+        if (d.empty() || !RenameModel(d, m.key, 0, a) || !svrfmt::WriteFile((ov / an).string(), d)) {
           REXLOG_WARN("[svr2011] superstar mods: {}: {} is not a character model pac", m.folder, attires[a]);
           continue;
         }
-        MarkCurrent(overlay / an, {src, f / "manifest.txt"});
+        MarkCurrent(ov / an, {src, f / "manifest.txt"});
       }
-      m.attire_guests.push_back(std::string("smods:\\") + an);
+      m.attire_guests.push_back(guest + an);
     }
     {  // the attires its models give (contiguous from 1)
       uint32_t mask = 0;
-      std::vector<fs::path> pacs = {overlay / nm};  // (nm: chNNN.pac still)
+      std::vector<fs::path> pacs = {ov / nm};  // (nm: chNNN.pac still)
       for (int a = 0; a < 4; ++a)
         if (drop >> a & 1) {
           char an[32];
-          std::snprintf(an, sizeof an, "ch%03u_a%d.pac", m.slot, a + 1);
-          pacs.push_back(overlay / an);
+          std::snprintf(an, sizeof an, "ch%03u_a%d.pac", m.key, a + 1);
+          pacs.push_back(ov / an);
         }
-      for (const auto& pp : pacs) mask |= AttireMask(pp, m.slot);
+      for (const auto& pp : pacs) mask |= AttireMask(pp, m.key);
       m.attires = 1;
       while (m.attires < 4 && (mask >> m.attires & 1)) ++m.attires;
     }
-    std::snprintf(nm, sizeof nm, "ssf%03u.pac", m.slot);
+    std::snprintf(nm, sizeof nm, "ssf%03u.pac", m.key);
     // (the renders depend on base=: rebuilt with the manifest)
     const std::vector<fs::path> render_srcs = {f / "manifest.txt", f / "render.dds", f / "render_small.dds",
                                                f / "render_full.dds"};
-    if (Current(overlay / nm, render_srcs) ||
-        (BuildRenders(overlay / nm, m.base, m.slot, f, m.styled) && (MarkCurrent(overlay / nm, render_srcs), true)))
-      m.ssf_guest = std::string("smods:\\") + nm;
+    if (Current(ov / nm, render_srcs) ||
+        (BuildRenders(ov / nm, m.base, m.key, f, m.styled) && (MarkCurrent(ov / nm, render_srcs), true)))
+      m.ssf_guest = guest + nm;
     else
       REXLOG_WARN("[svr2011] superstar mods: {}: base {} has no select render (not a playable superstar)", m.folder,
                   m.base);
-    if (m.signs) svr2011::AddCharacterSigns(m.slot, m.sign_files);
-    REXLOG_INFO("[svr2011] superstar mods: {} as id {} (from {})", m.name, m.slot, m.base);
+    if (m.signs) svr2011::AddCharacterSigns(kModSignBase + m.key * 10, m.sign_files);
+    REXLOG_INFO("[svr2011] superstar mods: {} as id {} (from {}, key {}){}", m.name, m.slot, m.base, m.key,
+                temp ? " - fetched from the session's host, this run only" : "");
+    m.fingerprint = Fingerprint(m);
     g_mods.push_back(std::move(m));
   }
   {  // the mods left out at this start, one folder a line (none: no file)
@@ -853,6 +1139,22 @@ void LoadMods() {
       std::fclose(t);
     }
   }
+  {  // (the overlay files of before the keys - named and stamped with a pool id: nothing mounts them now)
+    for (const auto& e : fs::directory_iterator(overlay, ec)) {
+      const std::string n = e.path().filename().string();
+      unsigned id = 0;
+      char rest[32] = {};
+      if ((std::sscanf(n.c_str(), "ch%3u%31s", &id, rest) == 2 || std::sscanf(n.c_str(), "ssf%3u%31s", &id, rest) == 2) &&
+          id < kFirstKey && std::find(std::begin(kPool), std::end(kPool), id) != std::end(kPool) &&
+          (!std::strncmp(rest, ".pac", 4) || !std::strncmp(rest, "_a", 2)))
+        fs::remove(e.path(), ec);
+    }
+  }
+  if (keys_changed)
+    if (FILE* t = std::fopen((dir / "keys.txt").string().c_str(), "wb")) {
+      for (const auto& k : keys) std::fprintf(t, "%s\t%u\n", k.first.c_str(), k.second);
+      std::fclose(t);
+    }
   if (slots_changed) {
     if (FILE* t = std::fopen((dir / "slots.txt").string().c_str(), "wb")) {
       for (const auto& s : slots) std::fprintf(t, "%s\t%u\n", s.first.c_str(), s.second);
@@ -878,6 +1180,7 @@ struct AttireMod {
   std::string folder, name;
   uint32_t id = 0, attire = 0;  // attire: 0-3 (the digit)
   int entrance = -1;
+  int victory = -1;  // (victory=: VictoryOfWinner)
 };
 std::vector<AttireMod> g_attire_mods;
 std::unordered_map<uint32_t, uint32_t> g_attire_pairs;  // id -> guest 4 x {name string id, unlock}
@@ -889,6 +1192,7 @@ constexpr uint32_t kAttireModNameIds = 0xB400;           // string ids for attir
 // superstar's own attires - not an attire of their own (no name, no slot of the attire rule); the first folder
 // (A-Z) for an attire keeps it. (id, attire digit) -> entrance.
 std::map<std::pair<uint32_t, uint32_t>, int> g_attire_entrance_only;
+std::map<std::pair<uint32_t, uint32_t>, int> g_attire_victory_only;  // (the same for victory=)
 
 const AttireMod* AttireModOf(uint32_t id, uint32_t attire) {
   for (const auto& a : g_attire_mods)
@@ -897,6 +1201,7 @@ const AttireMod* AttireModOf(uint32_t id, uint32_t attire) {
 }
 
 void LoadAttireMods() {
+  if (svr2011::NoMods()) return;  // (Start Without Mods: no_mods.h)
   std::error_code ec;
   const fs::path dir = g_game / "Mods" / "Attires";
   const fs::path overlay = g_game / "Mods" / "SuperstarOverlay";
@@ -934,6 +1239,7 @@ void LoadAttireMods() {
         else if (k == "name") p.a.name = v.substr(0, 31);
         else if (k == "model") p.model = v;
         else if (k == "entrance") p.a.entrance = std::clamp(std::atoi(v.c_str()), 0, 65535);
+        else if (k == "victory") p.a.victory = std::clamp(std::atoi(v.c_str()), 0, 65535);
       }
       std::fclose(t);
     }
@@ -950,7 +1256,11 @@ void LoadAttireMods() {
         continue;
       }
     }
-    if (!fs::exists(f / p.model, ec)) {  // (no model: an entrance for one of the superstar's own attires, or nothing)
+    if (!fs::exists(f / p.model, ec)) {  // (no model: an entrance / victory for one of the superstar's own attires, or nothing)
+      if (p.asked && p.a.victory > 0 &&
+          g_attire_victory_only.emplace(std::make_pair(p.a.id, uint32_t(p.asked - 1)), p.a.victory).second)
+        REXLOG_INFO("[svr2011] attire mods: {} -> superstar {} attire {}: victory {} (no model of its own)", p.a.folder,
+                    p.a.id, p.asked, p.a.victory);
       if (p.asked && p.a.entrance > 0) {
         if (g_attire_entrance_only.emplace(std::make_pair(p.a.id, uint32_t(p.asked - 1)), p.a.entrance).second)
           REXLOG_INFO("[svr2011] attire mods: {} -> superstar {} attire {}: entrance {} (no model of its own)", p.a.folder,
@@ -958,7 +1268,7 @@ void LoadAttireMods() {
         else
           REXLOG_WARN("[svr2011] attire mods: {}: superstar {} attire {} has an entrance from another mod already - left out",
                       p.a.folder, p.a.id, p.asked);
-      } else {
+      } else if (!p.asked || p.a.victory <= 0) {
         REXLOG_WARN("[svr2011] attire mods: {}: no {} (and no entrance= for attire 1-4) - left out", p.a.folder, p.model);
       }
       continue;
@@ -1141,6 +1451,8 @@ struct Kept {
   svrfmt::Bytes record, profile;
 };
 std::vector<Kept> g_kept;
+void RecordStubs(uint8_t* base);     // (per-mod saves, below)
+void PutBackEntries(uint8_t* base);
 
 Kept& KeptFor(uint32_t slot) {
   for (auto& k : g_kept)
@@ -1167,13 +1479,13 @@ bool IsBlank(uint32_t slot, const uint8_t* profile) {
 void Remember(uint8_t* base) {
   std::lock_guard lock(g_slots_mutex);
   for (const auto& m : g_mods) {
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
     if (si >= 512) continue;
-    const uint8_t* sr = base + kRecords + si * kRecordSize;
+    const uint8_t* sr = base + svr2011::RosterEntry(kRecords, kRecordSize, si);
     if (std::strncmp(reinterpret_cast<const char*>(sr + kFullName), m.name.c_str(), kNameLen - 1)) continue;
     Kept& k = KeptFor(m.slot);
     k.record.assign(sr, sr + kRecordSize);
-    const uint8_t* sp = base + kProfiles + si * kProfileSize;
+    const uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
     if (!IsBlank(m.slot, sp)) k.profile.assign(sp, sp + kProfileSize);
   }
 }
@@ -1183,7 +1495,7 @@ void Remember(uint8_t* base) {
 void SetSigns(uint8_t* sr, const uint8_t* br, const Mod& m) {
   for (uint32_t k = 0; k < 4; ++k) {
     if (m.signs) {
-      const uint32_t v = m.slot * 10 + 1 + k % m.signs;
+      const uint32_t v = kModSignBase + m.key * 10 + 1 + k % m.signs;
       sr[kSignIds + k * 2] = uint8_t(v >> 8), sr[kSignIds + k * 2 + 1] = uint8_t(v);
     } else {
       sr[kSignIds + k * 2] = br[kSignIds + k * 2], sr[kSignIds + k * 2 + 1] = br[kSignIds + k * 2 + 1];
@@ -1213,6 +1525,221 @@ void OwnSelectTile(uint8_t* sr, const uint8_t* br) {
   if (Rd16(sr + kSelectTile) && Rd16(sr + kSelectTile) == Rd16(br + kSelectTile)) sr[kSelectTile] = sr[kSelectTile + 1] = 0;
 }
 
+// A slot that changed hands at a save load (ApplyRecords: another mod's record there) gets this mod's profile -
+// but the save's own profile for the slot (the old mod's moves, entrance and user movie) is written after that:
+// sub_82594C78, whose hook does the handover, loads the records; the profiles come a moment later, after the hooks.
+// With the record this mod's by then, every later pass kept the old mod's profile as a player's edit (a mod swapped
+// into a slot played the old one's entrance and movie; 25 Oct). So the profile given is watched for a short while
+// (RedoHandovers, once a frame and before a match's people are made): the first change in that time is the save's
+// write, and the handover is made again; a change after it (a player's CREATE AN ENTRANCE edit) stays.
+struct Handover {
+  svrfmt::Bytes given;  // the profile the slot was given
+  int frames = 0;       // frames left to watch it
+};
+std::map<uint32_t, Handover> g_handed;
+constexpr int kHandoverFrames = 600;  // (10 s; the save's write comes within milliseconds)
+void RedoHandovers(uint8_t* base, bool frame);
+
+// A fetched mod's id (temp, this run only): its record + profile as the save had them before the mod was put
+// there - written back into the save it builds (OnlineTempForSave), so the save never keeps the host's mod and
+// a player's mod given that id later never meets its data. Taken at the first apply after a save load.
+std::map<uint32_t, std::vector<uint8_t>> g_temp_saved, g_temp_live;  // id -> record + profile
+
+// The fetched mods' ids as the save FILE has them (<saves>\SaveData.dat, the last one loaded or written - never one
+// with a fetched mod in it: 0x18-byte header; records at file 0x1C + index * 260, profiles at 0x18 + 0x3C160 +
+// index * 1056 - checked against the live tables). Not the live tables nor the in-memory image (*0x82E407B4): the
+// game rebuilds that from the tables, and the start's own apply put the mod in them before (s4save: the base's
+// profile in the save, B vs A). Read before each save is built and at a save load; no file (a new player): the
+// first ApplyRecords' snapshot stays. Proof: a save built with a fetched mod loaded = byte-identical to one without.
+fs::path g_save_file;
+
+void TempFromSave(uint8_t* base) {
+  constexpr size_t kHeader = 0x18, kSaveProfiles = 0x3C160;
+  if (g_save_file.empty() || std::none_of(g_mods.begin(), g_mods.end(), [](const Mod& m) { return m.temp; })) return;
+  svrfmt::Bytes file;
+  if (!svrfmt::ReadFile(g_save_file.string(), file) || file.size() < kHeader + kSaveProfiles + 512 * kProfileSize) return;
+  for (const auto& m : g_mods) {
+    if (!m.temp) continue;
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
+    if (si >= 512) continue;
+    const uint8_t* r = file.data() + kHeader + 4 + si * kRecordSize;  // (records: 4 bytes after the header)
+    const uint8_t* p = file.data() + kHeader + kSaveProfiles + si * kProfileSize;
+    std::vector<uint8_t> b(r, r + kRecordSize);
+    b.insert(b.end(), p, p + kProfileSize);
+    g_temp_saved[m.slot] = std::move(b);
+  }
+}
+
+// ---- The save cleaner's reference (the launcher's Saves tab, "Clean save of unused mods"; save_cleaner.c): each
+// mod id's placeholder record and profile as CHAR/DAT and CHAR/PRO load them - before this run loads a save, ids
+// no mod holds now - in <saves>/.universe/pool_placeholders.bin. A save whose record or profile at a mod id is none
+// of them holds a mod's data (one removed or turned off: its name, moves, entrance, Threads, edits); the launcher
+// writes the placeholder back. (DLC ids 59-69 have a version per DLC chEtc: each one seen is kept.)
+// With them each id's 40-byte entry (block B +0x3E648 + index * 40: kEntries40, the per-mod saves' 'E40 ').
+// The file: "SVRPOOL2", u32 record size, u32 profile size, u32 entry size, u32 the records', the profiles' and the
+// entries' offsets in SaveData.dat, u32 count, then per version: u16 id, u16 index (little-endian), the record (its
+// selectable byte 0), the profile, the entry.
+bool g_save_loaded = false;  // (a save was loaded this run: the slots hold its data now, not the placeholders)
+std::map<uint32_t, std::vector<svrfmt::Bytes>> g_pool_blank;  // id -> versions (record + profile)
+
+void KeepPoolPlaceholders(uint8_t* base) {
+  constexpr uint32_t kEntry = 0x82E7C918 + 0x3E648, kEntrySize = 40;  // (kEntries40, below)
+  constexpr uint32_t kFileProfiles = 0x18 + 0x3C160;                  // (CheckSavedProfiles: kProfiles in the file)
+  if (g_save_loaded || g_save_file.empty()) return;
+  bool added = false;
+  for (uint32_t id : kPool) {
+    if (ModOf(id)) continue;
+    const uint32_t si = svr2011::RosterIndex(base, id);
+    if (si >= 512) continue;
+    const uint8_t* r = base + svr2011::RosterEntry(kRecords, kRecordSize, si);
+    if (base[0x82DB3AE0 + id] == 1 && !r[kFullName]) continue;  // (CHAR/DAT not loaded yet; an absent id: as it is)
+    svrfmt::Bytes b(r, r + kRecordSize);
+    b[kSelectable] = 0;
+    b.insert(b.end(), base + svr2011::RosterEntry(kProfiles, kProfileSize, si), base + svr2011::RosterEntry(kProfiles, kProfileSize, si) + kProfileSize);
+    b.insert(b.end(), base + svr2011::RosterEntry(kEntry, kEntrySize, si), base + svr2011::RosterEntry(kEntry, kEntrySize, si) + kEntrySize);
+    b.insert(b.begin(), {uint8_t(id), uint8_t(id >> 8), uint8_t(si), uint8_t(si >> 8)});
+    auto& v = g_pool_blank[id];
+    if (std::find(v.begin(), v.end(), b) != v.end()) continue;
+    v.push_back(std::move(b));
+    added = true;
+  }
+  if (!added) return;
+  auto u32 = [](std::string& s, uint32_t v) { s.append(reinterpret_cast<const char*>(&v), 4); };
+  std::string out = "SVRPOOL2";
+  u32(out, kRecordSize), u32(out, kProfileSize), u32(out, kEntrySize);
+  u32(out, 0x1C), u32(out, kFileProfiles), u32(out, kEntry - kProfiles + kFileProfiles);
+  uint32_t n = 0;
+  for (const auto& [id, v] : g_pool_blank) n += uint32_t(v.size());
+  u32(out, n);
+  for (const auto& [id, v] : g_pool_blank)
+    for (const auto& b : v) out.append(reinterpret_cast<const char*>(b.data()), b.size());
+  std::error_code ec;
+  const fs::path f = g_save_file.parent_path() / ".universe" / "pool_placeholders.bin";
+  fs::create_directories(f.parent_path(), ec);
+  const fs::path tmp = f.string() + ".tmp";
+  {
+    std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+    o.write(out.data(), std::streamsize(out.size()));
+    if (!o) return;
+  }
+  fs::rename(tmp, f, ec);
+  if (!ec) REXLOG_INFO("[svr2011] superstar mods: {} mod ids' placeholders ({} versions) for the save cleaner: {}",
+                       g_pool_blank.size(), n, f.string());
+}
+
+// Which mod each slot's profile in the save was made for (13, 2.1.6 hold): <saves>/.universe/mod_profiles.txt,
+// "<id><TAB><folder><TAB><fingerprint>" a line, written when the game writes its save. A slot whose mod is another
+// one now (its id given to a new mod - slots.txt) or the same one changed (an update: other moves, entrance, movie)
+// has a stale profile in the save - kept, it played the old moves and entrance under the new mod (a same name kept
+// it as "the player's edits"). At a save load such a slot is handed over (ApplyRecords: the mod's own profile;
+// RedoHandovers: again after the save's late write). A save from before the file: a slot whose saved profile has
+// fewer than half of the mod's own moves (or, with none, not its entrance) is taken as another mod's.
+std::set<uint32_t> g_stale;  // slots to hand over at this load's ApplyRecords
+fs::file_time_type g_marks_seen;
+fs::path MarksFile() { return g_save_file.empty() ? fs::path() : g_save_file.parent_path() / ".universe" / "mod_profiles.txt"; }
+fs::file_time_type SaveWriteTime() {
+  std::error_code ec;
+  const auto t = fs::last_write_time(g_save_file, ec);
+  return ec ? fs::file_time_type{} : t;
+}
+
+void WriteMarks() {
+  const fs::path f = MarksFile();
+  if (f.empty()) return;
+  std::error_code ec;
+  fs::create_directories(f.parent_path(), ec);
+  if (FILE* t = std::fopen(f.string().c_str(), "wb")) {
+    for (const auto& m : g_mods)
+      if (!m.temp) std::fprintf(t, "%u\t%s\t%08X\n", m.slot, m.folder.c_str(), m.fingerprint);
+    std::fclose(t);
+  }
+  REXLOG_INFO("[svr2011] superstar mods: the save written - which mod each slot's profile is: {}", f.string());
+}
+
+void CheckSavedProfiles(uint8_t* base) {
+  constexpr size_t kHeader = 0x18, kSaveProfiles = 0x3C160;
+  g_stale.clear();
+  g_marks_seen = SaveWriteTime();  // (the save just loaded: not a write)
+  svrfmt::Bytes file;
+  if (g_save_file.empty() || !svrfmt::ReadFile(g_save_file.string(), file) ||
+      file.size() < kHeader + kSaveProfiles + 512 * kProfileSize)
+    return;
+  struct Mark {
+    std::string folder;
+    uint32_t fp = 0;
+  };
+  std::map<uint32_t, Mark> marks;
+  if (FILE* t = std::fopen(MarksFile().string().c_str(), "rb")) {
+    char line[600];
+    while (std::fgets(line, sizeof line, t)) {
+      char folder[512] = {};
+      unsigned id = 0, fp = 0;
+      if (std::sscanf(line, "%u\t%511[^\t]\t%x", &id, folder, &fp) == 3) marks[id] = {folder, fp};
+    }
+    std::fclose(t);
+  }
+  for (const auto& m : g_mods) {
+    if (m.temp) continue;
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
+    if (si >= 512) continue;
+    const uint8_t* p = file.data() + kHeader + kSaveProfiles + si * kProfileSize;
+    if (std::getenv("SVR2011_TEST_SLOT_LOG"))
+      REXLOG_INFO("[svr2011] superstar mods: test - id {} is save index {} (id 100's: {}), fingerprint {:08X}", m.slot,
+                  si, svr2011::RosterIndex(base, 100), m.fingerprint);
+    if (IsBlank(m.slot, p)) continue;  // (the placeholder saved: the mod's own profile goes in anyway)
+    std::string why;
+    if (const auto k = marks.find(m.slot); k != marks.end()) {
+      if (k->second.folder != m.folder) why = "made for " + k->second.folder;
+      else if (k->second.fp != m.fingerprint) why = "made for an older " + m.folder;
+    } else {
+      // (a save from before the file, or a slot new to it: does the profile look like this mod's?)
+      size_t own = 0, same = 0;
+      for (const auto& [off, id] : m.moves)
+        if (off + 1u < kEntrance && svr2011::MoveUsable(id)) ++own, same += (p[off] << 8 | p[off + 1]) == id;
+      const int ent = p[kEntrance + 0x14] << 8 | p[kEntrance + 0x15];
+      if (own ? same * 2 < own : m.entrance >= 0 && ent != m.entrance)
+        why = own ? fmt::format("{} of its {} own moves", same, own) : fmt::format("entrance {} not {}", ent, m.entrance);
+    }
+    if (why.empty()) continue;
+    g_stale.insert(m.slot);
+    REXLOG_INFO("[svr2011] superstar mods: id {} ({}) - the save's profile isn't this mod's ({}): its own moves and "
+                "entrance instead", m.slot, m.folder, why);
+  }
+}
+
+// Once a frame: the game wrote its save - the marks follow (the slots hold these mods' profiles now).
+void MarksTick(uint8_t* base) {
+  static uint32_t frames = 0;
+  if (g_save_file.empty() || ++frames % 60) return;
+  // Test aid: SVR2011_TEST_SLOT_LOG=1 - each mod slot's entrance number and first own move, when they change
+  // (the profile a slot ends up with after a load and the save's late write)
+  if (static const bool on = std::getenv("SVR2011_TEST_SLOT_LOG") != nullptr; on) {
+    static std::map<uint32_t, uint32_t> last;
+    for (const auto& m : g_mods) {
+      const uint32_t si = svr2011::RosterIndex(base, m.slot);
+      if (si >= 512) continue;
+      const uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
+      const uint32_t ent = sp[kEntrance + 0x14] << 8 | sp[kEntrance + 0x15];
+      const uint32_t mv = m.moves.empty() ? 0 : uint32_t(sp[m.moves[0].first] << 8 | sp[m.moves[0].first + 1]);
+      if (last.count(m.slot) && last[m.slot] == (ent << 16 | mv)) continue;
+      last[m.slot] = ent << 16 | mv;
+      REXLOG_INFO("[svr2011] superstar mods: test - id {} ({}) entrance {} first own move {} (the mod's: {} / {})",
+                  m.slot, m.folder, ent, mv, m.entrance, m.moves.empty() ? 0 : m.moves[0].second);
+    }
+  }
+  const auto t = SaveWriteTime();
+  if (t == fs::file_time_type{} || t == g_marks_seen) return;
+  const bool first = g_marks_seen == fs::file_time_type{};
+  g_marks_seen = t;
+  if (first) return;  // (the save there at the start: not one written now)
+  WriteMarks();
+}
+
+// A mod's record selectable: a fetched one (temp) only while the game is online (its lobby and matches) - the
+// offline game (WWE Universe's own generation at a save load, the other modes) never sees it in the roster, so
+// nothing it makes for the save differs from a start without it.
+uint8_t Selectable(const Mod& m) { return m.temp && !svr2011::P2POnlineMode() ? 0 : 1; }
+
 void ApplyRecords(uint8_t* base) {
   // Test aid: SVR2011_TEST_ID_TABLE=1 - once, the ids whose present flag
   // (0x82DB3AE0 + id, sub_828B7078) is off, with their record index and name.
@@ -1222,25 +1749,32 @@ void ApplyRecords(uint8_t* base) {
     int n = 0;
     for (uint32_t id = 0; id < 322; ++id) {
       if (base[0x82DB3AE0 + id] == 1) continue;
-      const uint32_t si = Rd16(base + kIdToIndex + id * 2);
-      absent += fmt::format(" {}:{}:{}", id, si, si < 512 ? base[kRecords + si * kRecordSize + kFullName] : 0);
+      const uint32_t si = svr2011::RosterIndex(base, id);
+      absent += fmt::format(" {}:{}:{}", id, si, si < 512 ? base[svr2011::RosterEntry(kRecords, kRecordSize, si) + kFullName] : 0);
       ++n;
     }
     REXLOG_INFO("[svr2011] superstar mods: test - {} ids absent (id:index:name byte){}", n, absent);
   }
   for (uint32_t id : kPool) {
     if (ModOf(id)) continue;
-    const uint32_t si = Rd16(base + kIdToIndex + id * 2);
-    if (si < 512) base[kRecords + si * kRecordSize + kSelectable] = 0;
+    const uint32_t si = svr2011::RosterIndex(base, id);
+    if (si < 512) base[svr2011::RosterEntry(kRecords, kRecordSize, si) + kSelectable] = 0;
   }
   for (const auto& m : g_mods) {
-    const uint32_t bi = Rd16(base + kIdToIndex + m.base * 2), si = Rd16(base + kIdToIndex + m.slot * 2);
+    const uint32_t bi = svr2011::RosterIndex(base, m.base), si = svr2011::RosterIndex(base, m.slot);
     if (bi >= 512 || si >= 512 || bi == si) continue;
-    uint8_t* br = base + kRecords + bi * kRecordSize;
-    uint8_t* sr = base + kRecords + si * kRecordSize;
+    uint8_t* br = base + svr2011::RosterEntry(kRecords, kRecordSize, bi);
+    uint8_t* sr = base + svr2011::RosterEntry(kRecords, kRecordSize, si);
     if (!br[kFullName]) continue;  // (not loaded yet)
-    uint8_t* bp = base + kProfiles + bi * kProfileSize;
-    uint8_t* sp = base + kProfiles + si * kProfileSize;
+    if (m.temp && !g_temp_saved.count(m.slot)) {  // (the id as it was, an unused pool slot: not selectable)
+      std::vector<uint8_t> b(sr, sr + kRecordSize);
+      b[kSelectable] = 0;
+      const uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
+      b.insert(b.end(), sp, sp + kProfileSize);
+      g_temp_saved[m.slot] = std::move(b);
+    }
+    uint8_t* bp = base + svr2011::RosterEntry(kProfiles, kProfileSize, bi);
+    uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
     bool have_blank = false;
     for (const auto& b : g_blank) have_blank |= b.first == m.slot;
     if (have_blank && IsBlank(m.slot, sp)) {
@@ -1249,8 +1783,10 @@ void ApplyRecords(uint8_t* base) {
         if (x.slot == m.slot && !x.profile.empty()) k = &x;
       if (k) {
         std::memcpy(sp, k->profile.data(), kProfileSize);
+        svr2011::ThreadsSlots(sp, m.folder);  // (Threads slots: kept by folder)
       } else {
         std::memcpy(sp, bp, kProfileSize);
+        svr2011::ThreadsSlots(sp, m.folder);  // (not the base's Threads slots)
         SetOwnMoves(sp, m);
         REXLOG_INFO("[svr2011] superstar mods: profile {} -> id {}{}", m.base, m.slot,
                     m.moves.empty() && m.entrance < 0 ? "" : " (its own moves / entrance)");
@@ -1258,8 +1794,18 @@ void ApplyRecords(uint8_t* base) {
     }
     if (have_blank) SetEntranceMedia(sp, m, bp);
     SetSigns(sr, br, m);
+    // (the save's profile for the slot made for another mod or an older version of this one: CheckSavedProfiles)
+    const bool stale = g_stale.erase(m.slot) > 0;
+    if (stale) {
+      std::memcpy(sp, bp, kProfileSize);
+      svr2011::ThreadsSlots(sp, m.folder);
+      SetOwnMoves(sp, m);
+      SetEntranceMedia(sp, m, bp);
+      g_handed[m.slot] = {svrfmt::Bytes(sp, sp + kProfileSize), kHandoverFrames};  // (RedoHandovers)
+      REXLOG_INFO("[svr2011] superstar mods: profile {} -> id {} (its saved profile was another mod's)", m.base, m.slot);
+    }
     if (!std::strncmp(reinterpret_cast<char*>(sr + kFullName), m.name.c_str(), kNameLen - 1)) {
-      sr[kSelectable] = 1, sr[kDlc] = 1;
+      sr[kSelectable] = Selectable(m), sr[kDlc] = 1;
       OwnSelectTile(sr, br);  // (a save from before 2.0.5 has the base's)
       SetHeight(sr, br, m);
       static std::vector<std::pair<uint32_t, uint32_t>> told;  // (slot, its ratings when last logged)
@@ -1275,32 +1821,42 @@ void ApplyRecords(uint8_t* base) {
     }
     const std::string was(reinterpret_cast<char*>(sr + kFullName), 0,
                           strnlen(reinterpret_cast<char*>(sr + kFullName), kNameLen));
+    // The slot changes hands (another mod's record there: its id given to this
+    // one, slots.txt) - its profile, the moves and entrance a save kept for
+    // the old mod, goes too: this mod's, as for a new slot. (A placeholder's
+    // record, "0", comes with its blank profile: nothing to take back.)
+    if (!stale && !was.empty() && was != "0" && !IsBlank(m.slot, sp)) {
+      std::memcpy(sp, bp, kProfileSize);
+      svr2011::ThreadsSlots(sp, m.folder);
+      SetOwnMoves(sp, m);
+      SetEntranceMedia(sp, m, bp);
+      g_handed[m.slot] = {svrfmt::Bytes(sp, sp + kProfileSize), kHandoverFrames};  // (RedoHandovers)
+      REXLOG_INFO("[svr2011] superstar mods: profile {} -> id {} (the slot held \"{}\": its moves and entrance not "
+                  "kept for {})", m.base, m.slot, was, m.name);
+    }
     {
+      // As it was before the game reloaded its records. A save loaded into
+      // the slot brings its record AND profile: a removed mod's, when a new
+      // mod has its id now (2.1.5 report: the new mod played with the deleted
+      // one's moves and entrance - this record went back, the profile stayed).
+      // The profile went back above; the record goes back here.
       const Kept* k = nullptr;
       for (const auto& x : g_kept)
         if (x.slot == m.slot && !x.record.empty()) k = &x;
-      if (k) {  // (as it was before the game reloaded its records)
+      if (k) {
         std::memcpy(sr, k->record.data(), kRecordSize);
+        for (uint32_t off : {kOwnId, kOwnId2, kSamePerson}) sr[off] = uint8_t(m.slot >> 8), sr[off + 1] = uint8_t(m.slot);
         OwnSelectTile(sr, br);
         SetHeight(sr, br, m);
         continue;
       }
-    }
-    // The slot changes hands (another mod's record there: its id given to this
-    // one, slots.txt) - its profile, the moves and entrance a save kept for
-    // the old mod, goes too: this mod's, as for a new slot.
-    if (!was.empty() && !IsBlank(m.slot, sp)) {
-      std::memcpy(sp, bp, kProfileSize);
-      SetOwnMoves(sp, m);
-      SetEntranceMedia(sp, m, bp);
-      REXLOG_INFO("[svr2011] superstar mods: profile {} -> id {} (the slot held \"{}\")", m.base, m.slot, was);
     }
     std::memcpy(sr, br, kRecordSize);
     OwnSelectTile(sr, br);
     PutName(sr, kFullName, m.name);
     PutName(sr, kSecondName, m.name);
     PutName(sr, kShortName, m.short_name);
-    sr[kSelectable] = 1;
+    sr[kSelectable] = Selectable(m);
     sr[kDlc] = 1;
     for (uint32_t off : {kOwnId, kOwnId2, kSamePerson}) sr[off] = uint8_t(m.slot >> 8), sr[off + 1] = uint8_t(m.slot);
     SetSigns(sr, br, m);
@@ -1316,6 +1872,35 @@ void ApplyRecords(uint8_t* base) {
       for (uint32_t i = 0; i < 15; ++i) sr[i] = i == 7 ? sr[i] : 20;
     REXLOG_INFO("[svr2011] superstar mods: record {} -> id {} ({}; was \"{}\")", m.base, m.slot, m.name, was);
   }
+  RedoHandovers(base, false);
+  PutBackEntries(base);
+}
+
+// `frame`: called once a frame (the watch counts down); else from a load or before a match.
+void RedoHandovers(uint8_t* base, bool frame) {
+  for (const auto& m : g_mods) {
+    const auto h = g_handed.find(m.slot);
+    if (h == g_handed.end()) continue;
+    const uint32_t bi = svr2011::RosterIndex(base, m.base), si = svr2011::RosterIndex(base, m.slot);
+    if (bi >= 512 || si >= 512 || bi == si) continue;
+    uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
+    const uint8_t* bp = base + svr2011::RosterEntry(kProfiles, kProfileSize, bi);
+    if (std::memcmp(sp, h->second.given.data(), kProfileSize)) {
+      // (the save's profile for the slot, written after the handover: this mod's again - once)
+      const int movie = sp[kEntrance + kMovie] << 8 | sp[kEntrance + kMovie + 1];
+      const int entrance = sp[kEntrance + 0x14] << 8 | sp[kEntrance + 0x15];
+      std::memcpy(sp, bp, kProfileSize);
+      svr2011::ThreadsSlots(sp, m.folder);
+      SetOwnMoves(sp, m);
+      SetEntranceMedia(sp, m, bp);
+      REXLOG_INFO("[svr2011] superstar mods: id {} - the save wrote the old mod's profile (entrance {}, movie {}) "
+                  "after the handover: {}'s again (entrance {}, movie {})", m.slot, entrance, movie, m.name,
+                  sp[kEntrance + 0x14] << 8 | sp[kEntrance + 0x15], sp[kEntrance + kMovie] << 8 | sp[kEntrance + kMovie + 1]);
+      g_handed.erase(h);
+      continue;
+    }
+    if (frame && --h->second.frames <= 0) g_handed.erase(h);
+  }
 }
 
 // CHAR/PRO loaded: each slot's blank profile (before ApplyRecords).
@@ -1325,9 +1910,9 @@ void RecordBlanks(uint8_t* base, const std::vector<svrfmt::Bytes>& before) {
   std::lock_guard lock(g_slots_mutex);
   for (size_t i = 0; i < g_mods.size() && i < before.size(); ++i) {
     const auto& m = g_mods[i];
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
     if (si >= 512 || before[i].empty()) continue;
-    const uint8_t* sp = base + kProfiles + si * kProfileSize;
+    const uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
     if (!std::memcmp(sp, before[i].data(), kProfileSize)) continue;  // (not rewritten)
     int n = 0;
     bool known = false;
@@ -1344,9 +1929,9 @@ void KeepBlankProfiles(uint8_t* base) {
   for (const auto& m : g_mods) {
     bool have = false;
     for (const auto& b : g_blank) have |= b.first == m.slot;
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
     if (have || si >= 512) continue;
-    const uint8_t* sp = base + kProfiles + si * kProfileSize;
+    const uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
     g_blank.push_back({m.slot, svrfmt::Bytes(sp, sp + kProfileSize)});
   }
 }
@@ -1366,6 +1951,7 @@ const uint8_t kModdedRgba[] = {
 };
 constexpr uint32_t kBadgeW = 256, kBadgeH = 64;
 constexpr uint32_t kBadgeCaller = 0x82466E40;  // sub_82466830: sub_828B6CD0(id) at the badge
+constexpr uint32_t kCaePickCaller = 0x824633CC;  // sub_82463090 state 14: sub_828B6CD0(id) - downloaded: easy editor
 
 struct Badge {
   svrfmt::Bytes data;  // swapped as in memory
@@ -1442,10 +2028,7 @@ void LoadBadges() {
   REXLOG_INFO("[svr2011] superstar mods: badge ({} languages)", found.size());
 }
 
-int64_t NowMs() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
+using svr2011::NowMs;
 
 bool Committed(uint32_t at) {
   auto* heap = g_memory->LookupHeap(at);
@@ -1463,6 +2046,7 @@ int BadgeAt(uint8_t* b, uint32_t guest) {
 }
 
 void BadgeLoop() {
+  rex::thread::set_current_thread_name("superstar badges");
   uint32_t guest = 0;
   int original = 1;  // the language's original there
   int64_t last_scan = 0;
@@ -1485,6 +2069,7 @@ void BadgeLoop() {
       if (!active || scans >= 10 || NowMs() - last_scan < 1000) continue;
       last_scan = NowMs();
       ++scans;
+      const auto scan_t0 = std::chrono::steady_clock::now();
       // (the menu textures: physical memory, seen at 0xE0000000+ in the
       // VS screen search; then the other views)
       for (uint64_t lo : {0xE0000000ull, 0xA0000000ull}) {
@@ -1497,13 +2082,16 @@ void BadgeLoop() {
             continue;
           }
           const uint64_t end = std::min<uint64_t>(uint64_t(info.base_address) + info.region_size, hi);
+          // (a texture's base is 4 KB aligned - the GPU's fetch constant holds it in 4 KB units: only page starts
+          // are tried, each badge's signature bytes at its place there - 256 times fewer compares than every 16
+          // bytes, which held a core for seconds through a match's load)
           if ((info.state & rex::memory::kMemoryAllocationCommit) && (info.protect & rex::memory::kMemoryProtectRead))
-            for (uint64_t a = at; a + 64 <= end && !guest; a += 16)
+            for (uint64_t t = (at + 0xFFF) & ~0xFFFull; t < end && !guest; t += 0x1000)
               for (size_t i = 0; i < g_badges.size(); ++i) {
                 const auto& g = g_badges[i];
-                if (a < lo + g.sig || std::memcmp(b + a, g.data.data() + g.sig, 64)) continue;
-                if (BadgeAt(b, uint32_t(a - g.sig)) == int(i)) {
-                  guest = uint32_t(a - g.sig);
+                if (t + g.sig + 64 > end || std::memcmp(b + t + g.sig, g.data.data() + g.sig, 64)) continue;
+                if (BadgeAt(b, uint32_t(t)) == int(i)) {
+                  guest = uint32_t(t);
                   break;
                 }
               }
@@ -1513,7 +2101,8 @@ void BadgeLoop() {
       }
       if (!guest) continue;
       now = BadgeAt(b, guest);
-      REXLOG_INFO("[svr2011] superstar mods: badge texture at {:08X}", guest);
+      REXLOG_INFO("[svr2011] superstar mods: badge texture at {:08X} (scan {} of this select screen, {} ms)", guest, scans,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scan_t0).count());
     }
     if (now > 0) original = now;
     const int target = want ? 0 : original;
@@ -1523,10 +2112,72 @@ void BadgeLoop() {
 
 }  // namespace
 
+// CREATE AN ENTRANCE, ADVANCED CREATION of a superstar without a created entrance: the editor's block
+// (sub_82879AF8) gets the created flag and five scene parts from his default template, looked up by id
+// (sub_82883A10(list, id); none: a generic one whose parts name no scene - the entrance manager then had no
+// entrant, the scene ended and the editor backed out to the menu). A mod: its own entrance's template, else
+// its base's.
+constexpr uint32_t kCaeTemplateCaller = 0x82879CF4;
+REX_EXTERN(__imp__sub_82883A10);
+REX_HOOK_RAW(sub_82883A10) {
+  const Mod* m = uint32_t(ctx.lr) == kCaeTemplateCaller ? ModOf(ctx.r4.u32) : nullptr;
+  if (!m) {
+    __imp__sub_82883A10(ctx, base);
+    return;
+  }
+  const auto in = ctx;
+  for (const int id : {m->entrance, int(m->base)}) {
+    if (id <= 0) continue;
+    ctx = in;
+    ctx.r4.u64 = uint32_t(id);
+    __imp__sub_82883A10(ctx, base);
+    if (ctx.r3.u32) {
+      REXLOG_INFO("[svr2011] create an entrance: {} starts from the scene template of {}", m->name, id);
+      return;
+    }
+  }
+  ctx = in;
+  __imp__sub_82883A10(ctx, base);
+}
+
+// ... and its music, movie and entrance numbers from his defaults (sub_828C3318(out, id): the profile's default
+// copy, entrance block +0x04..+0x0C, out = {entrance, champion, movie, music, multi-title}) - a mod's are the
+// base's there: its own (the profile's current ones) instead.
+constexpr uint32_t kCaeDefaultsCallers[] = {0x82879C28, 0x82879C84};
+REX_EXTERN(__imp__sub_828C3318);
+REX_HOOK_RAW(sub_828C3318) {
+  const uint32_t out = ctx.r3.u32, id = ctx.r4.u32, lr = uint32_t(ctx.lr);
+  __imp__sub_828C3318(ctx, base);
+  if (lr != kCaeDefaultsCallers[0] && lr != kCaeDefaultsCallers[1]) return;
+  const uint32_t si = id < 512 ? svr2011::RosterIndex(base, id) : 512;
+  if (!out || si >= 512 || !ModOf(id)) return;
+  const uint8_t* e = base + svr2011::RosterEntry(kProfiles, kProfileSize, si) + kEntrance;
+  std::memcpy(base + out + 0, e + 0x14, 2);  // entrance
+  std::memcpy(base + out + 2, e + 0x16, 2);  // champion
+  std::memcpy(base + out + 4, e + kMovie, 2);
+  std::memcpy(base + out + 6, e + kMusic, 2);
+  std::memcpy(base + out + 8, e + 0x18, 2);  // multi-title
+}
+
 // The select screen's panel: "is it DLC" for the badge (r26: the id; r31:
 // the cursor).
 REX_EXTERN(__imp__sub_828B6CD0);
 REX_HOOK_RAW(sub_828B6CD0) {
+  // CREATE AN ENTRANCE: the superstar picked (select screen state 14, sub_82463090) goes to the EASY / ADVANCED
+  // popup unless he is "downloaded" - then straight to the easy editor (state 23). Mods sit on downloaded slots,
+  // and the user asked for ADVANCED on the real DLC superstars too: none counts as downloaded here.
+  if (uint32_t(ctx.lr) == kCaePickCaller) {
+    __imp__sub_828B6CD0(ctx, base);
+    if (ctx.r3.u32) {
+      static bool told = false;
+      if (!told) {
+        told = true;
+        REXLOG_INFO("[svr2011] create an entrance: ADVANCED CREATION offered for downloaded superstars too");
+      }
+      ctx.r3.u64 = 0;
+    }
+    return;
+  }
   if (uint32_t(ctx.lr) != kBadgeCaller || g_badges.empty()) {
     __imp__sub_828B6CD0(ctx, base);
     return;
@@ -1563,12 +2214,45 @@ REX_HOOK_RAW(sub_8244A128) {
 
 // Test aid: SVR2011_TEST_VFS_LOG=1 logs each virtual file lookup that finds
 // nothing (sub_826B87B0(vfs, "/TYPE/NAME", out)), once per name.
+// A mod superstar's model and select renders, asked for by the id it holds (EMD/%06d%02d: id, attire*10 + kind;
+// SSFA/B/C/%04d: attire*1000 + id; with or without a leading /): its overlay entries are stamped with its key
+// (Mod::key), so the name asked for becomes the key's - the guest copy of the new name, or 0.
+uint32_t g_key_names = 0;  // guest: 32 x 64 bytes, used in turn (lookups come from two threads)
+std::atomic<uint32_t> g_key_next{0};
+uint32_t KeyAlias(uint8_t* base, const char* n) {
+  if (g_mods.empty()) return 0;
+  const char* p = n[0] == '/' ? n + 1 : n;
+  char out[64];
+  unsigned v = 0, kind = 0;
+  const Mod* m = nullptr;
+  if (!std::strncmp(p, "EMD/", 4) && strnlen(p, 16) == 12 && std::sscanf(p + 4, "%6u%2u", &v, &kind) == 2) {
+    if (!(m = ModOf(v)) || m->key == v) return 0;
+    std::snprintf(out, sizeof out, "%.*sEMD/%06u%02u", int(p - n), n, m->key, kind);
+  } else if (p[0] == 'S' && p[1] == 'S' && p[2] == 'F' && p[3] >= 'A' && p[3] <= 'C' && p[4] == '/' &&
+             strnlen(p, 16) == 9 && std::sscanf(p + 5, "%4u", &v) == 1) {
+    if (!(m = ModOf(v % 1000)) || m->key == v % 1000) return 0;
+    std::snprintf(out, sizeof out, "%.*s%.5s%04u", int(p - n), n, p, v / 1000 * 1000 + m->key);
+  } else {
+    return 0;
+  }
+  if (!g_key_names && !(g_key_names = g_memory->SystemHeapAlloc(32 * 64, 0x10))) return 0;
+  const uint32_t at = g_key_names + (g_key_next++ % 32) * 64;
+  std::memcpy(base + at, out, std::strlen(out) + 1);
+  return at;
+}
+
 REX_EXTERN(__imp__sub_826B87B0);
 REX_HOOK_RAW(sub_826B87B0) {
   static const bool log = [] {
     const char* e = std::getenv("SVR2011_TEST_VFS_LOG");
     return e && *e == '1';
   }();
+  // Superstar Threads' list with the mods' records (superstar_threads.h): asked for by another name
+  if (const char* n = reinterpret_cast<const char*>(base + ctx.r4.u32); !std::strcmp(n, "/EDIT/SSTL") || !std::strcmp(n, "EDIT/SSTL"))
+    svr2011::LogThreadsSlots(base);
+  if (const uint32_t alias = svr2011::ThreadsAlias(reinterpret_cast<const char*>(base + ctx.r4.u32))) ctx.r4.u64 = alias;
+  // the chosen VS screen style's theme (vs_styles.h): asked for by another name, as below
+  if (const uint32_t alias = svr2011::VsStyleAlias(reinterpret_cast<const char*>(base + ctx.r4.u32))) ctx.r4.u64 = alias;
   // a media mod's replacement (renders: media_mods.h) - the first match in
   // the archive list wins, so the game's own would: asked for by another name
   if (const uint32_t alias = svr2011::MediaAlias(reinterpret_cast<const char*>(base + ctx.r4.u32))) {
@@ -1579,6 +2263,8 @@ REX_HOOK_RAW(sub_826B87B0) {
       return;
     }
   }
+  // a superstar mod's model / renders: its key's entries (KeyAlias)
+  else if (const uint32_t key = KeyAlias(base, reinterpret_cast<const char*>(base + ctx.r4.u32))) ctx.r4.u64 = key;
   // Test aid: SVR2011_TEST_VFS_TRACE=<text> - every lookup whose name holds that text: the result and the
   // out record's first 16 bytes (which archive answered), once per name and result
   static const std::string trace = [] { const char* e = std::getenv("SVR2011_TEST_VFS_TRACE"); return std::string(e ? e : ""); }();
@@ -1792,6 +2478,7 @@ REX_HOOK_RAW(sub_825EA4E8) {
 // Hardy's with the name swapped (WriteAnnouncerNames).
 constexpr uint32_t kTemplateCall = 112;  // (Matt Hardy: every category his name is in)
 std::map<std::string, std::string> CawCalls() {
+  if (svr2011::NoMods()) return {};  // (Start Without Mods: no_mods.h)
   static std::map<std::string, std::string> calls;
   static fs::file_time_type stamp{};
   const fs::path file = g_game / "Mods" / "caw_announcer.txt";
@@ -1864,6 +2551,52 @@ void CawCall(PPCContext& ctx, uint8_t* base, uint32_t out, uint32_t slot) {
   if (NameCallLog()) REXLOG_INFO("[svr2011] name call: Created Superstar {} (id {}) as {}", name, id, c->second);
 }
 
+// A stock or DLC Superstar the announcer's table has no name for: DLC John Cena (purple, id 57) and DLC Undertaker
+// (biker, id 58) are "dummy" in every by-id category, the DLC's own sound_dlc_02.pac copy too (report
+// 20261101-023939-02ef48: no ring-announcer name, generic commentary), and their commentary ids 10007 / 10008 make
+// no bank. They borrow the calls of the same person - the record's +228 (same person) when that one has a name,
+// else the roster record with the same name that has one (JOHN CENA 139, UNDERTAKER 103). 0: none (a name of its
+// own, a mod, or no donor). Category 8 is the name ("RA_JR_SSN_<NAME>_1").
+bool HasCallName(uint8_t* base, uint32_t T, uint32_t id) {
+  const uint32_t count = Rd32(base + T + 420 + 8 * 8), names = Rd32(base + T + 424 + 8 * 8);
+  return names && id < count && std::strcmp(reinterpret_cast<const char*>(base + names + id * 64), "dummy") != 0;
+}
+const uint8_t* RosterRecord(uint8_t* base, uint32_t id) {
+  if (!id || id >= 1000) return nullptr;
+  const uint32_t si = svr2011::RosterIndex(base, id);
+  if (si >= 512) return nullptr;
+  const uint8_t* r = base + svr2011::RosterEntry(kRecords, kRecordSize, si);
+  return Rd16(r + kOwnId) == id ? r : nullptr;
+}
+uint32_t CallDonor(PPCContext& ctx, uint8_t* base, uint32_t id) {
+  static std::mutex mu;
+  static std::map<uint32_t, uint32_t> found;  // (per id, once the table is up)
+  if (id < 50 || id >= 1000 || ModOf(id)) return 0;
+  {
+    std::lock_guard lock(mu);
+    if (const auto f = found.find(id); f != found.end()) return f->second;
+  }
+  const uint32_t T = CallTable(ctx, base);
+  const uint8_t* rec = RosterRecord(base, id);
+  if (!T || !rec) return 0;
+  uint32_t donor = 0;
+  if (!HasCallName(base, T, id)) {
+    const uint32_t same = Rd16(rec + kSamePerson);
+    if (same != id && RosterRecord(base, same) && !ModOf(same) && HasCallName(base, T, same)) donor = same;
+    const std::string name(reinterpret_cast<const char*>(rec + kFullName), strnlen(reinterpret_cast<const char*>(rec + kFullName), 32));
+    for (uint32_t other = 50; !donor && !name.empty() && other < 1000; ++other) {
+      const uint8_t* o = other != id && !ModOf(other) ? RosterRecord(base, other) : nullptr;
+      if (o && !std::strncmp(reinterpret_cast<const char*>(o + kFullName), name.c_str(), 32) && HasCallName(base, T, other))
+        donor = other;
+    }
+    REXLOG_INFO("[svr2011] name call: {} (id {}, same person {}) has no name call - {}", name, id, same,
+                donor ? fmt::format("uses id {}'s", donor) : std::string("none to borrow"));
+  }
+  std::lock_guard lock(mu);
+  found[id] = donor;
+  return donor;
+}
+
 REX_EXTERN(__imp__sub_825EA208);
 REX_HOOK_RAW(sub_825EA208) {
   const uint32_t out = ctx.r3.u32, slot = ctx.r4.u32;
@@ -1877,7 +2610,11 @@ REX_HOOK_RAW(sub_825EA208) {
     REXLOG_INFO("[svr2011] name call: announcer id {} call {} nickname {}", Rd32(base + out), Rd32(base + out + 4),
                 Rd16(base + out + 20));
   const Mod* m = ModOf(Rd32(base + out));
-  if (!m) return;
+  if (!m) {
+    if (const uint32_t donor = CallDonor(ctx, base, Rd32(base + out)))
+      Wr32(base + out + 4, donor);  // (his own id stays: the call index is the donor's, as a mod's base)
+    return;
+  }
   if (!m->hometown_city.empty() && Hometown(ctx, base, out, *m)) return;
   if (!m->announcer.empty()) {  // (the game's own clips of that name)
     WriteAnnouncerNames(ctx, base, *m);
@@ -1901,7 +2638,12 @@ const Mod* ModOfCommentary(uint32_t n) { return ModOf(n >= 10000 && n < 10070 ? 
 REX_EXTERN(__imp__sub_8261EAB0);
 REX_HOOK_RAW(sub_8261EAB0) {
   const uint32_t n = ctx.r4.u32, buf = ctx.r3.u32;
-  if (const Mod* m = ModOfCommentary(ctx.r4.u32)) ctx.r4.u64 = m->call < 0 ? m->base : uint32_t(m->call + 1);
+  if (const Mod* m = ModOfCommentary(ctx.r4.u32)) {
+    ctx.r4.u64 = m->call < 0 ? m->base : uint32_t(m->call + 1);
+  } else if (const uint32_t id = n >= 10000 && n < 10070 ? n - 9950 : n; id >= 50) {
+    if (const uint32_t donor = CallDonor(ctx, base, id))  // (DLC Cena / Undertaker: the same person's commentary)
+      ctx.r4.u64 = donor < 70 ? donor + 9950 : donor;
+  }
   const uint32_t used = ctx.r4.u32;
   __imp__sub_8261EAB0(ctx, base);
   if (NameCallLog() && buf)
@@ -1976,6 +2718,12 @@ REX_HOOK_RAW(sub_82756538) {
   }
   // (a number whose mod is gone: cae_mod_motions.cpp)
   ctx.r3.u64 = svr2011::EntranceFallback(base, mgr, idx, int(part), ctx.r3.u32);
+  // (test aid SVR2011_TEST_CAE_LOG: the number each slot's scene part plays - a created entrance's are 10000+)
+  static const bool on = std::getenv("SVR2011_TEST_CAE_LOG") != nullptr;
+  static std::set<uint64_t> told;
+  if (on && idx < 16 && told.insert(uint64_t(mgr) << 32 | uint64_t(idx) << 28 | uint64_t(part & 0xFF) << 20 | (ctx.r3.u32 & 0xFFFFF)).second)
+    REXLOG_INFO("[svr2011] cae: slot {} part {} plays {} (created {})", idx, part, ctx.r3.u32,
+                base[mgr + 36 + idx * 280 + 195]);
 }
 REX_EXTERN(__imp__sub_82756718);
 REX_HOOK_RAW(sub_82756718) {
@@ -1994,6 +2742,52 @@ REX_HOOK_RAW(sub_82756768) {
   if (const int n = EntranceForAttire(ctx, base, mgr, idx, false); n > 0) ctx.r3.u64 = uint32_t(n);
   else ctx.r3 = r;
   ctx.r3.u64 = svr2011::EntranceFallback(base, mgr, idx, -1, ctx.r3.u32);
+}
+
+// Victory scenes (docs/VICTORY_SCENES.md): after the match the winner's scene is a script EVP? n from
+// pac\evt\Winning*.pac, queued in the entrance queue (*(0x82E3DDFC) + 5872) at +416 and started by
+// sub_8275DEE0: 6000 + id for the 26 superstars who have their own (6139 John Cena), else a generic one (7000-7107
+// the singles and divas ones; tag, trio, manager, title and match-type scenes are 7150+ and 8000+). A mod's
+// victory= (a superstar mod, or an attire mod for that attire, with or without a model) replaces a singles scene
+// with any scene that exists - another superstar's, a generic one or a pack's own (pacentry EVPx <n>).
+namespace {
+constexpr uint32_t kQueue = 5872, kVictoryAt = 416, kFighters = 0x82E3CC50, kPerson = 1156, kLost = 447,
+                   kBeatenBy = 448;
+int VictoryOfWinner(const uint8_t* base, uint32_t table, uint32_t* key_out) {
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t c = Rd32(base + kFighters + i * 4);
+    if (!c || !base[c + kLost]) continue;
+    const uint32_t person = base[c + kBeatenBy];
+    if (person >= 16) return -1;
+    const uint32_t key = Rd32(base + table + kSlotsAt + person * kSlotSize + kSlotKey), attire = key / 10 % 10;
+    *key_out = key;
+    if (const Mod* m = ModOf(key / 100)) return m->victory;
+    if (const AttireMod* am = AttireModOf(key / 100, attire); am && am->victory > 0) return am->victory;
+    const auto it = g_attire_victory_only.find({key / 100, attire});
+    return it != g_attire_victory_only.end() ? it->second : -1;
+  }
+  return -1;
+}
+}  // namespace
+REX_EXTERN(__imp__sub_8275DEE0);
+REX_HOOK_RAW(sub_8275DEE0) {
+  if (const uint32_t table = Rd32(base + kSlotTable)) {
+    uint8_t* at = base + table + kQueue + kVictoryAt;
+    const uint32_t now = Rd32(at);
+    uint32_t key = 0;
+    const int want = now >= 6000 && now <= 7107 ? VictoryOfWinner(base, table, &key) : -1;
+    if (now >= 6000 && now <= 7107)
+      REXLOG_INFO("[svr2011] victory: scene {} for superstar {} attire {}", now, key / 100, key / 10 % 10 + 1);
+    if (want > 0 && uint32_t(want) != now) {
+      if (svr2011::EntranceScriptExists(want)) {
+        Wr32(at, uint32_t(want));
+        REXLOG_INFO("[svr2011] victory: superstar {} attire {}: scene {} instead of {}", key / 100, key / 10 % 10 + 1, want, now);
+      } else {
+        REXLOG_WARN("[svr2011] victory: superstar {}: victory={} has no script - the game's {} plays", key / 100, want, now);
+      }
+    }
+  }
+  __imp__sub_8275DEE0(ctx, base);
 }
 
 // Audio events by name (sub_82BEC030(name, ...)): a mod's own announcer
@@ -2040,8 +2834,13 @@ REX_HOOK_RAW(sub_82BEC030) {
       if (!std::strncmp(e, "Play_RA_", 8))
         if (const char* mod = std::strstr(e, "_MOD_"))
           if (const Mod* m = ModOf(uint32_t(std::atoi(mod + 5))); m && !m->voice.empty()) {
-            REXLOG_INFO("[svr2011] superstar mods: {}: name call {}", m->name, m->voice.filename().string());
-            svr2011::PlayClip(m->voice);
+            // The game's own calls play 7 dB down: RA.pck's one actor-mixer (1AB691A1), every RA sound's parent,
+            // has a volume of -7.0. A mod's call (its own player, at the file's level) the same, then call_gain=.
+            constexpr float kGameCalls = -7.0f;
+            REXLOG_INFO("[svr2011] superstar mods: {}: name call {} at {:.1f} dB (the game's calls' {:.0f}{})", m->name,
+                        m->voice.filename().string(), kGameCalls + m->call_gain, kGameCalls,
+                        m->call_gain ? fmt::format(", call_gain {:+.1f}", m->call_gain) : std::string());
+            svr2011::PlayClip(m->voice, kGameCalls + m->call_gain);
           }
     }
   }
@@ -2111,8 +2910,8 @@ REX_HOOK_RAW(sub_828C4060) {
 // listed character of the same gender and the nearest height (record +28).
 uint32_t FramingStandIn(uint8_t* base, uint32_t mgr, uint32_t layout, uint32_t id) {
   const auto rec = [&](uint32_t i) -> const uint8_t* {
-    const uint32_t si = i < 512 ? Rd16(base + kIdToIndex + i * 2) : 0xFFFF;
-    return si < 512 ? base + kRecords + si * kRecordSize : nullptr;
+    const uint32_t si = i < 512 ? svr2011::RosterIndex(base, i) : 0xFFFF;
+    return si < 512 ? base + svr2011::RosterEntry(kRecords, kRecordSize, si) : nullptr;
   };
   const uint8_t* r = rec(id);
   if (!r) return 0;
@@ -2234,7 +3033,33 @@ REX_HOOK_RAW(sub_82B89E50) {
   Remember(base);
   __imp__sub_82B89E50(ctx, base);
   const auto r3 = ctx.r3.u64;
+  RecordStubs(base);  // (per-mod saves: each mod slot as the game loads it, before ApplyRecords)
+  // Test aid: SVR2011_TEST_SLOT_HELD=<mod id> - once the slot has a kept record
+  // (a later load: a save), it gets what a save from before a mod swap brings:
+  // another mod's record name and a stock superstar's profile (id 100's).
+  // Logs whether that profile is still there after ApplyRecords.
+  static const int held = std::getenv("SVR2011_TEST_SLOT_HELD") ? std::atoi(std::getenv("SVR2011_TEST_SLOT_HELD")) : -1;
+  static bool held_done = false;
+  uint8_t* held_sp = nullptr;
+  svrfmt::Bytes held_profile;
+  if (held >= 0 && !held_done) {
+    const uint32_t si = svr2011::RosterIndex(base, uint32_t(held)), oi = svr2011::RosterIndex(base, 100);
+    bool kept = false;
+    for (const auto& k : g_kept) kept |= k.slot == uint32_t(held) && !k.record.empty();
+    if (kept && si < 512 && oi < 512) {
+      held_done = true;
+      PutName(base + svr2011::RosterEntry(kRecords, kRecordSize, si), kFullName, "OLD MOD");
+      held_sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
+      std::memcpy(held_sp, base + svr2011::RosterEntry(kProfiles, kProfileSize, oi), kProfileSize);
+      held_profile.assign(held_sp, held_sp + kProfileSize);
+      REXLOG_INFO("[svr2011] superstar mods: test - id {} given \"OLD MOD\"'s record and id 100's profile", held);
+    }
+  }
   ApplyRecords(base);
+  if (held_sp)
+    REXLOG_INFO("[svr2011] superstar mods: test - id {} after the load: profile {}, name \"{}\"", held,
+                std::memcmp(held_sp, held_profile.data(), kProfileSize) ? "its own" : "STILL THE OLD MOD'S",
+                reinterpret_cast<const char*>(base + svr2011::RosterEntry(kRecords, kRecordSize, svr2011::RosterIndex(base, uint32_t(held))) + kFullName));
   ctx.r3.u64 = r3;
 }
 bool g_pro_load_ran = false;  // (sub_82594C78 ran inside sub_82B89DC0)
@@ -2244,23 +3069,24 @@ REX_HOOK_RAW(sub_82594C78) {
   Remember(base);
   std::vector<svrfmt::Bytes> before;  // (the mods' slots before the load: RecordBlanks)
   for (const auto& m : g_mods) {
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
-    before.push_back(si < 512 ? svrfmt::Bytes(base + kProfiles + si * kProfileSize,
-                                              base + kProfiles + (si + 1) * kProfileSize)
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
+    before.push_back(si < 512 ? svrfmt::Bytes(base + svr2011::RosterEntry(kProfiles, kProfileSize, si),
+                                              base + svr2011::RosterEntry(kProfiles, kProfileSize, si) + kProfileSize)
                               : svrfmt::Bytes());
   }
   __imp__sub_82594C78(ctx, base);
   const auto r3 = ctx.r3.u64;
   KeepBlankProfiles(base);
   RecordBlanks(base, before);
+  KeepPoolPlaceholders(base);  // (the save cleaner's reference: before ApplyRecords sets the mods)
   ApplyRecords(base);
   // test aid: SVR2011_TEST_PRO_LOG=1 - each mod slot's entrance after the load
   // (music, movie, entrance number; a placeholder reads 255 255 4000)
   if (std::getenv("SVR2011_TEST_PRO_LOG"))
     for (const auto& m : g_mods) {
-      const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
+      const uint32_t si = svr2011::RosterIndex(base, m.slot);
       if (si >= 512) continue;
-      const uint8_t* e = base + kProfiles + si * kProfileSize + kEntrance;
+      const uint8_t* e = base + svr2011::RosterEntry(kProfiles, kProfileSize, si) + kEntrance;
       REXLOG_INFO("[svr2011] superstar mods: CHAR/PRO loaded: id {} music {} movie {} entrance {}", m.slot,
                   Rd16(e + kMusic), Rd16(e + kMovie), Rd16(e + 0x14));
     }
@@ -2275,15 +3101,16 @@ REX_HOOK_RAW(sub_8259CAA8) {
   Remember(base);
   std::vector<svrfmt::Bytes> before;
   for (const auto& m : g_mods) {
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
-    before.push_back(si < 512 ? svrfmt::Bytes(base + kProfiles + si * kProfileSize,
-                                              base + kProfiles + (si + 1) * kProfileSize)
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
+    before.push_back(si < 512 ? svrfmt::Bytes(base + svr2011::RosterEntry(kProfiles, kProfileSize, si),
+                                              base + svr2011::RosterEntry(kProfiles, kProfileSize, si) + kProfileSize)
                               : svrfmt::Bytes());
   }
   __imp__sub_8259CAA8(ctx, base);
   const auto r3 = ctx.r3.u64;
   if (std::getenv("SVR2011_TEST_PRO_LOG")) REXLOG_INFO("[svr2011] superstar mods: DLC restore (sub_8259CAA8)");
   RecordBlanks(base, before);
+  KeepPoolPlaceholders(base);
   ApplyRecords(base);
   ctx.r3.u64 = r3;
 }
@@ -2296,9 +3123,9 @@ REX_EXTERN(__imp__sub_82B89DC0);
 REX_HOOK_RAW(sub_82B89DC0) {
   std::vector<svrfmt::Bytes> before;
   for (const auto& m : g_mods) {
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
-    before.push_back(si < 512 ? svrfmt::Bytes(base + kProfiles + si * kProfileSize,
-                                              base + kProfiles + (si + 1) * kProfileSize)
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
+    before.push_back(si < 512 ? svrfmt::Bytes(base + svr2011::RosterEntry(kProfiles, kProfileSize, si),
+                                              base + svr2011::RosterEntry(kProfiles, kProfileSize, si) + kProfileSize)
                               : svrfmt::Bytes());
   }
   g_pro_load_ran = false;
@@ -2308,8 +3135,10 @@ REX_HOOK_RAW(sub_82B89DC0) {
     if (std::getenv("SVR2011_TEST_PRO_LOG"))
       REXLOG_INFO("[svr2011] superstar mods: CHAR/PRO written without a load (a DLC's chEtc)");
     RecordBlanks(base, before);
+    KeepPoolPlaceholders(base);
     ApplyRecords(base);
   }
+  RedoHandovers(base, false);  // (a handed-over slot's saved profile, if the loader wrote it by now)
   ctx.r3.u64 = r3;
 }
 REX_EXTERN(__imp__sub_8259C9A8);
@@ -2319,9 +3148,15 @@ REX_HOOK_RAW(sub_8259C9A8) {
 }
 REX_EXTERN(__imp__sub_8257A218);
 REX_HOOK_RAW(sub_8257A218) {
+  g_save_loaded = true;  // (KeepPoolPlaceholders: the slots hold the save's data from here)
   __imp__sub_8257A218(ctx, base);
   const auto r3 = ctx.r3.u64;
+  TempFromSave(base);  // (the fetched mods' ids as this save has them: from its image, before they're written)
+  CheckSavedProfiles(base);  // (slots whose saved profile is another mod's: handed over by ApplyRecords)
   ApplyRecords(base);
+  svr2011::PerModSavesLoaded(base);  // (key refs: the save's teams / titles / cards naming a mod)
+  svr2011::BigRosterTestCard(base);
+  g_moves_checked = false;  // (the save's profiles - its kept edits - get CheckModProfiles' move check too)
   svr2011::UniverseModsLoaded(base);  // (the mods' Universe side table for this save)
   ctx.r3.u64 = r3;
 }
@@ -2338,39 +3173,230 @@ REX_HOOK_RAW(sub_8257A218) {
 // move that doesn't exist (crash, 2.0.3). A save's edited copy is no
 // placeholder and stays.
 namespace svr2011 {
+// A mod slot's move-set as the CPU and the player use it: the u16 move ids below the entrance block. Usable: ones
+// the game has a record with motions for (MoveUsable). A profile copied from a base that is a blank placeholder,
+// or a save's broken copy, has few or none: the CPU (and the player) got stuck in matches (player report, 20 Oct).
+struct MovesetCount {
+  int set = 0, usable = 0;
+};
+MovesetCount CountMoves(const uint8_t* profile) {
+  MovesetCount c;
+  for (uint32_t off = 0; off + 1 < kEntrance; off += 2) {
+    const uint16_t id = Rd16(profile + off);
+    if (!id || id == 0xFFFF) continue;
+    ++c.set;
+    c.usable += svr2011::MoveUsable(id) == 1;
+  }
+  return c;
+}
+bool MovesetWorks(const MovesetCount& c) { return c.usable >= kMinUsableMoves; }
+
+// Fail-safe: a mod slot whose move-set doesn't work gets a stock superstar's whole move-set (one of the mod's
+// gender - record +208 - picked by the mod's folder name: the same one every run), then the mod's own usable
+// moves on top - never a stuck match.
+void EnsureMoveset(uint8_t* base, uint8_t* sp, const Mod& m) {
+  const MovesetCount now = CountMoves(sp);
+  if (MovesetWorks(now)) return;
+  const uint32_t mi = svr2011::RosterIndex(base, m.slot);
+  const int gender = mi < 512 ? base[svr2011::RosterEntry(kRecords, kRecordSize, mi) + 208] : -1;
+  std::vector<uint32_t> donors;
+  for (uint32_t id = 100; id <= 321; ++id) {
+    if (ModOf(id) || std::find(std::begin(kPool), std::end(kPool), id) != std::end(kPool)) continue;
+    const uint32_t i = svr2011::RosterIndex(base, id);
+    if (i >= 512 || !base[svr2011::RosterEntry(kRecords, kRecordSize, i) + kFullName]) continue;
+    if (gender >= 0 && base[svr2011::RosterEntry(kRecords, kRecordSize, i) + 208] != gender) continue;
+    if (MovesetWorks(CountMoves(base + svr2011::RosterEntry(kProfiles, kProfileSize, i)))) donors.push_back(id);
+  }
+  if (donors.empty()) {
+    REXLOG_WARN("[svr2011] superstar mods: {}: its move-set doesn't work ({} of {} moves usable) and no stock one "
+                "was found to give it", m.folder, now.usable, now.set);
+    return;
+  }
+  uint32_t h = 2166136261u;
+  for (char c : m.folder) h = (h ^ uint8_t(c)) * 16777619u;
+  const uint32_t donor = donors[h % donors.size()];
+  const uint8_t* dp = base + svr2011::RosterEntry(kProfiles, kProfileSize, svr2011::RosterIndex(base, donor));
+  std::memcpy(sp, dp, kEntrance);  // (the move block only: below the entrance)
+  for (const auto& [off, id] : m.moves)
+    if (off + 1u < kEntrance && svr2011::MoveUsable(id) == 1) sp[off] = uint8_t(id >> 8), sp[off + 1] = uint8_t(id);
+  const MovesetCount after = CountMoves(sp);
+  REXLOG_WARN("[svr2011] superstar mods: {}: its move-set didn't work ({} of {} moves usable) - superstar {}'s (gender {}) "
+              "given instead, with the mod's own on top ({} usable now)", m.folder, now.usable, now.set, donor, gender, after.usable);
+}
+
+// The created entrances (CREATE AN ENTRANCE's ADVANCED CREATION) the profiles hold, for the Mod Maker's "Made in the
+// game" (a mod's cae=): <game>\Mods\.cae\<id>.bin (the 284-byte block as the game holds it) and list.txt
+// ("<id>\t<name>"). Only that folder is written - never a save or a DLC file; a file only when it changed.
+void ExportCreatedEntrances(const uint8_t* base) {
+  static uint32_t frames = 0;
+  static std::string last;  // (what was written: the profiles' created entrances, compared in memory)
+  if (++frames % 300) return;  // (every 5 s: a save loaded, an entrance made in the game)
+  {
+    const uint32_t ri = svr2011::RosterIndex(base, 100);  // (the profiles loaded)
+    if (ri >= 512 || !CountMoves(base + svr2011::RosterEntry(kProfiles, kProfileSize, ri)).set) return;
+  }
+  std::string now;
+  for (uint32_t id = 1; id < 512; ++id) {
+    const uint32_t i = svr2011::RosterIndex(base, id);
+    if (i < 512 && base[svr2011::RosterEntry(kProfiles, kProfileSize, i) + kEntrance + 0xC7])
+      now.append(reinterpret_cast<const char*>(base + svr2011::RosterEntry(kProfiles, kProfileSize, i) + kEntrance), kCaeSize);
+  }
+  if (now == last) return;
+  last = now;
+  std::error_code ec;
+  const fs::path dir = g_game / "Mods" / ".cae";
+  std::string list;
+  std::set<std::string> keep = {"list.txt"}, seen;  // (seen: name + block - a copy slot of the same superstar once)
+  for (uint32_t id = 1; id < 512; ++id) {
+    const uint32_t i = svr2011::RosterIndex(base, id);
+    if (i >= 512 || !base[svr2011::RosterEntry(kRecords, kRecordSize, i) + kFullName]) continue;
+    const uint8_t* e = base + svr2011::RosterEntry(kProfiles, kProfileSize, i) + kEntrance;
+    if (!e[0xC7]) continue;
+    bool real = true;  // (each scene's motion: 0, or 10000 + 1000 * scene + an entrance)
+    int parts = 0;
+    for (uint32_t p = 0; p < 5; ++p) {
+      const int n = e[kCaeFrom + 34 * p + 14] << 8 | e[kCaeFrom + 34 * p + 15];
+      if (n && (n < int(10000 + 1000 * p) || n >= int(11000 + 1000 * p))) real = false;
+      parts += n != 0;
+    }
+    if (!real || !parts) continue;
+    char name[kNameLen + 1] = {};
+    std::memcpy(name, base + svr2011::RosterEntry(kRecords, kRecordSize, i) + kFullName, kNameLen);
+    if (!seen.insert(std::string(name) + std::string(reinterpret_cast<const char*>(e), kCaeSize)).second) continue;
+    const std::string file = std::to_string(id) + ".bin";
+    keep.insert(file);
+    list += std::to_string(id) + "\t" + name + "\n";
+    std::vector<uint8_t> have;
+    if (std::ifstream in(dir / file, std::ios::binary); in) have.assign(std::istreambuf_iterator<char>(in), {});
+    if (have.size() == kCaeSize && !std::memcmp(have.data(), e, kCaeSize)) continue;
+    fs::create_directories(dir, ec);
+    std::ofstream(dir / file, std::ios::binary).write(reinterpret_cast<const char*>(e), kCaeSize);
+  }
+  std::string old;
+  if (std::ifstream in(dir / "list.txt", std::ios::binary); in) old.assign(std::istreambuf_iterator<char>(in), {});
+  if (old != list && (!list.empty() || fs::exists(dir, ec))) {
+    fs::create_directories(dir, ec);
+    std::ofstream(dir / "list.txt", std::ios::binary) << list;
+    REXLOG_INFO("[svr2011] superstar mods: created entrances for the Mod Maker: {} in {}",
+                std::count(list.begin(), list.end(), '\n'), dir.string());
+  }
+  for (const auto& f : fs::directory_iterator(dir, ec))  // (ones gone from the profiles)
+    if (!keep.count(f.path().filename().string())) fs::remove(f.path(), ec);
+}
+
+// Test aid SVR2011_TEST_SAVE_DUMP=<dir>: every 10 s, the save image in memory (0x812C0 bytes from 0x82E407C0: block A
+// then block B, as the writer writes them) to <dir>\save_<n>.bin when it changed, and the mods' ids to <dir>\ids.txt -
+// diffing the dumps finds the save's fields that hold a mod's id (superstar_threads.cpp's save-time dumps share the
+// folder).
+void SaveDumpTick(uint8_t* base) {
+  static const char* dir = std::getenv("SVR2011_TEST_SAVE_DUMP");
+  if (!dir) return;
+  static auto next = std::chrono::steady_clock::now();
+  static uint64_t last = 0;
+  static int n = 0;
+  const auto now = std::chrono::steady_clock::now();
+  if (now < next) return;
+  next = now + std::chrono::seconds(10);
+  constexpr uint32_t kImage = 0x82E407C0, kImageSize = 0x812C0;
+  const uint8_t* p = base + kImage;
+  uint64_t h = 1469598103934665603ull;
+  for (uint32_t i = 0; i < kImageSize; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  if (h == last) return;
+  last = h;
+  const fs::path d(dir);
+  std::error_code ec;
+  fs::create_directories(d, ec);
+  std::ofstream(d / ("save_" + std::to_string(n) + ".bin"), std::ios::binary)
+      .write(reinterpret_cast<const char*>(p), kImageSize);
+  std::string ids;
+  {
+    std::lock_guard lock(g_slots_mutex);
+    for (const auto& m : g_mods) ids += m.folder + "\t" + std::to_string(m.slot) + "\t" + std::to_string(m.key) + "\n";
+  }
+  std::ofstream(d / "ids.txt", std::ios::binary) << ids;
+  REXLOG_INFO("[svr2011] save dump: save_{}.bin", n);
+  ++n;
+}
+
 void CheckModProfiles(uint8_t* base) {
+  SaveDumpTick(base);
+  ExportCreatedEntrances(base);
+  {
+    std::lock_guard lock(g_slots_mutex);
+    RedoHandovers(base, true);  // (a slot handed over at a save load: the save's own write after it)
+  }
   UniverseModsTick(base);  // (the game wrote its save: the mods' Universe side table beside it)
+  MarksTick(base);  // (and which mod each slot's saved profile is: mod_profiles.txt)
+  UniverseTeamsTick(base);  // (Universe's teams and stables made / changed / dissolved: logged)
   UniverseWelcomeTick(base);  // (the Universe welcome accepted: kept as seen in the save file at once)
   std::lock_guard lock(g_slots_mutex);
   for (const auto& m : g_mods) {
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
     if (si >= 512) continue;
     bool have_blank = false;
     for (const auto& b : g_blank) have_blank |= b.first == m.slot;
-    if (have_blank && IsBlank(m.slot, base + kProfiles + si * kProfileSize)) {
+    if (have_blank && IsBlank(m.slot, base + svr2011::RosterEntry(kProfiles, kProfileSize, si))) {
       ApplyRecords(base);
+      g_moves_checked = false;  // (the profiles were set up again: checked again)
       return;
     }
   }
   // Once the move records are loaded: a mod's own move the game has no usable
   // record for (SetOwnMoves may have run before they were) goes back to the
-  // base's - only where the slot still holds the mod's id, never an edit.
-  static bool checked = false;
+  // base's - only where the slot still holds the mod's id; an edit only when it
+  // holds a move the game has no record for (then the mod's own).
+  bool& checked = g_moves_checked;
   if (checked || MoveUsable(0) < 0) return;
+  {  // (the profiles loaded: a stock superstar holds its moves - else later)
+    const uint32_t ri = svr2011::RosterIndex(base, 100);  // (THE ROCK)
+    if (ri >= 512 || !CountMoves(base + svr2011::RosterEntry(kProfiles, kProfileSize, ri)).set) return;
+  }
   checked = true;
+  if (const char* f = std::getenv("SVR2011_TEST_DUMP_ENTRANCES")) {  // (test aid: every profile's entrance block, hex)
+    if (FILE* o = std::fopen(f, "wb")) {
+      for (uint32_t id = 0; id < 512; ++id) {
+        const uint32_t i = svr2011::RosterIndex(base, id);
+        if (i >= 512) continue;
+        const uint8_t* e = base + svr2011::RosterEntry(kProfiles, kProfileSize, i) + kEntrance;
+        std::fprintf(o, "%u ", id);
+        for (uint32_t k = 0; k < 284; ++k) std::fprintf(o, "%02x", e[k]);
+        std::fputc('\n', o);
+      }
+      std::fclose(o);
+      REXLOG_INFO("[svr2011] superstar mods: test: entrance blocks written to {}", f);
+    }
+  }
   for (const auto& m : g_mods) {
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2), bi = Rd16(base + kIdToIndex + m.base * 2);
+    const uint32_t si = svr2011::RosterIndex(base, m.slot), bi = svr2011::RosterIndex(base, m.base);
     if (si >= 512 || bi >= 512) continue;
-    uint8_t* sp = base + kProfiles + si * kProfileSize;
-    const uint8_t* bp = base + kProfiles + bi * kProfileSize;
-    std::string fixed;
+    uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
+    const uint8_t* bp = base + svr2011::RosterEntry(kProfiles, kProfileSize, bi);
+    std::string fixed, repaired;
     for (const auto& [off, id] : m.moves) {
-      if (off + 1u >= kEntrance || Rd16(sp + off) != id || MoveUsable(id) != 0) continue;
-      sp[off] = bp[off], sp[off + 1] = bp[off + 1];
-      fixed += fmt::format(" 0x{:03X}={}", off, id);
+      if (off + 1u >= kEntrance) continue;
+      const uint16_t cur = uint16_t(Rd16(sp + off) & 0x7FFF);
+      if (cur == id) {
+        if (MoveUsable(id) != 0) continue;
+        sp[off] = bp[off], sp[off + 1] = bp[off + 1];
+        fixed += fmt::format(" 0x{:03X}={}", off, id);
+      } else if ((!cur || MoveUsable(cur) == 0) && MoveUsable(id) == 1) {
+        // (a saved edit - or an older version of the mod - holding a move the game has no record for, or none:
+        // the mod's own move. Sabu 1.5's finisher 6861 had no record - 1.7 moved it to 6027 - and a save whose
+        // move-set was edited kept 6861: the finisher started and stopped after the flip.)
+        sp[off] = uint8_t(id >> 8), sp[off + 1] = uint8_t(id);
+        repaired += fmt::format(" 0x{:03X}={}->{}", off, cur, id);
+      }
     }
     if (!fixed.empty())
       REXLOG_WARN("[svr2011] superstar mods: {}: moves the game doesn't have, the base's put back:{}", m.folder, fixed);
+    if (!repaired.empty())
+      REXLOG_WARN("[svr2011] superstar mods: {}: saved moves the game has no record for, the mod's own put back:{}",
+                  m.folder, repaired);
+    if (const char* t = std::getenv("SVR2011_TEST_EMPTY_MOVESET"); t && m.folder == t) {  // (test aid: a broken move-set)
+      std::memset(sp, 0, kEntrance);
+      REXLOG_INFO("[svr2011] superstar mods: test: {}'s move-set emptied", m.folder);
+    }
+    EnsureMoveset(base, sp, m);
   }
 }
 }  // namespace svr2011
@@ -2386,9 +3412,9 @@ void CheckModProfiles(uint8_t* base) {
 void ModSortKeys(uint8_t* base, bool on) {
   uint32_t n = 0;
   for (const auto& m : g_mods) {
-    const uint32_t si = Rd16(base + kIdToIndex + m.slot * 2);
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
     if (si >= 512) continue;
-    uint8_t* key = base + kRecords + si * kRecordSize + kSelectTile;
+    uint8_t* key = base + svr2011::RosterEntry(kRecords, kRecordSize, si) + kSelectTile;
     const uint32_t mine = 0x7000 + n++;
     if (on && !Rd16(key)) key[0] = uint8_t(mine >> 8), key[1] = uint8_t(mine);
     else if (!on && Rd16(key) == mine) key[0] = key[1] = 0;
@@ -2449,8 +3475,12 @@ REX_HOOK_RAW(sub_828C1288) {
 // profile and show like the other mod ids when a mod takes one.
 REX_EXTERN(__imp__sub_828B7078);
 REX_HOOK_RAW(sub_828B7078) {
-  if (ctx.r3.u32 < 322 && ModOf(ctx.r3.u32)) {
+  if (ctx.r3.u32 < svr2011::kMaxIds && ModOf(ctx.r3.u32)) {
     ctx.r3.u64 = 1;
+    return;
+  }
+  if (ctx.r3.u32 >= 322) {  // (past the game's 322-byte table: big roster's ids hold mods only)
+    ctx.r3.u64 = 0;
     return;
   }
   __imp__sub_828B7078(ctx, base);
@@ -2527,7 +3557,11 @@ REX_HOOK_RAW(sub_825AD850) {  // (id, id) -> the pair's rivalry index from the c
       return;
     }
     const int64_t pa = ModOf(a) ? 0 : UniversePlace(ctx, base, a), pb = ModOf(b) ? 0 : UniversePlace(ctx, base, b);
-    ctx.r3.u64 = uint64_t(svr2011::UniverseModPair(base, table, a, pa, b, pb));
+    // (the weekly relationship pass's working copy lives in sub_825C3D70's stack frame, just above this call's
+    // stack pointer: universe_mods.h)
+    const uint32_t sp = ctx.r1.u32;
+    const bool working_copy = table > sp && table - sp < 0x10000;
+    ctx.r3.u64 = uint64_t(svr2011::UniverseModPair(base, table, a, pa, b, pb, working_copy));
     return;
   }
   __imp__sub_825AD850(ctx, base);
@@ -2546,14 +3580,422 @@ REX_HOOK_RAW(sub_82589198) {
   __imp__sub_82589198(ctx, base);
 }
 
+// ---- Per-mod save files (per_mod_saves, experimental, off by default)
+// A mod superstar's save data - its slot's 260-byte record, 1056-byte profile and 40-byte entry (block B +0x3E648 +
+// index * 40; the other per-id looking tables of block A aren't per id: +0x2FE04 is 26,280 bytes, +0x364AC 8) -
+// lives in <saves>\.mods\<folder>.dat instead of SaveData.dat. At each save the game builds, every mod slot gets its
+// stub - the slot as the game loads it before any mod (the placeholder record, profile and entry) - and the mod's
+// own bytes go to its file; after the write they're put back. The save then holds no mod data: a mod uninstalled
+// leaves it clean, and a 2.1.8 game reads it as ever. At start each mod's file (its fingerprint matching - an
+// updated mod starts from its own defaults, as a stale profile does) seeds what the slot keeps (g_kept): a save's
+// stub there takes it back (ApplyRecords). The link to the save is mod_profiles.txt (slot, folder, fingerprint).
+// Turning it on: the save folder is backed up first (SaveBackups\per_mod_saves_<time>), the first save moves the
+// data out. Turning it off: the files still seed the slots once (.mods\.on is there), the next save folds them back.
+//
+// File (big-endian): "SVRMODSV", u32 1, u16 n + folder, u16 n + version, u32 fingerprint, u16 the id it held,
+// u32 the blocks' CRC-32, then blocks of u32 tag + u32 size + bytes: 'REC ' 260, 'PRO ' 1056, 'E40 ' 40. Unknown
+// tags are skipped.
+constexpr uint32_t kEntries40 = 0x82E7C918 + 0x3E648, kEntry40Size = 40;
+constexpr char kModSaveMagic[8] = {'S', 'V', 'R', 'M', 'O', 'D', 'S', 'V'};
+
+namespace {
+struct ModSave {
+  svrfmt::Bytes record, profile, entry;
+};
+std::map<uint32_t, svrfmt::Bytes> g_stub_record, g_stub_entry;  // slot -> as the game loaded it, before any mod
+std::map<uint32_t, svrfmt::Bytes> g_saved_entry;                // slot -> the .dat's 40-byte entry, to put back
+std::map<uint32_t, ModSave> g_live_while_saving;                // slot -> the mod's bytes while the save is written
+std::map<std::string, svrfmt::Bytes> g_mod_save_written;         // folder -> the file's bytes last written
+bool g_mod_saves_on = false, g_mod_saves_fold = false;
+
+fs::path ModSavesDir() { return g_save_file.empty() ? fs::path() : g_save_file.parent_path() / ".mods"; }  // (a dot folder: the saves layer takes any other entry in Saves for a save package - a "Mods" folder crashed the game)
+
+uint32_t Crc32(const uint8_t* p, size_t n) {
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; ++i) {
+    c ^= p[i];
+    for (int k = 0; k < 8; ++k) c = c >> 1 ^ (0xEDB88320u & (0u - (c & 1)));
+  }
+  return ~c;
+}
+
+void Put32(svrfmt::Bytes& o, uint32_t v) {
+  for (int s = 24; s >= 0; s -= 8) o.push_back(uint8_t(v >> s));
+}
+void PutStr(svrfmt::Bytes& o, const std::string& s) {
+  o.push_back(uint8_t(s.size() >> 8)), o.push_back(uint8_t(s.size()));
+  o.insert(o.end(), s.begin(), s.end());
+}
+
+svrfmt::Bytes ModSaveFile(const Mod& m, const ModSave& s) {
+  svrfmt::Bytes blocks;
+  for (const auto& [tag, data] : {std::pair<uint32_t, const svrfmt::Bytes*>{0x52454320, &s.record},
+                                  {0x50524F20, &s.profile}, {0x45343020, &s.entry}})
+    if (!data->empty()) Put32(blocks, tag), Put32(blocks, uint32_t(data->size())), blocks.insert(blocks.end(), data->begin(), data->end());
+  svrfmt::Bytes o(kModSaveMagic, kModSaveMagic + 8);
+  Put32(o, 1);
+  PutStr(o, m.folder);
+  PutStr(o, m.version);
+  Put32(o, Fingerprint(m));
+  o.push_back(uint8_t(m.slot >> 8)), o.push_back(uint8_t(m.slot));
+  Put32(o, Crc32(blocks.data(), blocks.size()));
+  o.insert(o.end(), blocks.begin(), blocks.end());
+  return o;
+}
+
+// A mod's file read back: false when it's missing, damaged, another mod's or made for another version (fingerprint).
+bool ReadModSave(const Mod& m, ModSave& s) {
+  svrfmt::Bytes d;
+  if (!svrfmt::ReadFile((ModSavesDir() / (m.folder + ".dat")).string(), d) || d.size() < 22 ||
+      std::memcmp(d.data(), kModSaveMagic, 8) || Rd32(d.data() + 8) != 1)
+    return false;
+  size_t at = 12;
+  auto str = [&](std::string& out) {
+    if (at + 2 > d.size()) return false;
+    const size_t n = Rd16(d.data() + at);
+    if (at + 2 + n > d.size()) return false;
+    out.assign(reinterpret_cast<const char*>(d.data() + at + 2), n), at += 2 + n;
+    return true;
+  };
+  std::string folder, version;
+  if (!str(folder) || !str(version) || at + 10 > d.size() || folder != m.folder) return false;
+  const uint32_t fingerprint = Rd32(d.data() + at), crc = Rd32(d.data() + at + 6);
+  at += 10;
+  if (Crc32(d.data() + at, d.size() - at) != crc) {
+    REXLOG_WARN("[svr2011] per-mod saves: {}.dat is damaged - its defaults instead", m.folder);
+    return false;
+  }
+  if (fingerprint != Fingerprint(m)) {
+    REXLOG_INFO("[svr2011] per-mod saves: {}.dat was made for another version of the mod - its defaults instead",
+                m.folder);
+    return false;
+  }
+  while (at + 8 <= d.size()) {
+    const uint32_t tag = Rd32(d.data() + at), n = Rd32(d.data() + at + 4);
+    if (at + 8 + n > d.size()) break;
+    const svrfmt::Bytes b(d.data() + at + 8, d.data() + at + 8 + n);
+    if (tag == 0x52454320 && n == kRecordSize) s.record = b;
+    else if (tag == 0x50524F20 && n == kProfileSize) s.profile = b;
+    else if (tag == 0x45343020 && n == kEntry40Size) s.entry = b;
+    at += 8 + n;
+  }
+  g_mod_save_written[m.folder] = std::move(d);
+  return !s.record.empty() && !s.profile.empty();
+}
+
+void WriteModSave(const Mod& m, const ModSave& s) {
+  const svrfmt::Bytes f = ModSaveFile(m, s);
+  if (const auto it = g_mod_save_written.find(m.folder); it != g_mod_save_written.end() && it->second == f) return;
+  std::error_code ec;
+  fs::create_directories(ModSavesDir(), ec);
+  const fs::path to = ModSavesDir() / (m.folder + ".dat"), part = fs::path(to).concat(".tmp");
+  if (FILE* o = std::fopen(part.string().c_str(), "wb")) {
+    const bool ok = std::fwrite(f.data(), 1, f.size(), o) == f.size();
+    std::fclose(o);
+    if (ok) fs::rename(part, to, ec);
+    if (ok && !ec) {
+      g_mod_save_written[m.folder] = f;
+      REXLOG_INFO("[svr2011] per-mod saves: {} (id {}) written to .mods\\{}.dat", m.name, m.slot, m.folder);
+      return;
+    }
+  }
+  REXLOG_WARN("[svr2011] per-mod saves: {}.dat could not be written", m.folder);
+}
+
+// The slots' stubs: the record and entry as the game's first CHAR/DAT load leaves them (before ApplyRecords), the
+// profile CHAR/PRO's placeholder (g_blank).
+void RecordStubs(uint8_t* base) {
+  for (const auto& m : g_mods) {
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
+    if (si >= 512 || g_stub_record.count(m.slot)) continue;
+    const uint8_t* sr = base + svr2011::RosterEntry(kRecords, kRecordSize, si);
+    if (!std::strncmp(reinterpret_cast<const char*>(sr + kFullName), m.name.c_str(), kNameLen - 1)) continue;
+    g_stub_record[m.slot].assign(sr, sr + kRecordSize);
+    const uint8_t* se = base + svr2011::RosterEntry(kEntries40, kEntry40Size, si);
+    g_stub_entry[m.slot].assign(se, se + kEntry40Size);
+  }
+}
+
+// At start: the option, the backup when it was just turned on, and the files seeding the slots.
+void StartModSaves() {
+  const fs::path dir = ModSavesDir();
+  if (dir.empty()) return;
+  std::error_code ec;
+  const fs::path on_mark = dir / ".on";
+  const bool was_on = fs::exists(on_mark, ec);
+  g_mod_saves_on = REXCVAR_GET(per_mod_saves);
+  // Test aid: SVR2011_TEST_PER_MOD_SAVES=0 / 1 overrides the setting.
+  if (const char* v = std::getenv("SVR2011_TEST_PER_MOD_SAVES"); v && *v) g_mod_saves_on = *v == '1';
+  // (big_roster: the indices from 242 up are in no table SaveData.dat holds - the mods' files are their only save)
+  if (svr2011::BigRosterOn() && !g_mod_saves_on) {
+    g_mod_saves_on = true;
+    REXLOG_INFO("[svr2011] per-mod saves: on - big_roster needs them (per_mod_saves is off in the settings)");
+  }
+  if (g_mod_saves_on && !was_on) {
+    // (turned on: the saves backed up first - the first save then moves the mods' data out)
+    const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch()).count();
+    const fs::path backup = g_game / "SaveBackups" / fmt::format("per_mod_saves_{}", stamp);
+    fs::create_directories(backup, ec);
+    for (const auto& e : fs::directory_iterator(g_save_file.parent_path(), ec))
+      if (e.is_regular_file(ec)) fs::copy_file(e.path(), backup / e.path().filename(), fs::copy_options::overwrite_existing, ec);
+    fs::create_directories(dir, ec);
+    if (FILE* f = std::fopen(on_mark.string().c_str(), "wb")) std::fclose(f);
+    REXLOG_INFO("[svr2011] per-mod saves: turned on - saves backed up to {}; the next save moves the mods' data out",
+                backup.string());
+  }
+  g_mod_saves_fold = !g_mod_saves_on && was_on;
+  if (!g_mod_saves_on && !g_mod_saves_fold) return;
+  int seeded = 0;
+  for (const auto& m : g_mods) {
+    if (m.temp) continue;
+    ModSave s;
+    if (!ReadModSave(m, s)) continue;
+    Kept& k = KeptFor(m.slot);
+    k.record = s.record, k.profile = s.profile;
+    // (the file's record names the id the mod had when it was saved: its id of this run - slots move with big_roster)
+    if (k.record.size() >= kRecordSize)
+      for (uint32_t off : {kOwnId, kOwnId2, kSamePerson}) k.record[off] = uint8_t(m.slot >> 8), k.record[off + 1] = uint8_t(m.slot);
+    if (!s.entry.empty()) g_saved_entry[m.slot] = s.entry;
+    ++seeded;
+  }
+  REXLOG_INFO("[svr2011] per-mod saves: {}{} mod file(s) read", g_mod_saves_on ? "on - " : "turned off - folding back; ",
+              seeded);
+}
+
+// The 40-byte entries from the files: once the slot holds the mod's record again (its stub's entry still there).
+void PutBackEntries(uint8_t* base) {
+  for (auto it = g_saved_entry.begin(); it != g_saved_entry.end();) {
+    const Mod* m = ModOf(it->first);
+    const uint32_t si = m ? svr2011::RosterIndex(base, m->slot) : 512;
+    const uint8_t* sr = si < 512 ? base + svr2011::RosterEntry(kRecords, kRecordSize, si) : nullptr;
+    if (!sr || std::strncmp(reinterpret_cast<const char*>(sr + kFullName), m->name.c_str(), kNameLen - 1)) {
+      ++it;
+      continue;
+    }
+    std::memcpy(base + svr2011::RosterEntry(kEntries40, kEntry40Size, si), it->second.data(), kEntry40Size);
+    it = g_saved_entry.erase(it);
+  }
+}
+
+// Key refs (per_mod_saves): the save's other fields that name a superstar by id (step 0's map, docs/
+// UNLIMITED_MOD_SLOTS.md) hold no mod's id in the file. While the save is built each one that holds a mod gets a
+// stand-in (the mod's base superstar, else 0x200 = nobody) and Saves\.mods\refs.bin keeps (field, mod folder,
+// stand-in); after a load each field that still holds its stand-in gets the mod's id back - a mod that's gone keeps
+// the stand-in. Offsets are from the save image (*0x82E407B4); u16 ids, big-endian.
+constexpr char kRefsMagic[8] = {'S', 'V', 'R', 'M', 'R', 'E', 'F', 'S'};
+constexpr uint32_t kNobody = 0x200;
+
+// Every u16 id field (save image offsets).
+std::vector<uint32_t> IdFields() {
+  std::vector<uint32_t> f;
+  for (uint32_t t = 0; t < 70; ++t)  // teams / stables: 70 x 270 B, members at +2 (count at +0)
+    for (uint32_t k = 0; k < 5; ++k) f.push_back(0xF5C8 + t * 270 + 2 + k * 2);
+  for (uint32_t k = 0; k < 28; ++k) f.push_back(0x7CD70 + k * 2);  // title holders: 14 titles x 2
+  constexpr uint32_t P = 0x364B4;
+  for (uint32_t c = P + 14942; c + 88 <= P + 20808; c += 88)  // Universe cards: 16 B header, 6 people x 12 B
+    for (uint32_t k = 0; k < 6; ++k) f.push_back(c + 16 + k * 12);
+  for (uint32_t k = 0; k < 240; ++k) f.push_back(P + 20808 + k * 12), f.push_back(P + 20808 + k * 12 + 2);  // the list
+  return f;
+}
+
+struct Ref {
+  uint32_t off;
+  std::string folder;
+  uint16_t stub;
+};
+std::vector<std::pair<uint32_t, uint16_t>> g_refs_live;  // (field, the mod's id) while the save is built
+svrfmt::Bytes g_refs_written;
+
+fs::path RefsFile() { return ModSavesDir() / "refs.bin"; }
+
+svrfmt::Bytes RefsBytes(const std::vector<Ref>& refs) {
+  std::vector<std::string> folders;
+  svrfmt::Bytes body;
+  Put32(body, uint32_t(refs.size()));
+  for (const Ref& r : refs) {
+    auto it = std::find(folders.begin(), folders.end(), r.folder);
+    if (it == folders.end()) it = folders.insert(folders.end(), r.folder);
+    Put32(body, r.off);
+    body.push_back(uint8_t((it - folders.begin()) >> 8)), body.push_back(uint8_t(it - folders.begin()));
+    body.push_back(uint8_t(r.stub >> 8)), body.push_back(uint8_t(r.stub));
+  }
+  svrfmt::Bytes names;
+  names.push_back(uint8_t(folders.size() >> 8)), names.push_back(uint8_t(folders.size()));
+  for (const auto& s : folders) PutStr(names, s);
+  names.insert(names.end(), body.begin(), body.end());
+  svrfmt::Bytes o(kRefsMagic, kRefsMagic + 8);
+  Put32(o, 1);
+  Put32(o, Crc32(names.data(), names.size()));
+  o.insert(o.end(), names.begin(), names.end());
+  return o;
+}
+
+bool ReadRefs(const fs::path& file, std::vector<Ref>& refs) {
+  svrfmt::Bytes d;
+  if (!svrfmt::ReadFile(file.string(), d) || d.size() < 18 || std::memcmp(d.data(), kRefsMagic, 8) ||
+      Rd32(d.data() + 8) != 1 || Crc32(d.data() + 16, d.size() - 16) != Rd32(d.data() + 12))
+    return false;
+  size_t at = 16;
+  std::vector<std::string> folders(Rd16(d.data() + at));
+  at += 2;
+  for (auto& s : folders) {
+    if (at + 2 > d.size()) return false;
+    const size_t n = Rd16(d.data() + at);
+    if (at + 2 + n > d.size()) return false;
+    s.assign(reinterpret_cast<const char*>(d.data() + at + 2), n), at += 2 + n;
+  }
+  if (at + 4 > d.size()) return false;
+  const uint32_t n = Rd32(d.data() + at);
+  at += 4;
+  if (d.size() - at < size_t(n) * 8) return false;
+  for (uint32_t k = 0; k < n; ++k, at += 8) {
+    const uint32_t fi = Rd16(d.data() + at + 4);
+    if (fi >= folders.size()) return false;
+    refs.push_back({Rd32(d.data() + at), folders[fi], uint16_t(Rd16(d.data() + at + 6))});
+  }
+  return true;
+}
+
+// A stand-in for a mod's id in the file: its base superstar when that is a stock one, else nobody.
+uint16_t RefStub(const Mod& m) { return m.base && m.base < 322 && !ModOf(m.base) ? uint16_t(m.base) : uint16_t(kNobody); }
+
+void WriteRefs(const std::vector<Ref>& refs) {
+  const svrfmt::Bytes f = RefsBytes(refs);
+  if (f == g_refs_written) return;
+  std::error_code ec;
+  fs::create_directories(ModSavesDir(), ec);
+  const fs::path to = RefsFile(), part = fs::path(to).concat(".tmp"), bak = fs::path(to).concat(".bak");
+  if (FILE* o = std::fopen(part.string().c_str(), "wb")) {
+    const bool ok = std::fwrite(f.data(), 1, f.size(), o) == f.size();
+    std::fclose(o);
+    if (ok && fs::exists(to, ec)) fs::copy_file(to, bak, fs::copy_options::overwrite_existing, ec);  // (the last one)
+    if (ok) fs::rename(part, to, ec);
+    if (ok && !ec) {
+      g_refs_written = f;
+      REXLOG_INFO("[svr2011] per-mod saves: refs.bin written - {} field(s) name a mod", refs.size());
+      return;
+    }
+  }
+  REXLOG_WARN("[svr2011] per-mod saves: refs.bin could not be written");
+}
+
+// Around the save writer: the fields' mod ids out (saving: stand-ins in, refs.bin written), then back.
+void RefsForSave(uint8_t* base, bool saving) {
+  const uint32_t save = Rd32(base + 0x82E407B4);
+  if (!save) return;
+  if (!saving) {
+    for (const auto& [off, id] : g_refs_live) svrfmt::Wr16(base + save + off, uint16_t(id));
+    g_refs_live.clear();
+    return;
+  }
+  std::vector<Ref> refs;
+  for (const uint32_t off : IdFields()) {
+    const uint32_t id = Rd16(base + save + off);
+    const Mod* m = id < kNobody ? ModOf(id) : nullptr;
+    if (!m || m->temp) continue;  // (a fetched mod: OnlineTempForSave)
+    const uint16_t stub = RefStub(*m);
+    refs.push_back({off, m->folder, stub});
+    g_refs_live.emplace_back(off, uint16_t(id));
+    svrfmt::Wr16(base + save + off, stub);
+  }
+  WriteRefs(refs);
+}
+
+// After a load: each field still holding its stand-in gets its mod's id back (the mod installed).
+void RefsLoaded(uint8_t* base) {
+  const uint32_t save = Rd32(base + 0x82E407B4);
+  std::vector<Ref> refs;
+  if (!save || ModSavesDir().empty() || !ReadRefs(RefsFile(), refs)) return;
+  int back = 0, gone = 0, changed = 0;
+  for (const Ref& r : refs) {
+    const Mod* m = nullptr;
+    for (const auto& x : g_mods)
+      if (!x.temp && x.folder == r.folder) m = &x;
+    if (Rd16(base + save + r.off) != r.stub) {
+      ++changed;  // (the save was written without this refs.bin - another copy of SaveData.dat)
+      continue;
+    }
+    if (!m) {
+      ++gone;
+      continue;
+    }
+    svrfmt::Wr16(base + save + r.off, uint16_t(m->slot));
+    ++back;
+  }
+  REXLOG_INFO("[svr2011] per-mod saves: refs.bin - {} field(s) given their mod back, {} mod(s) not installed (stand-in "
+              "kept), {} field(s) no longer the stand-in",
+              back, gone, changed);
+}
+}  // namespace
+
+namespace svr2011 {
+
+// Around the save writer (superstar_threads.cpp's sub_827235D8 hook): the mods' bytes out to their files and the
+// stubs in (saving), then back (after).
+void PerModSavesForSave(uint8_t* base, bool saving) {
+  if (!g_mod_saves_on) {
+    if (!saving && g_mod_saves_fold) {  // (turned off: this save holds the mods' data again)
+      std::error_code ec;
+      fs::remove(ModSavesDir() / ".on", ec);
+      g_mod_saves_fold = false;
+      REXLOG_INFO("[svr2011] per-mod saves: off - the mods' data is back in the save (their files kept)");
+    }
+    return;
+  }
+  for (const auto& m : g_mods) {
+    if (m.temp) continue;  // (a fetched mod: OnlineTempForSave)
+    const uint32_t si = svr2011::RosterIndex(base, m.slot);
+    const auto sr_stub = g_stub_record.find(m.slot);
+    if (si >= 512 || sr_stub == g_stub_record.end()) continue;
+    const svrfmt::Bytes* sp_stub = nullptr;
+    for (const auto& b : g_blank)
+      if (b.first == m.slot) {
+        sp_stub = &b.second;
+        break;
+      }
+    if (!sp_stub) continue;
+    uint8_t* sr = base + svr2011::RosterEntry(kRecords, kRecordSize, si);
+    uint8_t* sp = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
+    uint8_t* se = base + svr2011::RosterEntry(kEntries40, kEntry40Size, si);
+    if (saving) {
+      if (std::strncmp(reinterpret_cast<const char*>(sr + kFullName), m.name.c_str(), kNameLen - 1)) continue;
+      ModSave s{svrfmt::Bytes(sr, sr + kRecordSize), svrfmt::Bytes(sp, sp + kProfileSize),
+                svrfmt::Bytes(se, se + kEntry40Size)};
+      WriteModSave(m, s);
+      std::memcpy(sr, sr_stub->second.data(), kRecordSize);
+      std::memcpy(sp, sp_stub->data(), kProfileSize);
+      if (const auto e = g_stub_entry.find(m.slot); e != g_stub_entry.end()) std::memcpy(se, e->second.data(), kEntry40Size);
+      g_live_while_saving[m.slot] = std::move(s);
+    } else if (const auto it = g_live_while_saving.find(m.slot); it != g_live_while_saving.end()) {
+      std::memcpy(sr, it->second.record.data(), kRecordSize);
+      std::memcpy(sp, it->second.profile.data(), kProfileSize);
+      std::memcpy(se, it->second.entry.data(), kEntry40Size);
+    }
+  }
+  if (saving && !g_live_while_saving.empty())
+    REXLOG_INFO("[svr2011] per-mod saves: the save is built with {} mod slot(s) as stubs", g_live_while_saving.size());
+  if (!saving) g_live_while_saving.clear();
+  RefsForSave(base, saving);  // (teams, titles, Universe cards and list: key refs)
+}
+
+// After a save is loaded (the sub_8257A218 hook): its fields' mods back from refs.bin - also once while folding back.
+void PerModSavesLoaded(uint8_t* base) {
+  if (g_mod_saves_on || g_mod_saves_fold) RefsLoaded(base);
+}
+
+}  // namespace svr2011
+
 namespace svr2011 {
 
 void CopySuperstarMovies(const std::filesystem::path& movies) {
+  if (svr2011::NoMods()) return;  // (Start Without Mods: no_mods.h)
   std::error_code ec;
   const fs::path dir = rex::filesystem::GetExecutableFolder() / "Mods" / "Superstars";
   for (const auto& e : fs::directory_iterator(dir, ec)) {
     if (!e.is_directory() || fs::exists(e.path() / "disabled", ec)) continue;
-    std::string name = e.path().filename().string(), movie;
+    const std::string folder = e.path().filename().string();
+    std::string name = folder, movie;
     if (FILE* t = std::fopen((e.path() / "manifest.txt").string().c_str(), "rb")) {
       char line[512];
       while (std::fgets(line, sizeof line, t)) {
@@ -2567,10 +4009,10 @@ void CopySuperstarMovies(const std::filesystem::path& movies) {
     const std::string mp4 = !movie.empty() && fs::path(movie).extension() == ".mp4" ? movie : std::string();
     if (!mp4.empty()) movie = fs::path(movie).replace_extension(".bik").string();
     if (!movie.empty() && fs::path(movie).extension() == ".bik" && fs::exists(e.path() / movie, ec))
-      CopyIfChanged(e.path() / movie, movies / (FileName(name) + ".bik"));  // (an .mp4's: its .bik fallback)
+      CopyIfChanged(e.path() / movie, movies / (MovieName(name, folder) + ".bik"));  // (an .mp4's: its .bik fallback)
     // (an .mp4: its stub and probe now, before the mount - hd_movies.h)
     if (!mp4.empty() && fs::exists(e.path() / mp4, ec))
-      svr2011::PrepareHdMovie(movies, FileName(name) + ".bik", e.path() / mp4);
+      svr2011::PrepareHdMovie(movies, MovieName(name, folder) + ".bik", e.path() / mp4);
   }
 }
 
@@ -2580,14 +4022,15 @@ void InstallSuperstarMods(rex::memory::Memory* memory, rex::filesystem::VirtualF
   // changes in the CHAR/PRO table (who overwrites a mod's profile, and when)
   if (std::getenv("SVR2011_TEST_PRO_LOG"))
     std::thread([memory] {
+      rex::thread::set_current_thread_name("pro log");
       std::vector<uint32_t> last(64, 0xFFFFFFFF);
       for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         uint8_t* base = memory->virtual_membase();
         for (size_t i = 0; i < g_mods.size() && i < last.size(); ++i) {
-          const uint32_t si = Rd16(base + kIdToIndex + g_mods[i].slot * 2);
+          const uint32_t si = svr2011::RosterIndex(base, g_mods[i].slot);
           if (si >= 512) continue;
-          const uint32_t e = Rd16(base + kProfiles + si * kProfileSize + kEntrance + 0x14);
+          const uint32_t e = Rd16(base + svr2011::RosterEntry(kProfiles, kProfileSize, si) + kEntrance + 0x14);
           if (e != last[i]) {
             REXLOG_INFO("[svr2011] superstar mods: watch: id {} entrance {} -> {}", g_mods[i].slot, last[i], e);
             last[i] = e;
@@ -2597,6 +4040,13 @@ void InstallSuperstarMods(rex::memory::Memory* memory, rex::filesystem::VirtualF
     }).detach();
   g_game = rex::filesystem::GetExecutableFolder();
   LoadMods();
+  {
+    // (test aid SVR2011_TEST_HIGH_INDEX, big_roster on: mods with record indices from 242 up)
+    std::vector<uint32_t> ids;
+    for (const auto& m : g_mods) ids.push_back(m.slot);
+    svr2011::BigRosterTestMove(memory->virtual_membase(), ids.data(), int(ids.size()));
+  }
+  StartModSaves();
   LoadAttireMods();
   // the attires' COS pairs and names (string ids kAttireNameIds + mod * 4 + attire)
   uint8_t* b = memory->virtual_membase();
@@ -2633,6 +4083,14 @@ void InstallSuperstarMods(rex::memory::Memory* memory, rex::filesystem::VirtualF
     g_attire_names.push_back({name, at});
     Wr32(b + pairs + a.attire * 8, name);
   }
+  // Superstar Threads: the mods whose model is their base's, listed (superstar_threads.h)
+  {
+    std::vector<svr2011::ThreadsMod> tm;
+    for (const auto& m : g_mods)
+      if (!m.temp) tm.push_back({m.slot, m.base, m.folder, m.dir / "ch.pac"});
+    if (svr2011::BuildThreadsOverlay(memory, g_game, g_game / "Mods" / "SuperstarOverlay", tm))
+      g_extra_mounts.push_back("smods:\\threads.pac");
+  }
   // The overlay files as smods:\<file>: a device of their own, made after they
   // are written (a host device lists its folder once, so GAME: would not see
   // the files made this run).
@@ -2649,16 +4107,73 @@ void InstallSuperstarMods(rex::memory::Memory* memory, rex::filesystem::VirtualF
   REXLOG_INFO("[svr2011] superstar mods: {}", g_mods.size());
 }
 
-std::vector<uint32_t> SuperstarModIds() {
+std::vector<uint32_t> SuperstarModIds(bool with_online) {
   std::vector<uint32_t> ids;
-  for (const auto& m : g_mods) ids.push_back(m.slot);
+  for (const auto& m : g_mods)
+    if (with_online || !m.temp) ids.push_back(m.slot);
   return ids;
+}
+
+void OnlineTempForSave(uint8_t* base, bool saving) {
+  // (the bytes to put back: the save image about to be rebuilt - the last one loaded or written, which never has a
+  // fetched mod in it; the boot's save load doesn't come through sub_8257A218's hook)
+  if (saving) TempFromSave(base);
+  // Test aid: SVR2011_TEST_NO_TEMP_BLANK=1 - the fetched mods go into the save as they are (the check's control)
+  static const bool off = std::getenv("SVR2011_TEST_NO_TEMP_BLANK") != nullptr;
+  if (off) {
+    if (saving) REXLOG_WARN("[svr2011] superstar mods: test - the save is built WITH the fetched mods");
+    return;
+  }
+  for (const auto& [id, saved] : g_temp_saved) {
+    const uint32_t si = svr2011::RosterIndex(base, id);
+    if (si >= 512) continue;
+    uint8_t* r = base + svr2011::RosterEntry(kRecords, kRecordSize, si);
+    uint8_t* p = base + svr2011::RosterEntry(kProfiles, kProfileSize, si);
+    if (saving) {
+      std::vector<uint8_t> live(r, r + kRecordSize);
+      live.insert(live.end(), p, p + kProfileSize);
+      g_temp_live[id] = std::move(live);
+      std::memcpy(r, saved.data(), kRecordSize), std::memcpy(p, saved.data() + kRecordSize, kProfileSize);
+    } else if (const auto it = g_temp_live.find(id); it != g_temp_live.end()) {
+      std::memcpy(r, it->second.data(), kRecordSize), std::memcpy(p, it->second.data() + kRecordSize, kProfileSize);
+    }
+  }
+  if (saving && !g_temp_saved.empty())
+    REXLOG_INFO("[svr2011] superstar mods: the save is built without the {} fetched mod(s)", g_temp_saved.size());
+  if (!saving) g_temp_live.clear();
+}
+
+void SetSuperstarModsSaves(const fs::path& saves) { g_save_file = saves / "SaveData.dat"; }
+
+bool IsOnlineTempSuperstar(uint32_t id) {
+  const Mod* m = ModOf(id);
+  return m && m->temp;
+}
+
+std::vector<SuperstarModEntrance> SuperstarModEntrances() {
+  std::vector<SuperstarModEntrance> out;
+  for (const auto& m : g_mods) {
+    if (m.temp) continue;
+    SuperstarModEntrance e{m.slot, m.name.empty() ? m.folder : m.name, {}, m.base};
+    for (int n : {m.entrance, m.attire_entrance[0], m.attire_entrance[1], m.attire_entrance[2], m.attire_entrance[3]})
+      if (n > 0 && std::find(e.numbers.begin(), e.numbers.end(), n) == e.numbers.end()) e.numbers.push_back(n);
+    if (!e.numbers.empty()) out.push_back(std::move(e));
+  }
+  return out;
 }
 
 bool IsSuperstarMod(uint32_t id) { return ModOf(id) != nullptr; }
 std::string SuperstarModFolder(uint32_t id) {
   const Mod* m = ModOf(id);
   return m ? m->folder : std::string();
+}
+void SuperstarModHandovers(uint8_t* base) { RedoHandovers(base, false); }
+std::string SuperstarModLoading(uint32_t id) {
+  const Mod* m = ModOf(id);
+  if (!m) return {};
+  std::error_code ec;
+  const fs::path p = m->loading.empty() ? m->dir / "load.dds" : m->loading;
+  return fs::is_regular_file(p, ec) ? p.string() : std::string();
 }
 uint32_t SuperstarModBase(uint32_t id) {
   const Mod* m = ModOf(id);
@@ -2799,7 +4314,7 @@ const std::vector<std::pair<uint32_t, uint32_t>>& MotionSwaps() {
 // (Not covered: sub_82394740, a second bank search at motion start - no tail
 // fallback; it only reads a per-slot byte, 0 for m.pac, so harmless so far.)
 namespace {
-uint8_t* GuestAt(uint8_t* base, uint32_t a) { return base + a + (a >= 0xE0000000u ? 0x1000u : 0u); }
+uint8_t* GuestAt(uint8_t* base, uint32_t a) { return base + a + REX_PHYS_HOST_OFFSET(a); }  // (as the game's loads)
 struct BankOrder { uint32_t count = 0, last = 0, sorted = 0; };  // sorted: entries in order from 0
 std::mutex g_order_mutex;
 std::unordered_map<uint32_t, BankOrder> g_order;  // bank -> its order (checked again when count or last key change)
@@ -2814,17 +4329,86 @@ uint32_t SortedPrefix(uint8_t* base, uint32_t bank, uint32_t count) {
   o = {count, last, n};
   return n;
 }
-uint32_t FindInUnsortedBanks(uint8_t* base, uint32_t banks, uint32_t key, uint32_t out) {
+// A bank in a list that can't be one (2.1.6 report 20261030-212436-89cfee: every match crashed at its start - a
+// slot's "bank" said 0xB7C4EFFF entries and the game's search read its last one 2 GB away, guest 0x21BAD310; a heavy
+// install, 53 packs, updated in place from 2.1.3): its count over 65535. -> the bank's +0 adjusted (as the game does)
+// or 0 when the slot is empty or fine; *bad true when it isn't a bank.
+uint32_t BankAt(uint8_t* base, uint32_t banks, uint32_t k, bool* bad) {
   constexpr uint32_t kYmks = 0x734B4D59, kYmbs = 0x73424D59;  // (as the game reads them)
+  *bad = false;
+  uint32_t b = Rd32(GuestAt(base, banks + 4 * k));
+  if (!b) return 0;
+  const uint32_t magic = Rd32(GuestAt(base, b));
+  if (magic != kYmks && magic != kYmbs) b -= 16;
+  const uint32_t count = Rd32(GuestAt(base, b + 272));
+  if (!count) return 0;
+  // (only the count: packs leave banks out of order - their YMBs motions after the stock ones - and a key's id can
+  // carry the 0x8000 flag, so key checks threw out good banks and their motions went missing)
+  if (count > 65535) *bad = true;
+  return b;
+}
+
+// Test aids: SVR2011_TEST_BAD_BANK=1 - each search goes over a copy of its list with a fake bank whose last entry
+// is the report's fault address in its first empty slot - the game's own list untouched;
+// SVR2011_TEST_BANK_GUARD_OFF=1 - the game's searches only (the crash).
+bool BankGuardOff() {
+  static const bool off = std::getenv("SVR2011_TEST_BANK_GUARD_OFF") != nullptr;
+  return off;
+}
+uint32_t TestListWithBadBank(uint8_t* base, uint32_t banks) {  // -> the copy to search instead, or banks
+  static const bool on = std::getenv("SVR2011_TEST_BAD_BANK") != nullptr;
+  if (!on || !banks || !g_memory) return banks;
+  static uint32_t fake = 0;
+  thread_local uint32_t copy = 0;  // (each thread its own: searches run on several at once)
+  {
+    static std::mutex mu;
+    std::lock_guard lock(mu);
+    if (!fake && (fake = g_memory->SystemHeapAlloc(512)) != 0) {
+      uint8_t* f = GuestAt(base, fake);
+      std::memset(f, 0, 512);
+      // (its count puts its last entry on the report's fault, guest 0x21BAD310 - unmapped, as there)
+      const uint32_t n = (0x21BAD314u - (fake + 276)) / 16 + 1;
+      const uint8_t magic[4] = {0x73, 0x4B, 0x4D, 0x59}, count[4] = {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)};
+      std::memcpy(f, magic, 4), std::memcpy(f + 272, count, 4);  // (magic read as 0x734B4D59)
+      REXLOG_INFO("[svr2011] motion banks: test - a fake bank at {:08X} (count {:08X})", fake, n);
+    }
+  }
+  if (!copy) copy = g_memory->SystemHeapAlloc(512);
+  if (!fake || !copy) return banks;
+  uint8_t* c = GuestAt(base, copy);
+  std::memcpy(c, GuestAt(base, banks), 272 + 68);  // (the 68 slots, then their bytes)
+  for (uint32_t k = 0; k < 68; ++k)
+    if (!Rd32(c + 4 * k)) {
+      c[4 * k] = uint8_t(fake >> 24), c[4 * k + 1] = uint8_t(fake >> 16), c[4 * k + 2] = uint8_t(fake >> 8), c[4 * k + 3] = uint8_t(fake);
+      return copy;
+    }
+  return banks;
+}
+
+// Any such bank in the list - the game's own search isn't safe with it. -> its slot (and what it held), or -1.
+int BadBankSlot(uint8_t* base, uint32_t banks, uint32_t* bank = nullptr, uint32_t* count = nullptr) {
   for (uint32_t k = 0; k < 68; ++k) {
-    uint32_t b = Rd32(GuestAt(base, banks + 4 * k));
-    if (!b) continue;
-    const uint32_t magic = Rd32(GuestAt(base, b));
-    if (magic != kYmks && magic != kYmbs) b -= 16;
+    bool bad;
+    const uint32_t b = BankAt(base, banks, k, &bad);
+    if (bad) {
+      if (bank) *bank = b;
+      if (count) *count = Rd32(GuestAt(base, b + 272));
+      return int(k);
+    }
+  }
+  return -1;
+}
+
+uint32_t FindInUnsortedBanks(uint8_t* base, uint32_t banks, uint32_t key, uint32_t out, bool all = false,
+                             uint32_t* slot = nullptr) {
+  for (uint32_t k = 0; k < 68; ++k) {
+    bool bad;
+    const uint32_t b = BankAt(base, banks, k, &bad);
+    if (!b || bad) continue;
     const uint32_t count = Rd32(GuestAt(base, b + 272));
-    if (!count || count > 20000) continue;
+    if (!all && count > 20000) continue;
     const uint32_t sorted = SortedPrefix(base, b, count);
-    if (sorted >= count) continue;  // (in order: the game's search was right)
+    if (sorted >= count && !all) continue;  // (in order: the game's search was right)
     const uint8_t* e = GuestAt(base, b + 276);
     int lo = 0, hi = int(sorted) - 1, at = -1;
     while (lo <= hi) {
@@ -2840,11 +4424,28 @@ uint32_t FindInUnsortedBanks(uint8_t* base, uint32_t banks, uint32_t key, uint32
       uint8_t* q = GuestAt(base, out);
       q[0] = uint8_t(uint32_t(at) >> 24), q[1] = uint8_t(uint32_t(at) >> 16), q[2] = uint8_t(uint32_t(at) >> 8), q[3] = uint8_t(at);
     }
+    if (slot) *slot = k;
     return b + 272;
   }
   return 0;
 }
 }  // namespace
+
+// The second bank search, at a motion's start: sub_82394740(banks, id, x, y) -> the per-slot byte at banks + 272 + k
+// of the bank k that has the key (0 if none) - it reads each bank as sub_823941F8 does, so a slot that isn't a bank
+// (BankAt) crashed it the same way: then the search here over the good banks.
+REX_EXTERN(__imp__sub_82394740);
+REX_HOOK_RAW(sub_82394740) {
+  const uint32_t banks = TestListWithBadBank(base, ctx.r3.u32);
+  ctx.r3.u64 = banks;
+  if (!banks || BankGuardOff() || BadBankSlot(base, banks) < 0) {
+    __imp__sub_82394740(ctx, base);
+    return;
+  }
+  const uint32_t key = (ctx.r4.u32 & 0xFFFF) << 16 | (ctx.r5.u32 & 0xFF) << 8 | (ctx.r6.u32 & 0xFF);
+  uint32_t slot = 0;
+  ctx.r3.u64 = FindInUnsortedBanks(base, banks, key, 0, true, &slot) ? *GuestAt(base, banks + 272 + slot) : 0u;
+}
 
 REX_EXTERN(__imp__sub_823941F8);
 REX_HOOK_RAW(sub_823941F8) {
@@ -2857,12 +4458,31 @@ REX_HOOK_RAW(sub_823941F8) {
       ctx.r4.u64 = to;
       ctx.r5.u64 = 0;
     }
-  const uint32_t banks = ctx.r3.u32, out = ctx.r7.u32;
-  __imp__sub_823941F8(ctx, base);
+  const uint32_t banks = TestListWithBadBank(base, ctx.r3.u32), out = ctx.r7.u32;
+  ctx.r3.u64 = banks;
+  // (a slot that can't be a bank - BankAt: the search over the good banks here instead of the game's, which read
+  // past it and crashed every match; the bank logged once)
+  uint32_t bad_bank = 0, bad_count = 0;
+  if (const int bad = banks && !BankGuardOff() ? BadBankSlot(base, banks, &bad_bank, &bad_count) : -1; bad >= 0) {
+    static std::mutex bmu;
+    static std::vector<uint32_t> told;
+    {
+      std::lock_guard lock(bmu);
+      if (told.size() < 16 && std::find(told.begin(), told.end(), bad_bank) == told.end()) {
+        told.push_back(bad_bank);
+        REXLOG_ERROR("[svr2011] motion banks: slot {} of list {:08X} isn't a motion bank (at {:08X}, count {}) - left out "
+                     "of the search (a damaged pac's bank?)", bad, banks, bad_bank, bad_count);
+      }
+    }
+    ctx.r3.u64 = FindInUnsortedBanks(base, banks, id << 16 | x << 8 | y, out, true);
+  } else {
+    __imp__sub_823941F8(ctx, base);
+  }
   if (!ctx.r3.u32 && banks) {
     static const bool off = std::getenv("SVR2011_TEST_YMBS_SEARCH_OFF") != nullptr;  // (test aid: the game's search only)
     if (!off) ctx.r3.u64 = FindInUnsortedBanks(base, banks, id << 16 | x << 8 | y, out);
   }
+  if (banks && y <= 1) svr2011::MatchBoxMotionLooked(id, ctx.r3.u32 != 0);  // (a body track found or not: match_box.h)
   // Test aid: SVR2011_TEST_BANK_DUMP=<id>[,<id>] - at a lookup of that id (x 0, y 0), once per id and bank
   // list: each bank in the list (its slot, magic, count, first / last key, whether the key is in its directory)
   static const std::vector<uint32_t> dump_ids = [] {
@@ -2943,13 +4563,58 @@ REX_HOOK_RAW(sub_823941F8) {
   told.push_back(k);
   REXLOG_INFO("[svr2011] move log: motion {} x {} y {} {}", id, x, y, ctx.r3.u32 ? "found" : "NOT FOUND");
 }
+namespace svr2011 {
+bool LoaderCacheForcedFull(uint32_t size);   // (model_mem.cpp)
+uint32_t LoaderCacheFallback(uint32_t size);  // (model_mem.cpp)
+}  // namespace svr2011
 // (with SVR2011_TEST_MOVE_LOG: allocations that fail, and what sub_8258EB90
 // - a data file read into memory - asked for)
 REX_EXTERN(__imp__sub_8269BBA0);
 REX_HOOK_RAW(sub_8269BBA0) {
   const uint32_t size = ctx.r3.u32, lr = uint32_t(ctx.lr);
+  // The file loader's cache (sub_826BA928's retry loop, model_mem.cpp): a file that never fits takes the fallback
+  // memory instead of retrying forever (the 21 Oct hang after the entrances).
+  if (lr == 0x826BA9A8) {
+    if (svr2011::LoaderCacheForcedFull(size))
+      ctx.r3.u64 = 0;
+    else
+      __imp__sub_8269BBA0(ctx, base);
+    if (!ctx.r3.u32) ctx.r3.u64 = svr2011::LoaderCacheFallback(size);
+    return;
+  }
   __imp__sub_8269BBA0(ctx, base);
+  // Big models: a wrestler's model heap full copying its blood overlays (sub_826B6BA8; 2K17 Asuka crashed there) -
+  // the block from the fallback memory, given back by the delete hook (CawHeapFree, frame_rate.cpp)
+  if (!ctx.r3.u32 && size && lr == 0x826B6C4C && svr2011::BigModelMemory())
+    if (const uint32_t p = svr2011::FallbackBlock(size)) {
+      ctx.r3.u64 = p;
+      static int told = 0;
+      if (told++ < 3) REXLOG_INFO("[svr2011] model memory: a model heap full - {} bytes from the fallback memory", size);
+    }
+  // (the stage's heap full - an arena with more 3D detail than the game's own: caw_limits.h kStageHeap; new takes
+  // its heap's blocks without sub_8269A8D8, whose hook does the same)
+  if (!ctx.r3.u32 && size && svr2011::BigModelMemory()) {
+    const auto saved = ctx;
+    sub_8269A478(ctx, base);
+    const uint32_t heap = ctx.r3.u32;
+    ctx = saved;
+    if (heap == svr2011::kStageHeap)
+      if (const uint32_t p = svr2011::FallbackBlock(size, true)) {
+        ctx.r3.u64 = p;
+        static int told = 0;
+        if (told++ < 5 || told % 200 == 0)
+          REXLOG_INFO("[svr2011] model memory: the stage's heap ({}) full - new {} bytes from the fallback memory ({} "
+                      "so)", heap, size, told);
+      }
+  }
   if (!MoveLogIds().empty() && !ctx.r3.u32) REXLOG_WARN("[svr2011] move log: alloc {} bytes failed (lr {:08X})", size, lr);
+  if (svr2011::MemTraceOn() && ctx.r3.u32) {  // (test aid: mem_trace.h - which heap gave it)
+    const auto saved = ctx;
+    sub_8269A478(ctx, base);
+    const uint32_t heap = ctx.r3.u32;
+    ctx = saved;
+    svr2011::MemTraceNew(ctx.r3.u32, size, heap, lr);
+  }
 }
 REX_EXTERN(__imp__sub_8258EB90);
 REX_HOOK_RAW(sub_8258EB90) {

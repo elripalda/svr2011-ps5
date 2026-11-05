@@ -51,6 +51,13 @@ void SetSceneThirtyFps(bool on);
 // per frame at a 60 Hz frame clock, as on the console - both peers step the
 // world alike; a device that can't make 60 runs slower instead of catching up.
 void SetLockstep(bool on);
+bool Lockstep();
+
+// The world updates the frame running now got (1; 2 at 30 fps or a slow frame; 0 while the free camera holds it).
+int WorldPassesThisFrame();
+
+// A guest address in readable memory (a mapped, accessible page) - is a word a pointer?
+bool GuestReadable(uint32_t address);
 
 // Chooses the frame rate, at once (GRAPHICS -> FRAME RATE).
 void SetTargetFrameRate(int fps);
@@ -64,5 +71,9 @@ void WriteTiming(uint8_t* base, int fps);
 void LatencyOnPublish();
 // ... and a game swap reached the native renderer (OnPresent).
 void LatencyOnSwap();
+// The render command queue's fullest in a match since the last call, in % of its buffer (record 0 at queue +76: +4
+// units used, +8 units; a full buffer crashes the game - 27 Oct, six heavy superstars). Logged per match at its end
+// (model_mem.cpp).
+uint32_t RenderQueuePeakTake();
 
 }  // namespace svr2011

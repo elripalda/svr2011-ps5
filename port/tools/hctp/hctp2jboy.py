@@ -15,6 +15,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # (its own folder: the embeddable Python doesn't add it)
 import jboy  # noqa: E402
 
 import yobj  # noqa: E402
@@ -27,16 +28,22 @@ def sphere_of(P):
     return (float(c[0]), float(c[1]), float(c[2]), float(np.sqrt(((P - c) ** 2).sum(1)).max()) + 0.01)
 
 
-def argb(c, tone=1.0):
-    r, g, b, a = (max(0, min(255, int(round(x * 255 * (tone if i < 3 else 1.0))))) for i, x in enumerate(c))
+def argb(c, tone=1.0, alpha=1.0):
+    r, g, b, a = (max(0, min(255, int(round(x * 255 * (tone if i < 3 else alpha))))) for i, x in enumerate(c))
     return (a << 24) | (r << 16) | (g << 8) | b
 
 
 def convert(M, tmpl_model, name=None, tone=1.0, xform=None, tex_rename=None, max_verts=0xFFFF, merge=True,
-            keep_nodes=False):
+            keep_nodes=False, double_sided=False, alpha=1.0, both_below=0.0):
     """M: yobj.Model (world space). tmpl_model: jboy.Model whose meshes[0] and
     node are the template. xform(P) -> P for positions (normals rotate with
-    xform's linear part if given as (R, t)). Returns jboy.Model."""
+    xform's linear part if given as (R, t)). double_sided: True, or f(texture name) -> bool: those meshes
+    drawn from both sides (render flags +0x88 without 0x2, back-face cull - the PS2 drew everything
+    both sides: single-sided fences, signs and props vanished from behind). alpha: vertex alpha scale (an
+    additive PS2 layer drawn plain translucent: a faint one). both_below: in a culled mesh, each strip
+    smaller than this across gets a reverse-wound copy (the PS2 drew both sides: room 30's flight cases,
+    wound inward, vanished; walls stay one-sided, so a camera outside a room still sees in). Returns
+    jboy.Model."""
     tm = tmpl_model.meshes[0]
     out = copy.copy(tmpl_model)
     out.name = (name or M.name)[:15]
@@ -53,6 +60,7 @@ def convert(M, tmpl_model, name=None, tone=1.0, xform=None, tex_rename=None, max
             N = N @ R
         for sub in mesh['subs']:
             tname = M.textures[sub['tex']] if sub['tex'] < len(M.textures) else None
+            culled = not (double_sided is True or (callable(double_sided) and double_sided(tname)))
             verts, uvs, key, vnodes = [], [], {}, []
             strip = []
             for st in sub['strips']:
@@ -63,7 +71,7 @@ def convert(M, tmpl_model, name=None, tone=1.0, xform=None, tex_rename=None, max
                     vi &= 0xFFFF
                     q = stq[2] or 1.0
                     uv = (stq[0] / q, stq[1] / q)
-                    col = argb(c, tone)
+                    col = argb(c, tone, alpha)
                     k = (vi, round(uv[0], 5), round(uv[1], 5), col)
                     if keep_nodes and VN is not None and vi < len(VN):
                         vnodes_key = int(VN[vi])
@@ -81,6 +89,22 @@ def convert(M, tmpl_model, name=None, tone=1.0, xform=None, tex_rename=None, max
                     if len(strip) % 2:
                         strip.append(ids[0])
                 strip += ids
+                if culled and both_below > 0:
+                    Q = P[[v[0] & 0xFFFF for v in st]]
+                    if float((Q.max(0) - Q.min(0)).max()) < both_below:
+                        # (the same strip again, one place further on: every triangle turned over - on copies of
+                        # its vertices with the normals turned too, or the back is lit as the front's inside)
+                        back = []
+                        for i in ids:
+                            v = verts[i]
+                            back.append(len(verts))
+                            verts.append(v[:3] + (-v[3], -v[4], -v[5]) + v[6:])
+                            uvs.append(uvs[i])
+                            vnodes.append(vnodes[i])
+                        strip += [strip[-1], back[0]]
+                        if len(strip) % 2 == 0:
+                            strip.append(back[0])
+                        strip += back
             if not strip:
                 continue
             if len(verts) > max_verts:
@@ -109,6 +133,9 @@ def convert(M, tmpl_model, name=None, tone=1.0, xform=None, tex_rename=None, max
                         for n, t, v in tm.params]
             s.sphere = sphere_of([v[:3] for v in verts])
             s.raw = s.raw[:0xA4] + struct.pack('>4f', *s.sphere) + s.raw[0xB4:]
+            if double_sided is True or (callable(double_sided) and double_sided(tname)):
+                fl = struct.unpack_from('>I', s.raw, 0x88)[0] & ~0x2
+                s.raw = s.raw[:0x88] + struct.pack('>I', fl) + s.raw[0x8C:]
             out.meshes.append(s)
     if not out.meshes:
         return None

@@ -8,6 +8,7 @@
 #   night.ps1 [-Workers 4] [-Only B,C] [-Ids B2B,C100_101] [-Redo] [-Setup]
 param([int]$Workers = 4, [string[]]$Only = @(), [string[]]$Ids = @(), [switch]$Redo, [switch]$Setup,
       [string]$Scenarios = "")
+$env:SVR2011_AUDIO_MUTE = "1"  # (test games stay muted even if their command line is lost)
 $ErrorActionPreference = "Continue"
 # (powershell -File passes "a,b" as one string)
 $Only = @($Only | ForEach-Object { $_ -split "," } | Where-Object { $_ })
@@ -141,6 +142,7 @@ function Start-Scenario($s, [int]$w) {
     $env:SDL_WINDOW_ACTIVATE_WHEN_SHOWN = "0"; $env:SDL_WINDOW_ACTIVATE_WHEN_RAISED = "0"
     $args_ = @("--log_file=`"$log`"", "--log_level=info", "--audio_mute=true", "--fullscreen=false", "--monitor=2",
                "--show_fps=false") + @($s.args)
+    Use-SvrTestServer -GameDir $d -GameArgs $args_ | Out-Null
     $p = Start-Process (Join-Path $d "svr2011.exe") -WorkingDirectory $d -ArgumentList $args_ -PassThru -WindowStyle Minimized
     return @{ proc = $p; s = $s; w = $w; log = $log; start = Get-Date; pos = 0; text = ""; tmStarted = $false;
               passed = $false; needsSeen = (-not $s.needs); err = @(); stuckMax = 0; fps = @(); worst = @(); shots = @(); parked = $false;

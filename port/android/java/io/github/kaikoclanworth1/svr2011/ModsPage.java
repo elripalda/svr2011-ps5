@@ -5,7 +5,7 @@
 // "disabled" file turns one off. A switch for each, Remove, and Add a .svrmod
 // (a zip) picked from the phone. Mods are made on the PC with the SvR2011 Mod
 // Maker. Match types the port adds are mods too (type=matchtype, a manifest
-// only, in Mods/MatchTypes/<id>) so they can be switched off; they come on.
+// only, in Mods/MatchTypes/<id>) so they can be switched off; bundled ones come off.
 // Main menu backgrounds are mods too (Mods/Backgrounds/<id>: picture.dds +
 // manifest); "Add a background picture" makes one from a photo (Backgrounds.java).
 
@@ -49,6 +49,22 @@ final class ModsPage {
     static File matchTypesFolder() { return new File(new File(InstallActivity.gameFolder(), "Mods"), "MatchTypes"); }
     static File attiresFolder() { return new File(new File(InstallActivity.gameFolder(), "Mods"), "Attires"); }
     static File backgroundsFolder() { return Backgrounds.folder(); }
+
+    // This app's version: the game's (the app installs the game of its own release).
+    static String gameVersion(android.content.Context ctx) {
+        try {
+            return ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    // A mod's needs= (docs/SVRMOD_FORMAT.md: the oldest game version that plays it - a big model or arena) is newer
+    // than this game: older games leave a big model out, and crash loading a big arena (the PC's mods_tab.c).
+    static boolean needsNewer(android.content.Context ctx, String needs) {
+        String v = gameVersion(ctx);
+        return needs != null && !needs.trim().isEmpty() && v != null && !v.isEmpty() && Updater.newer(needs.trim(), v);
+    }
 
     View view() {
         LinearLayout c = a_.column();
@@ -139,9 +155,10 @@ final class ModsPage {
             boolean pic = d.getParentFile().getName().equals("Backgrounds");
             boolean attire = d.getParentFile().getName().equals("Attires");
             String hint = (star && leftOut.contains(d.getName()) ? "NOT IN GAME - over the " + superstarLimit() + " limit. " : "")
-                + (attire ? "Attire " + m.get("attire") + " for " + starName(m.get("superstar")) : pic ? "Menu background" : matchType ? "Match type" : backPack ? "Backstage area" : mediaPack ? "Media" : signPack ? "Crowd signs" : star ? "Superstar" : "Arena")
+                + (attire ? "Attire " + m.get("attire") + " for " + starName(m.get("superstar")) : pic ? "Menu background" : matchType ? (d.getName().equals("free_roaming_backstage") ? "Match type - REMOVED: FREE-ROAMING BACKSTAGE isn't in the game for now" : "Match type") : backPack ? "Backstage area - OFF: backstage mods are switched off, Backstage Brawl plays the stock backstage" : mediaPack ? "Media" : signPack ? "Crowd signs" : star ? "Superstar" : "Arena")
                 + (m.containsKey("author") && !m.get("author").isEmpty() ? " by " + m.get("author") : "")
                 + (m.containsKey("version") ? ", v" + m.get("version") : "")
+                + (needsNewer(a_, m.get("needs")) ? " - NEEDS GAME " + m.get("needs") : "")
                 + (signPack || mediaPack || matchType || pic ? "" : ", " + FileOps.human(new File(d, star ? "ch.pac" : attire ? "attire.pac" : "arena.pac").length()));
             LinearLayout controls = new LinearLayout(a_);
             Switch on = new Switch(a_);
@@ -347,9 +364,64 @@ final class ModsPage {
     String install(Uri uri) throws IOException {
         try (InputStream raw = a_.getContentResolver().openInputStream(uri)) {
             if (raw == null) throw new IOException("can't read it");
-            Installed r = install(a_, raw, false);
+            Installed r = install(a_, raw, false, this::askMoves);
             return r.name + (r.note.isEmpty() ? "" : ". " + r.note);
         }
+    }
+
+    // The question before a mod with custom moves is installed (launcher/move_warning.c on PC), from the install's
+    // worker thread: a Yes / No box on the UI thread, No focused (a pad's A answers No), "Don't warn me again" kept in
+    // the launcher's preferences. True: install it.
+    interface MoveQuestion {
+        boolean install(String name);
+    }
+
+    static final String kMoveWarning = "This mod has custom moves (ported or made by hand). Custom moves are "
+        + "experimental and most likely broken: they can land wrong, look odd or freeze a match. Install anyway?";
+
+    boolean askMoves(String name) {
+        android.content.SharedPreferences prefs = a_.getPreferences(android.content.Context.MODE_PRIVATE);
+        if (prefs.getBoolean("move_warning_off", false)) return true;
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        boolean[] yes = {false};
+        a_.runOnUiThread(() -> {
+            if (a_.isFinishing()) {
+                done.countDown();
+                return;
+            }
+            android.widget.CheckBox quiet = new android.widget.CheckBox(a_);
+            quiet.setText("Don't warn me again");
+            quiet.setTextColor(LauncherActivity.kText);
+            quiet.setButtonTintList(android.content.res.ColorStateList.valueOf(LauncherActivity.kRed));
+            LinearLayout box = new LinearLayout(a_);
+            box.setPadding(a_.dp(20), a_.dp(4), a_.dp(20), 0);
+            box.addView(quiet);
+            android.app.AlertDialog d = new android.app.AlertDialog.Builder(a_, android.app.AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle("\"" + name + "\" has custom moves")
+                .setMessage(kMoveWarning)
+                .setView(box)
+                .setPositiveButton("Yes", (dlg, w) -> {
+                    yes[0] = true;
+                    if (quiet.isChecked()) prefs.edit().putBoolean("move_warning_off", true).apply();
+                })
+                .setNegativeButton("No", null)
+                .setOnDismissListener(dlg -> done.countDown())
+                .show();
+            d.getButton(android.content.DialogInterface.BUTTON_NEGATIVE).requestFocus();
+        });
+        try {
+            while (!done.await(1, java.util.concurrent.TimeUnit.SECONDS))
+                if (a_.isFinishing() || a_.isDestroyed()) return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return yes[0];
+    }
+
+    // The player said No (the custom-moves question): not a failure.
+    static final class Declined extends IOException {
+        Declined(String why) { super(why); }
     }
 
     // Where a mod went (Mods/<kind>/<id>), whether it was there already, and
@@ -364,6 +436,11 @@ final class ModsPage {
     // Installs the .svrmod read from `raw`. A bundled mod (BundledMods) keeps
     // the player's on / off and never replaces a newer version of it.
     static Installed install(android.content.Context ctx, InputStream raw, boolean bundle) throws IOException {
+        return install(ctx, raw, bundle, null);
+    }
+
+    // ... `ask`: asked before a mod with custom moves is installed (null: only logged).
+    static Installed install(android.content.Context ctx, InputStream raw, boolean bundle, MoveQuestion ask) throws IOException {
         Map<String, File> parts = new HashMap<>();
         File stage = new File(ctx.getCacheDir(), "mod_stage");
         deleteTree(stage);
@@ -407,6 +484,18 @@ final class ModsPage {
         if (!pic && !attire && !signPack && !mediaPack && !matchType && (star ? !parts.containsKey("ch.pac") : !parts.containsKey("arena.pac"))) {
             deleteTree(stage);
             throw new IOException(star ? "it has no ch.pac" : "it has no arena (not a SvR2011 mod?)");
+        }
+        // (custom moves - a superstar mod's moves/ pack, ported or made by hand: asked first, as on PC; not the port's
+        // bundled mods)
+        if (!bundle && new File(stage, "moves/pack.txt").isFile()) {
+            String nm = m.containsKey("name") ? m.get("name") : m.containsKey("id") ? m.get("id") : "the mod";
+            android.util.Log.w("SvR2011", "mods: \"" + nm + "\" has custom moves (ported or made by hand) - experimental "
+                + "and most likely broken" + (ask == null ? " (not asked)" : ""));
+            if (ask != null && !ask.install(nm)) {
+                deleteTree(stage);
+                android.util.Log.i("SvR2011", "mods: \"" + nm + "\" not installed (custom moves: No)");
+                throw new Declined("it has custom moves (you chose not to install it)");
+            }
         }
         String id = m.containsKey("id") ? m.get("id").replaceAll("[^A-Za-z0-9_\\-]", "_") : "";
         if (id.isEmpty()) id = attire ? "attire" : pic ? "background" : matchType ? "matchtype" : backPack ? "backstage" : mediaPack ? "media" : signPack ? "signs" : star ? "superstar" : "arena";
@@ -466,6 +555,9 @@ final class ModsPage {
             }
             r.note = attireGuard(dest);
         }
+        if (needsNewer(ctx, m.get("needs")))
+            r.note = ("It needs game version " + m.get("needs").trim() + " or newer - this one is " + gameVersion(ctx)
+                + ": update the game first. " + r.note).trim();
         return r;
     }
 

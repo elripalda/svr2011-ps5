@@ -18,6 +18,7 @@
  * Windows-only rows say so).
  */
 #include "setup_tab.h"
+#include "verify.h"
 
 #include <bcrypt.h>
 #include <commctrl.h>
@@ -71,7 +72,7 @@ static int is_wine(void)
  * with the 14.40+ toolsets needs a 14.40+ runtime (std::mutex). */
 
 static int exists(const WCHAR *p);
-static void join(WCHAR *out, const WCHAR *a, const WCHAR *b);
+static void setup_join(WCHAR *out, const WCHAR *a, const WCHAR *b);
 
 /* "14.29.30157.0" of a DLL file; 0 when it has none. */
 static int file_version(const WCHAR *path, WORD v[4])
@@ -99,7 +100,7 @@ int setup_vcrt_cleanup(const WCHAR *dir, WCHAR *log, size_t logn)
     if (log && logn) log[0] = 0;
     if (!dir || !dir[0]) return 0;
     for (i = 0; i < 4; i++) {
-        join(p, dir, k_vcrt[i]);
+        setup_join(p, dir, k_vcrt[i]);
         swprintf_s(old, MAX_PATH + 8, L"%s.old", p);
         if (exists(old)) DeleteFileW(old);   /* (one put aside at an earlier start) */
         if (!exists(p) || !file_version(p, v) || v[0] != 14 || v[1] != 29) continue;   /* (not ours: kept) */
@@ -125,7 +126,7 @@ int setup_vcrt_system(WCHAR *ver, size_t vern)
         if (!m) return SETUP_VCRT_MISSING;
         FreeLibrary(m);
     }
-    join(p, sys, L"msvcp140.dll");
+    setup_join(p, sys, L"msvcp140.dll");
     if (!file_version(p, v)) return is_wine() ? SETUP_VCRT_OK : SETUP_VCRT_OLD;   /* (Wine's builtins: no version) */
     if (ver) swprintf_s(ver, vern, L"%u.%u.%u", v[0], v[1], v[2]);
     return v[0] > 14 || (v[0] == 14 && v[1] >= SETUP_VCRT_MIN_MINOR) ? SETUP_VCRT_OK : SETUP_VCRT_OLD;
@@ -133,7 +134,7 @@ int setup_vcrt_system(WCHAR *ver, size_t vern)
 
 static int exists(const WCHAR *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
 
-static void join(WCHAR *out, const WCHAR *a, const WCHAR *b) { swprintf_s(out, MAX_PATH, L"%s\\%s", a, b); }
+static void setup_join(WCHAR *out, const WCHAR *a, const WCHAR *b) { swprintf_s(out, MAX_PATH, L"%s\\%s", a, b); }
 
 static void mb_text(unsigned long long b, WCHAR *out, size_t n)
 {
@@ -170,8 +171,13 @@ void setup_check(const WCHAR *game, const WCHAR *launcher, SetupRow *rows)
     memset(rows, 0, sizeof(SetupRow) * SETUP_N);
 
     rows[SETUP_GAME].name = L"Game files";
-    join(p, game, L"default.xex");
-    if (exists(p)) {
+    setup_join(p, game, L"default.xex");
+    if (exists(p) && verify_xex_supported(p) == 0) {   /* (another release: the Japanese disc - it can't run) */
+        rows[SETUP_GAME].state = SETUP_MISSING;
+        swprintf_s(rows[SETUP_GAME].detail, 400, L"another release of the game in %s (for example the Japanese "
+                   L"disc): the port only runs the US / Europe release (title 5451085D) - install from that disc",
+                   game);
+    } else if (exists(p)) {
         rows[SETUP_GAME].state = SETUP_FOUND;
         swprintf_s(rows[SETUP_GAME].detail, 400, L"in %s", game);
     } else {
@@ -220,12 +226,12 @@ void setup_check(const WCHAR *game, const WCHAR *launcher, SetupRow *rows)
     }
 
     rows[SETUP_PYTHON].name = L"Python 3 + numpy + Pillow";
-    join(p, game, L"Tools\\python\\python.exe");
-    join(q, game, L"Tools\\python\\Lib\\site-packages");
+    setup_join(p, game, L"Tools\\python\\python.exe");
+    setup_join(q, game, L"Tools\\python\\Lib\\site-packages");
     {
         WCHAR np[MAX_PATH], pil[MAX_PATH];
-        join(np, q, L"numpy");
-        join(pil, q, L"PIL");
+        setup_join(np, q, L"numpy");
+        setup_join(pil, q, L"PIL");
         if (exists(p) && exists(np) && exists(pil)) {
             rows[SETUP_PYTHON].state = SETUP_FOUND;
             wcscpy_s(rows[SETUP_PYTHON].detail, 400, L"in Tools\\python (for the Mod Maker's converters)");
@@ -250,7 +256,7 @@ void setup_check(const WCHAR *game, const WCHAR *launcher, SetupRow *rows)
     }
 
     rows[SETUP_FFMPEG].name = L"ffmpeg";
-    join(p, game, L"Tools\\ffmpeg\\ffmpeg.exe");
+    setup_join(p, game, L"Tools\\ffmpeg\\ffmpeg.exe");
     if (exists(p)) {
         rows[SETUP_FFMPEG].state = SETUP_FOUND;
         wcscpy_s(rows[SETUP_FFMPEG].detail, 400, L"in Tools\\ffmpeg");
@@ -282,7 +288,7 @@ void setup_check(const WCHAR *game, const WCHAR *launcher, SetupRow *rows)
     }
 
     rows[SETUP_ADB].name = L"adb (Android)";
-    join(p, launcher, L"platform-tools\\adb.exe");
+    setup_join(p, launcher, L"platform-tools\\adb.exe");
     if (exists(p) || on_path(L"adb.exe", q)) {
         rows[SETUP_ADB].state = SETUP_FOUND;
         swprintf_s(rows[SETUP_ADB].detail, 400, L"%s", exists(p) ? p : q);
@@ -406,18 +412,31 @@ static void mkdirs(const WCHAR *dir)
     CreateDirectoryW(p, NULL);
 }
 
+/* Deletes a folder tree directly - no shell (its FO_DELETE took 30 s on a just-renamed folder: mods_tab.h
+   mods_delete_tree, which the Mod Maker, using this file, doesn't link). A junction: the link only. */
 static void remove_tree(const WCHAR *dir)
 {
-    WCHAR from[MAX_PATH + 2];
-    SHFILEOPSTRUCTW op;
-    if (!exists(dir)) return;
-    memset(from, 0, sizeof from);
-    wcscpy_s(from, MAX_PATH, dir);
-    memset(&op, 0, sizeof op);
-    op.wFunc = FO_DELETE;
-    op.pFrom = from;
-    op.fFlags = FOF_NO_UI;
-    SHFileOperationW(&op);
+    WCHAR pat[MAX_PATH], p[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    const DWORD a = GetFileAttributesW(dir);
+    if (a == INVALID_FILE_ATTRIBUTES) return;
+    SetFileAttributesW(dir, FILE_ATTRIBUTE_NORMAL);
+    if (!(a & FILE_ATTRIBUTE_DIRECTORY)) {
+        DeleteFileW(dir);
+        return;
+    }
+    if (!(a & FILE_ATTRIBUTE_REPARSE_POINT) && swprintf_s(pat, MAX_PATH, L"%s\\*", dir) > 0) {
+        h = FindFirstFileW(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+                if (swprintf_s(p, MAX_PATH, L"%s\\%s", dir, fd.cFileName) > 0) remove_tree(p);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+    RemoveDirectoryW(dir);
 }
 
 /* The embeddable Python ignores site-packages unless its ._pth lists it (and "import site"). */
@@ -430,11 +449,11 @@ static int fix_pth(const WCHAR *pydir)
     char text[4096] = "", *line, *ctx = NULL, out[4096] = "";
     size_t n;
     int has_sp = 0, has_site = 0;
-    join(pat, pydir, L"python*._pth");
+    setup_join(pat, pydir, L"python*._pth");
     h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     FindClose(h);
-    join(path, pydir, fd.cFileName);
+    setup_join(path, pydir, fd.cFileName);
     if (_wfopen_s(&f, path, L"rb") || !f) return 0;
     n = fread(text, 1, sizeof text - 1, f);
     text[n] = 0;
@@ -494,9 +513,9 @@ static void licences_readme(const WCHAR *game)
 {
     WCHAR dir[MAX_PATH], path[MAX_PATH];
     FILE *f;
-    join(dir, game, L"Tools\\LICENSES");
+    setup_join(dir, game, L"Tools\\LICENSES");
     mkdirs(dir);
-    join(path, dir, L"README.txt");
+    setup_join(path, dir, L"README.txt");
     if (_wfopen_s(&f, path, L"wb") || !f) return;
     fputs("Tools installed by the launcher's Setup tab (WWE SmackDown vs. Raw 2011 PC port).\r\n"
           "They are only for the Mod Maker's converters; the game doesn't use them.\r\n\r\n"
@@ -519,8 +538,8 @@ static int install_python(const WCHAR *game, const WCHAR *tmp, setup_progress_fn
 {
     WCHAR py[MAX_PATH], sp[MAX_PATH], zip[MAX_PATH], exe[MAX_PATH];
     int f;
-    join(py, game, L"Tools\\python");
-    join(sp, py, L"Lib\\site-packages");
+    setup_join(py, game, L"Tools\\python");
+    setup_join(sp, py, L"Lib\\site-packages");
     for (f = F_PYTHON; f <= F_PILLOW; f++) {   /* (all three first: nothing changes unless all arrive) */
         swprintf_s(zip, MAX_PATH, L"%s\\svr2011-setup-%d.zip", tmp, f);
         if (!fetch(f, zip, progress, (f - F_PYTHON) * 250, (f - F_PYTHON + 1) * 250, cancel, err, errn)) return 0;
@@ -541,7 +560,7 @@ static int install_python(const WCHAR *game, const WCHAR *tmp, setup_progress_fn
         return 0;
     }
     if (progress) progress(950, L"Checking Python\x2026");
-    join(exe, py, L"python.exe");
+    setup_join(exe, py, L"python.exe");
     if (!python_works(exe, 60000)) {
         swprintf_s(err, errn, L"Python was installed, but \"import numpy, PIL\" didn't work in it.");
         return 0;
@@ -568,17 +587,17 @@ static int install_ffmpeg(const WCHAR *game, const WCHAR *tmp, setup_progress_fn
         swprintf_s(err, errn, L"Could not unpack ffmpeg.");
         return 0;
     }
-    join(dir, game, L"Tools\\ffmpeg");
+    setup_join(dir, game, L"Tools\\ffmpeg");
     mkdirs(dir);
-    join(from, unp, L"ffmpeg-9.0.2-essentials_build\\bin\\ffmpeg.exe");
-    join(to, dir, L"ffmpeg.exe");
+    setup_join(from, unp, L"ffmpeg-9.0.2-essentials_build\\bin\\ffmpeg.exe");
+    setup_join(to, dir, L"ffmpeg.exe");
     if (!MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
         remove_tree(unp);
         swprintf_s(err, errn, L"Could not put ffmpeg.exe into %s (error %lu).", dir, GetLastError());
         return 0;
     }
-    join(from, unp, L"ffmpeg-9.0.2-essentials_build\\LICENSE");
-    join(to, dir, L"LICENSE.txt");
+    setup_join(from, unp, L"ffmpeg-9.0.2-essentials_build\\LICENSE");
+    setup_join(to, dir, L"LICENSE.txt");
     MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
     remove_tree(unp);
     DeleteFileW(zip);
@@ -592,7 +611,7 @@ int setup_install(const WCHAR *game, unsigned items, setup_progress_fn progress,
     err[0] = 0;
     /* (the downloads in the game folder's Tools\.downloads, not %TEMP%: a program that downloads into %TEMP%
        and unpacks programs from there looks like a dropper to antivirus heuristics) */
-    join(tmp, game, L"Tools\\.downloads");
+    setup_join(tmp, game, L"Tools\\.downloads");
     mkdirs(tmp);
     if (!exists(tmp)) {
         DWORD n = GetTempPathW(MAX_PATH, tmp);
@@ -678,42 +697,53 @@ static void start(unsigned items)
     else { s_busy = 0; refresh(); }
 }
 
-void setup_build(HWND wnd, mods_add_fn add, int tab, int id_base, setup_goto_fn go_install)
+void setup_build(HWND wnd, mods_add_fn add, int tab, int tools_tab, int id_base, setup_goto_fn go_install)
 {
     const int x = 28;
     int i, y;
     s_wnd = wnd;
     s_base = id_base;
     s_go_install = go_install;
-    add(tab, L"Button", L"What this PC has", BS_GROUPBOX, x, 4, 560, 446, 0);
-    s_ctl[S_INTRO] = add(tab, L"Static", L"What the game and its tools need on this PC. The game itself needs only "
-                         L"the first three; Python and ffmpeg are for the Mod Maker's converters.",
+    /* This PC: the game, the VC++ runtime, Media Foundation (rows 0-2); Tools: the rest (optional) */
+    add(tab, L"Button", L"What this PC has", BS_GROUPBOX, x, 4, 560, 240, 0);
+    s_ctl[S_INTRO] = add(tab, L"Static", L"What the game needs on this PC. The Mod Maker's tools (Python, ffmpeg) "
+                         L"are an optional step of their own: Tools.",
                          SS_LEFT | SS_NOPREFIX, x + 16, 34, 528, 34, id_base + S_INTRO);
-    for (i = 0, y = 72; i < SETUP_N; i++, y += 42)
-        s_ctl[S_ROW0 + i] = add(tab, L"Static", L"", SS_LEFT | SS_NOPREFIX, x + 16, y,
+    add(tools_tab, L"Button", L"Mod Maker tools (optional)", BS_GROUPBOX, x, 4, 560, 318, 0);
+    add(tools_tab, L"Static", L"Only for making mods: Python and ffmpeg run the Mod Maker's converters, Bink 2 makes "
+                              L"HD entrance videos, adb installs the game to a phone (Android step). Playing needs none.",
+        SS_LEFT | SS_NOPREFIX, x + 16, 34, 528, 34, 0);
+    for (i = 0; i < SETUP_N; i++) {
+        const int tools = i > SETUP_MF;
+        y = 72 + (tools ? i - SETUP_MF - 1 : i) * 42;
+        s_ctl[S_ROW0 + i] = add(tools ? tools_tab : tab, L"Static", L"", SS_LEFT | SS_NOPREFIX, x + 16, y,
                                 i == SETUP_VCRT ? 384 : 528, 40, id_base + S_ROW0 + i);
+    }
     /* (the VC++ runtime's download page in the player's browser - Microsoft's own link, nothing downloaded here) */
     s_ctl[S_VCRT] = add(tab, L"Button", L"Get the VC++ runtime", BS_PUSHBUTTON | WS_TABSTOP, x + 404, 72 + SETUP_VCRT * 42 + 4,
                         140, 28, id_base + S_VCRT);
-    y = 72 + SETUP_N * 42 + 4;
-    s_ctl[S_INSTALL] = add(tab, L"Button", L"Install Python + numpy + Pillow (33 MB)", BS_DEFPUSHBUTTON | WS_TABSTOP,
+    y = 72 + (SETUP_N - SETUP_MF - 1) * 42 + 4;
+    s_ctl[S_INSTALL] = add(tools_tab, L"Button", L"Install Python + numpy + Pillow (33 MB)", BS_DEFPUSHBUTTON | WS_TABSTOP,
                            x + 16, y, 270, 32, id_base + S_INSTALL);
-    s_ctl[S_FFMPEG] = add(tab, L"Button", L"Install ffmpeg (115 MB)", BS_PUSHBUTTON | WS_TABSTOP, x + 296, y, 170, 32,
+    s_ctl[S_FFMPEG] = add(tools_tab, L"Button", L"Install ffmpeg (115 MB)", BS_PUSHBUTTON | WS_TABSTOP, x + 296, y, 170, 32,
                           id_base + S_FFMPEG);
-    s_ctl[S_STOP] = add(tab, L"Button", L"Stop", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, x + 476, y, 68, 32,
+    s_ctl[S_STOP] = add(tools_tab, L"Button", L"Stop", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, x + 476, y, 68, 32,
                         id_base + S_STOP);
     y += 38;
+    s_ctl[S_RAD] = add(tools_tab, L"Button", L"RAD's download page", BS_PUSHBUTTON | WS_TABSTOP, x + 16, y, 150, 28,
+                       id_base + S_RAD);
+    add(tools_tab, L"Button", L"Check again", BS_PUSHBUTTON | WS_TABSTOP, x + 176, y, 120, 28, id_base + S_RECHECK);
+    /* This PC's buttons */
+    y = 72 + (SETUP_MF + 1) * 42 + 4;
     s_ctl[S_RECHECK] = add(tab, L"Button", L"Check again", BS_PUSHBUTTON | WS_TABSTOP, x + 16, y, 120, 28,
                            id_base + S_RECHECK);
-    s_ctl[S_GOTO_INSTALL] = add(tab, L"Button", L"Install tab", BS_PUSHBUTTON | WS_TABSTOP, x + 146, y, 110, 28,
+    s_ctl[S_GOTO_INSTALL] = add(tab, L"Button", L"Next: the game", BS_PUSHBUTTON | WS_TABSTOP, x + 146, y, 130, 28,
                                 id_base + S_GOTO_INSTALL);
-    s_ctl[S_FEATURES] = add(tab, L"Button", L"Optional features", BS_PUSHBUTTON | WS_TABSTOP, x + 266, y, 140, 28,
+    s_ctl[S_FEATURES] = add(tab, L"Button", L"Optional features", BS_PUSHBUTTON | WS_TABSTOP, x + 286, y, 140, 28,
                             id_base + S_FEATURES);
-    s_ctl[S_RAD] = add(tab, L"Button", L"RAD's download page", BS_PUSHBUTTON | WS_TABSTOP, x + 416, y, 128, 28,
-                       id_base + S_RAD);
-    s_ctl[S_PROGRESS] = add(tab, PROGRESS_CLASSW, L"", PBS_SMOOTH, x, 458, 560, 18, id_base + S_PROGRESS);
+    s_ctl[S_PROGRESS] = add(tools_tab, PROGRESS_CLASSW, L"", PBS_SMOOTH, x, 330, 560, 18, id_base + S_PROGRESS);
     SendMessageW(s_ctl[S_PROGRESS], PBM_SETRANGE32, 0, 1000);
-    s_ctl[S_STATUS] = add(tab, L"Static", L"", SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, x, 482, 560, 36,
+    s_ctl[S_STATUS] = add(tools_tab, L"Static", L"", SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, x, 354, 560, 36,
                           id_base + S_STATUS);
 }
 

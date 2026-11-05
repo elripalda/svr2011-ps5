@@ -11,8 +11,11 @@
 #include <functional>
 #include <sstream>
 
+#include "svrfmt/arena.h"
+#include "tool_run.h"
 #include "svrfmt/pac.h"
 #include "svrfmt/texture.h"
+#include "svrfmt/wwe13.h"
 #include "svrfmt/zip_write.h"
 
 namespace mm {
@@ -260,7 +263,46 @@ void SongCheck(const fs::path& dir, const std::string& key, const std::string& r
     p.push_back(Warning(Thing(key) + " is a " + e + " file, which the game can't play: it would be silent.", "Use an MP3 instead.").With(kOpen, OpenIt(dir)));
 }
 
-// A movie key's file: .bik (320 x 320 for a titantron), or .mp4 with a .bik of the same name beside it.
+// A Bink movie's likely size as an .mp4 (H.264 CRF 20 + AAC: about 0.04 bits a pixel, 128 kb/s sound); 0 unknown.
+uint64_t Mp4Guess(const fs::path& f) {
+  FILE* fp = _wfopen(f.c_str(), L"rb");
+  if (!fp) return 0;
+  uint8_t h[0x24] = {};
+  const bool ok = std::fread(h, 1, sizeof h, fp) == sizeof h;
+  std::fclose(fp);
+  if (!ok || std::memcmp(h, "BIK", 3)) return 0;
+  auto u32 = [&](int o) { return uint32_t(h[o] | h[o + 1] << 8 | h[o + 2] << 16 | uint32_t(h[o + 3]) << 24); };
+  const double frames = u32(8), w = u32(0x14), hh = u32(0x18), num = u32(0x1C), den = u32(0x20);
+  if (!frames || !w || !hh || !num || !den) return 0;
+  const double fps = num / den, seconds = frames / fps;
+  return uint64_t(seconds * (w * hh * fps * 0.04 + 128000) / 8);
+}
+
+// The "Shrink it" fix: the mod's Bink movie as an .mp4 beside it, the key pointed at it, the Bink kept only with
+// the Mod Maker's "Keep the Bink too" (the game's fallback where MP4 can't play). In the background.
+std::function<void()> ShrinkIt(const fs::path& dir, const std::string& key, const std::string& file) {
+  return [dir, key, file] {
+    RunInBackground([dir, key, file] {
+      const fs::path bik = dir / fs::u8path(file), mp4 = fs::path(bik).replace_extension(L".mp4");
+      std::error_code ec;
+      const uint64_t before = fs::file_size(bik, ec);
+      Progress("Making " + file + " an mp4 ...");
+      const std::string why = ShrinkMovie(bik.wstring(), mp4.wstring());
+      OnUiThread([dir, key, file, bik, mp4, before, why] {
+        std::error_code ec2;
+        if (!why.empty()) {
+          Status("The movie couldn't be shrunk: " + why + ".");
+          return;
+        }
+        Set(dir, key, PathStr(mp4.filename()))();
+        if (!g_settings.keep_bik) fs::remove(bik, ec2);
+        Status(file + " is an mp4 now: " + SizeText(before) + " -> " + SizeText(fs::file_size(mp4, ec2)) + ".");
+      });
+    });
+  };
+}
+
+// A movie key's file: .bik (320 x 320 for a titantron), or .mp4 (a .bik of the same name beside it: the fallback).
 void MovieCheck(const fs::path& dir, const std::string& key, const std::string& raw, bool titantron, std::vector<Problem>& p) {
   const std::string f = Trim(raw);
   if (f.empty()) return;
@@ -275,8 +317,8 @@ void MovieCheck(const fs::path& dir, const std::string& key, const std::string& 
     fs::path bik = path;
     bik.replace_extension(".bik");
     if (!Exists(bik))
-      p.push_back(Warning(Thing(key) + " is an MP4 that hasn't been prepared for the game yet: install the mod through the launcher "
-                          "(or the Mod Maker) and it's done for you."));
+      p.push_back(Warning(Thing(key) + " is an mp4: it plays where Windows plays mp4. On Steam Deck (Proton) or Windows N the "
+                       "usual video plays instead, unless a Bink of the same name is beside it.").Note());
     return;
   }
   if (e != ".bik") {
@@ -288,6 +330,12 @@ void MovieCheck(const fs::path& dir, const std::string& key, const std::string& 
     p.push_back(Error(Thing(key) + " is damaged or not a video the game can play.").With("Leave it out", Set(dir, key, "")).With(kOpen, OpenIt(dir)));
   else if (titantron && (w != 320 || h != 320))
     p.push_back(Warning(Thing(key) + " isn't square: the big screen is square, so it plays stretched."));
+  // a Bink is big: as an mp4 the mod gets much smaller
+  std::error_code ec;
+  const uint64_t size = fs::file_size(path, ec), guess = Mp4Guess(path);
+  if (!ec && guess && guess * 10 < size * 8 && size > (2u << 20))
+    p.push_back(Warning(Thing(key) + " is a Bink movie (" + SizeText(size) + "): as an mp4 it would be about " + SizeText(guess) +
+                     ", a much smaller mod.").With("Shrink it", ShrinkIt(dir, key, f)));
 }
 
 // Keys whose value is a file name: a trailing space makes the game miss the file (superstar / arena / media
@@ -420,8 +468,8 @@ void CheckSuperstar(const fs::path& dir, std::vector<Problem>& p) {
   const Manifest m = ReadManifest(dir);
   ManifestBasics(dir, m, "superstar", p);
   TrailingSpaces(dir, m, p);
-  UnknownKeys(dir, m, {"short", "base", "song", "music", "theme_gain", "movie", "voice", "style", "ratings", "call", "hometown", "announcer", "height", "pose",
-                       "entrance", "abilities", "moves", "pack", "game_look"},
+  UnknownKeys(dir, m, {"short", "base", "song", "music", "theme_gain", "theme_gain_auto", "movie", "voice", "call_gain", "loading", "style", "ratings", "call", "hometown", "announcer", "height", "pose",
+                       "entrance", "victory", "abilities", "moves", "pack", "game_look", "cae"},
               {"attire"}, p);
   const std::string name = Trim(m.Get("name"));
   const std::string who = name.empty() ? std::string("The superstar") : name;
@@ -433,6 +481,13 @@ void CheckSuperstar(const fs::path& dir, std::vector<Problem>& p) {
       p.push_back(Warning(who + " has both their own song and a game theme: their own song plays.")
                       .With("Keep the own song", Set(dir, "music", "")).With("Keep the game theme", Set(dir, "song", "")));
   }
+  if (const std::string c = Trim(m.Get("cae")); !c.empty()) {  // (a created entrance: the game's 284-byte block)
+    std::error_code ec;
+    const auto size = fs::file_size(dir / fs::u8path(c), ec);
+    if (ec || size != 284)
+      p.push_back(Warning(who + "'s created entrance file (" + c + ") is " + (ec ? std::string("missing") : "damaged") +
+                          ": " + who + " walks out with the entrance number instead.").With("Leave it out", Set(dir, "cae", "")));
+  }
   const fs::path ch = dir / "ch.pac";
   if (!Exists(ch))
     p.push_back(Error(who + " has no body (the model file is missing): the game leaves " + who + " out.").With(kOpen, OpenIt(dir)).With("Turn it off", TurnOff(dir)));
@@ -441,6 +496,38 @@ void CheckSuperstar(const fs::path& dir, std::vector<Problem>& p) {
   else {
     BudgetProblems(ch.wstring(), who, false, p);
     ModelCheckProblems(ch.wstring(), who, p);
+    // Superstar Threads paints a mod's parts from its threads.txt (tools/threads_parts.py makes it from the model's
+    // colour masks); installed mods only (a .svrmod's check runs on a cache copy)
+    std::error_code ec;
+    const fs::path mods = fs::absolute(fs::path(g_game) / L"Mods", ec), at = fs::absolute(dir, ec);
+    const bool installed = !g_game.empty() && PathStr(at).rfind(PathStr(mods), 0) == 0;
+    if (installed && !Exists(dir / "threads.txt")) {
+      if (ThreadsNoMasks(dir))
+        p.push_back(Warning(who + "'s model has no colour masks: Superstar Threads can't recolour " + who + "'s attires.",
+                            "The fix paints colour masks for the model (its parts found from the body areas) and names them; "
+                            "the model's old files are kept in the mod's .threads_backup folder.")
+                        .With("Make colour masks and Threads parts", [dir, who] {
+                          Status("Making colour masks and Superstar Threads parts for " + who + " ...");
+                          MakeThreadsParts(dir, [who, dir](int code, const std::string& msg) {
+                            if (code == 0)
+                              Status(who + "'s colour masks and Superstar Threads parts are made" + (msg.empty() ? "" : ": " + msg) +
+                                     " (the old model files are in " + PathStr(dir / ".threads_backup") + ").");
+                            else Status("The colour masks couldn't be made (see the log).");
+                            FixChanged();
+                          }, true);
+                        }, "colour masks and Threads parts are being made"));
+      else
+        p.push_back(Warning(who + " has no Superstar Threads parts: Superstar Threads can't recolour " + who + "'s attires.")
+                        .With("Make Superstar Threads parts", [dir, who] {
+                          Status("Making " + who + "'s Superstar Threads parts ...");
+                          MakeThreadsParts(dir, [who](int code, const std::string& msg) {
+                            if (code == 0) Status(who + "'s Superstar Threads parts are made" + (msg.empty() ? "." : ": " + msg + "."));
+                            else if (code == 3) Status("This model has no colour masks: Superstar Threads can't recolour " + who + "'s attires.");
+                            else Status("The Superstar Threads parts couldn't be made (see the log).");
+                            FixChanged();
+                          });
+                        }, "Superstar Threads parts are being made"));
+    }
   }
   if (!IsInt(Trim(m.Get("base")), 100, 321))
     p.push_back(Error(who + " has no fighting style: the game leaves " + who + " out.").With(kOpen, OpenIt(dir)));
@@ -556,7 +643,7 @@ bool GearStar(int star) {
 void CheckAttire(const fs::path& dir, std::vector<Problem>& p) {
   const Manifest m = ReadManifest(dir);
   ManifestBasics(dir, m, "attire", p);
-  UnknownKeys(dir, m, {"superstar", "attire", "model", "entrance", "gear"}, {}, p);
+  UnknownKeys(dir, m, {"superstar", "attire", "model", "entrance", "victory", "gear"}, {}, p);
   long star = 0;
   if (!IsInt(Trim(m.Get("superstar")), 100, 321, &star))
     p.push_back(Error("This outfit isn't set for any superstar: the game leaves it out.").With(kOpen, OpenIt(dir)));
@@ -628,18 +715,133 @@ const char* const kArenaBases[] = {"arena_SD", "arena_RAW", "arena_WM26", "arena
                                    "arena_BASH", "arena_NoC", "arena_BP", "arena_RR", "arena_BR", "arena_Series", "arena_TLC",
                                    "arena_ttt", "arena_EC", "arena_back", "arena_EXT", "arena_ECW", "arena_drui"};
 
+// An arena's 0xC35A, the "MipmapData" table (XML, texture -> mip level): its NumOfData (every stock arena says 200), -1
+// none. WWE 2K16 / 2K17 arenas converted before 16 Oct kept their own (241): the game crashed just before the match
+// (2K17 bg09, a render target resolve into a null texture; the 2011 arena's table alone made it play - its own trimmed
+// to 234 entries still crashed). WWE '13 ports keep theirs (234) and play: the check is for 2K16 / 2K17 sources only.
+int MipmapDataCount(const Epac& e) {
+  std::vector<PachEntry> ents;
+  if (e.groups.empty() || e.groups[0].entries.empty() || !PachRead(e.groups[0].entries[0].data, ents)) return -1;
+  for (const auto& x : ents)
+    if (x.id == 0xC35A) {
+      const Bytes u = Unpack(x.data);
+      const std::string t(u.begin(), u.end());
+      const size_t at = t.find("NumOfData=\"");
+      return at == std::string::npos ? -1 : std::atoi(t.c_str() + at + 11);
+    }
+  return -1;
+}
+// the fix: the 2011 RAW arena's table put in (as the converter does now)
+std::function<void()> RepairMipmapData(const fs::path& f) {
+  return [f] {
+    Bytes b, rb;
+    Epac e, r;
+    std::vector<PachEntry> ents, rents;
+    if (!ReadFile(PathStr(f), b) || !EpacRead(b, e) || e.groups.empty() || e.groups[0].entries.empty() ||
+        !PachRead(e.groups[0].entries[0].data, ents))
+      return;
+    if (g_game.empty() || !ReadFile(PathStr(fs::path(g_game) / "pac" / "bg" / "bg01.pac"), rb) || !EpacRead(rb, r) ||
+        r.groups.empty() || r.groups[0].entries.empty() || !PachRead(r.groups[0].entries[0].data, rents))
+      return;
+    for (const auto& x : rents)
+      if (x.id == 0xC35A)
+        for (auto& y : ents)
+          if (y.id == 0xC35A) y.data = x.data;
+    e.groups[0].entries[0].data = PachWrite(ents);
+    WriteFile(PathStr(f), EpacWrite(e));
+  };
+}
+
+// An arena's light bank (0x7530, unpacked; empty: none)
+Bytes LightBankOf(const Epac& e) {
+  std::vector<PachEntry> ents;
+  if (e.groups.empty() || e.groups[0].entries.empty() || !PachRead(e.groups[0].entries[0].data, ents)) return {};
+  for (const auto& x : ents)
+    if (x.id == 0x7530) return Unpack(x.data);
+  return {};
+}
+// The fix for dark match lights (svrfmt DarkLightSets): those sets from the game's RAW arena (bg01, only read) into the
+// mod's own arena file, as the converter does now
+std::function<void()> RepairLights(const fs::path& f) {
+  return [f] {
+    Bytes b, rb;
+    Epac e, r;
+    std::vector<PachEntry> ents;
+    if (!ReadFile(PathStr(f), b) || !EpacRead(b, e) || e.groups.empty() || e.groups[0].entries.empty() ||
+        !PachRead(e.groups[0].entries[0].data, ents))
+      return;
+    if (g_game.empty() || !ReadFile(PathStr(fs::path(g_game) / "pac" / "bg" / "bg01.pac"), rb) || !EpacRead(rb, r))
+      return;
+    const Bytes host = LightBankOf(r);
+    if (host.empty()) return;
+    for (auto& y : ents)
+      if (y.id == 0x7530) {
+        const Bytes bank = Unpack(y.data);
+        y.data = BpeEncode(ReplaceLightSets(bank, host, DarkLightSets(bank)));
+      }
+    e.groups[0].entries[0].data = PachWrite(ents);
+    WriteFile(PathStr(f), EpacWrite(e));
+  };
+}
+
 void CheckArenaPac(const fs::path& dir, const fs::path& f, std::vector<Problem>& p) {
   Bytes b;
   Epac e;
   if (!Exists(f)) p.push_back(Error("The arena's file is missing: the game skips it.").With(kOpen, OpenIt(dir)).With("Turn it off", TurnOff(dir)));
   else if (!ReadFile(PathStr(f), b) || b.size() < 0x800 || std::memcmp(b.data(), "EPAC", 4) || !EpacRead(b, e))
     p.push_back(Error("The arena's file is damaged.").With(kOpen, OpenIt(dir)).With("Turn it off", TurnOff(dir)));
+  else if (const std::string src = Trim(ReadManifest(dir).Get("source"));
+           (src.rfind("wwe2k16", 0) == 0 || src.rfind("wwe2k17", 0) == 0) && MipmapDataCount(e) != 200) {
+    p.push_back(Error("The arena was made from a WWE 2K16 / 2K17 arena by an older Mod Maker: it crashes the game just before the "
+                      "match.").With("Repair it", RepairMipmapData(f), "repaired (the game's own texture detail table put in)")
+                    .With("Turn it off", TurnOff(dir)));
+  }
+  Arena a;
+  if (!b.empty() && !std::memcmp(b.data(), "EPAC", 4) && a.LoadData(b)) {
+    // (svrfmt/arena.h: over the game's own arenas' 3D detail needs 2.1.6; over kMaxArenaVertsNew it crashes)
+    if (const ArenaGeometry g = GeometryOf(a); g.Over())
+      p.push_back(Error("The arena has more 3D detail than the game can load (" + std::to_string(g.verts) + " points, " +
+                        std::to_string(g.meshes) + " meshes; it takes up to " + std::to_string(kMaxArenaVertsNew) +
+                        " points and " + std::to_string(kMaxArenaMeshesNew) + " meshes): the game crashes in the match.")
+                      .With("Turn it off", TurnOff(dir)).With(kOpen, OpenIt(dir)));
+    else if (g.OverStock())
+      p.push_back(Warning("The arena has more 3D detail than the game's own arenas (" + std::to_string(g.verts) +
+                          " points, " + std::to_string(g.meshes) + " meshes; theirs: up to " +
+                          std::to_string(kMaxArenaVerts) + " points, " + std::to_string(kMaxArenaMeshes) + " meshes).",
+                          std::string("Version ") + kNeedsVersion + " or newer plays it; older ones crash loading it.")
+                      .With(kOpen, OpenIt(dir)));
+    int odd = 0;  // (pictures the game can't show: 2011's arenas use DXT1 / DXT3 / DXT5 and ARGB)
+    for (const auto& set : a.bundles)
+      for (const auto& t : set.textures) {
+        DdsInfo info;  // (one that isn't a picture file at all is left alone: stock bg23 has one)
+        if (DdsInfoOf(t.data, info) && info.format != DxtFormat::kDxt1 && info.format != DxtFormat::kDxt3 &&
+            info.format != DxtFormat::kDxt5 && info.format != DxtFormat::kArgb)
+          ++odd;
+      }
+    if (odd)
+      p.push_back(Warning(std::to_string(odd) + " of the arena's pictures are of a kind the game's arenas don't use: they may show "
+                          "black or wrong.").With(kOpen, OpenIt(dir)));
+  }
 }
 
 void CheckArena(const fs::path& dir, std::vector<Problem>& p) {
   const Manifest m = ReadManifest(dir);
   if (m.found) ManifestBasics(dir, m, "arena", p), TrailingSpaces(dir, m, p);
   CheckArenaPac(dir, dir / "arena.pac", p);
+  {  // (the match lighting: svrfmt/wwe13.h DarkLightSets)
+    Bytes b;
+    Epac e;
+    if (ReadFile(PathStr(dir / "arena.pac"), b) && b.size() >= 0x800 && !std::memcmp(b.data(), "EPAC", 4) && EpacRead(b, e)) {
+      const std::set<int> dark = DarkLightSets(LightBankOf(e));
+      if (dark.count(10))
+        p.push_back(Warning("The arena's match lighting is much darker than the game's arenas: wrestlers and the ring look dark "
+                            "in the match (bright at the entrance).")
+                        .With("Repair it", RepairLights(dir / "arena.pac"), "repaired (the game's own match lighting put in)"));
+      else if (dark.count(100))
+        p.push_back(Warning("Parts of the arena have no light from any side: they look flat and dark.")
+                        .With("Repair it", RepairLights(dir / "arena.pac"), "repaired (the game's own light for them put in)"));
+    }
+  }
   if (!Exists(dir / "banner.dds"))
     p.push_back(Error("The arena has no select screen picture: the launcher won't install it.").With(kOpen, OpenIt(dir)));
   else if (const std::string is = DdsIssue(dir / "banner.dds", 256, 128, {DxtFormat::kDxt5}, "DXT5"); !is.empty())
@@ -827,7 +1029,9 @@ std::vector<Problem> CheckInstalledSet() {
   int signs = 0;
   for (const auto& d : on_dirs("Signs"))
     for (const auto& e : fs::directory_iterator(d, ec)) signs += e.is_regular_file(ec) && PathStr(e.path().extension()) == ".dds";
-  if (signs > 400) p.push_back(Warning(std::to_string(signs) + " crowd signs are on: the game holds 400, so some never show."));
+  // (400: the sign packs' ids, 6001-9991 - crowd_signs.cpp; not memory: the match load's heap (16 MB since 2.1.9)
+  // takes the whole bank's two copies even at 400 pack signs plus 4 for each of 137 superstars)
+  if (signs > 400) p.push_back(Warning(std::to_string(signs) + " crowd signs are on in sign packs: the game has room for 400 of them, so the rest never show."));
   int rows = 0, plain = 0;
   for (const auto& d : on_dirs("Backstage")) (ReadManifest(d).Has("row") ? rows : plain) += 1;
   if (rows > 8) p.push_back(Warning(std::to_string(rows) + " new backstage areas are on: the menu holds 8, so the rest don't show."));

@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 
 struct ImFont;
 
@@ -47,6 +48,14 @@ void SetOnlineOverlayFonts(ImFont* menu, ImFont* title);
 // Opens / closes it (any thread).
 void ToggleOnlineOverlay();
 
+// The game closing: the server shows this player offline now (not after its
+// 60 s presence window). A short request; nothing when signed out.
+void OnlineOverlaySayGoodbye();
+
+// A notice at the top of the screen for `seconds` (any thread): two lines,
+// e.g. "THE HOST LEFT" / "THE MATCH IS OVER".
+void OnlineOverlayNotice(const std::string& line1, const std::string& line2, int seconds);
+
 // True while it is open or the button that closed it is still held.
 bool OnlineOverlayHoldsInput();
 
@@ -64,5 +73,15 @@ uint16_t OnlineRawPad();
 // cursor is) and the help bar it built (each screen has its own).
 void OnlineNoteString(uint32_t id);
 void OnlineNoteHelpBar(uint32_t id);
+
+// Where the player is, for the presence poll (&place=: the dashboard's live view) - a short token:
+// match_online / match_offline, lobby_host / lobby_join, cc / cc_download / cc_upload, leaderboards,
+// matchmaking, online_menu; offline: menus, match_setup, universe, rtwm, shop, my_wwe, options and the
+// creation suites (create_superstar, paint_tool, threads, create_story, create_finisher, create_entrance,
+// highlight_reel, create_moveset). In an online match `kind` gets ranked / player (empty: not known).
+// The modules that see the web / session activity note it (any thread).
+enum class OnlineActivity { kSearch, kCcBrowse, kCcDownload, kCcUpload, kLeaderboards, kCount };
+void NoteOnlineActivity(OnlineActivity what);
+std::string PresencePlace(std::string* kind = nullptr);
 
 }  // namespace svr2011

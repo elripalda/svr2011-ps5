@@ -17,6 +17,7 @@ param([string]$Name = "bench", [ValidateSet("normal", "weak", "phone")][string]$
       [int]$Fps = 60, [string[]]$Set = @(), [string[]]$Env = @(), [string]$People = "BATISTA,KANE",
       [int]$Arena = 1, [int]$TitleWait = 100, [int]$MatchSecs = 60, [int]$Mask = 0x5, [int]$Load = 1,
       [switch]$Keep, [switch]$Report, [switch]$UntilEnd)
+$env:SVR2011_AUDIO_MUTE = "1"  # (test games stay muted even if their command line is lost)
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 if (-not ("OB" -as [type])) {
@@ -112,6 +113,7 @@ $env:SVR2011_NATIVE_WINDOW_POS = "-2600,0"
 Remove-Item Env:SVR2011_NATIVE_SHADERS -ErrorAction SilentlyContinue
 foreach ($e in $Env) { $k, $v = $e -split '=', 2; Set-Item "Env:$k" $v }
 $a = @("--log_file=`"$log`"", "--log_level=info", "--audio_mute=true", "--fullscreen=false", "--monitor=2")
+Use-SvrTestServer -GameDir $Game -GameArgs $a | Out-Null
 $p = Start-Process (Join-Path $Game "svr2011.exe") -WorkingDirectory $Game -ArgumentList $a -PassThru -WindowStyle Minimized
 $loadIds = @()
 try {

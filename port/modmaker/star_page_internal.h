@@ -31,6 +31,9 @@ struct StarProject {
   bool ratings_set = false;  // (the style's, until moved)
   char name[32] = "", short_name[32] = "", author[64] = "", version[16] = "1.0";
   std::wstring model, song, movie, voice;
+  std::string threads;   // threads.txt made in the Threads parts tab ("" = none: an own model gets threads_parts.py's)
+  std::wstring cae;      // a created entrance (cae=: the game's 284-byte entrance block, "Made in the game")
+  std::string cae_name;  // whose it was in the game (shown)
   std::wstring attires[4];        // [1..3]: attires 2-4 from other model pacs (their first attire)
   char attire_names[4][32] = {};  // [1..3]: their names on CHANGE ATTIRE ("" = ATTIRE N)
   int attire_entrance[4] = {-1, -1, -1, -1};  // [1..3]: attire<N>_entrance= (-1: the superstar's entrance)
@@ -41,16 +44,19 @@ struct StarProject {
   Image picture_small;            // the 256 bust made with it (or own_bust)
   bool own_bust = false;          // picture_small is the user's own bust picture
   Image picture_full;             // own full-body picture (render_full.dds -> SSFB; none: render.dds)
+  Image picture_load;             // the NOW LOADING picture (load.dds, 1024 x 512 DXT5; none: the arena's / the game's)
   bool game_look = false;         // the picture's tone moved toward the game's renders
   Image picture_src;              // the picture as picked (this session: the game look can be undone)
   int call = -1;                  // -1: "The Superstar"
   float height = 1.0f;            // height=<scale> from the feet (0.80-1.25; 1: left out)
   float theme_gain = 0.0f;        // theme_gain=<dB> (-20..+6; 0: left out)
+  float call_gain = 0.0f;         // call_gain=<dB>: the name recording against the game's own calls (-20..+12; 0: left out)
   std::vector<Picture> signs;     // its fans' signs (up to 4; 128 x 64)
   // the SvR 2010-style extras (the game: superstar_mods.cpp)
   int pose = -1;                  // pose=<motion id>: the select / VS panel's pose (-1: the style's)
   int music = 0;                  // music= : a theme of the game's own (its music id 1-253) instead of a song file; 0 = none
   int entrance = -1;              // entrance= number (-1: the style's); a superstar's id, or 535 (Jeff Hardy's, unused)
+  int victory = -1;               // victory= scene (-1: the game's; Victories())
   char announcer[32] = "";        // announcer=<NAME>: the ring announcer's own clips of that name
   char hometown_city[32] = "";    // hometown=<CITY>[,<STATE>]: the announcer's own hometown clips
   char hometown_state[32] = "";
@@ -71,6 +77,10 @@ struct StarProject {
   std::map<int, std::string> gear;
   std::map<MatKey, MatEdit> mats;  // the material panel's edits: (attire 1-4, gear, model id, mesh) -> edit
   std::map<std::string, MatEdit> fbx_mat;  // FBX import: a mesh's material for the builder (by mesh name)
+  int fbx_reduce = 0;          // FBX import's Reduce detail: about this many vertices (0: off - never on its own)
+  int fbx_hair = -1;           // ... moving hair: -1 auto (not VRChat's J_Sec_* bones), 0 none, 1 every hair bone
+  std::map<std::string, std::string> fbx_cloth;  // ... spring cloth bones ticked ("1") / unticked ("0") by hand
+  bool fbx_keep_face = true;   // ... the head left as it is
 };
 extern StarProject g_star;
 // The overall rating as the game works it out (sub_828B7950, used by the select screen's OVERALL list and ~28 more
@@ -82,7 +92,9 @@ inline int OverallRating(const int r[7]) {
   return v > 100 ? 100 : v;
 }
 extern int g_view_attire;  // the attire the preview shows (1-4)
-void MaterialsSection(bool simple);  // the material panel for the model the 3D view shows (its attire, its gear)
+// The material panel for the model the 3D view shows (its attire, its gear): under a header of its own, or (header
+// false) just the list - show_list false: none of it, its edits still shown in the 3D view.
+void MaterialsSection(bool simple, bool header = true, bool show_list = true);
 // The Full preview window (full_preview.cpp) of entrance n for this project (star_page.cpp).
 void OpenFullPreview(int n, int start_part = 0);  // (start_part: full_preview::Request)
 
@@ -102,8 +114,12 @@ void Install(bool start);
 void SetPicture(const Image& src);
 std::wstring StyleChPac();  // the fighting style's superstar's model (pac\ch\ch<id>.pac)
 void SimpleDraw();          // simple_star.cpp
-void FbxRows(bool simple);
+void FbxRows(bool simple);  // the FBX import, step by step
+bool FbxMaterials(bool simple, bool intro = true);  // the FBX's materials (its step 3; Simple's Materials tab)
+void FbxMakeButton(const char* label, float width);
 void GearRows(bool simple);  // entrance gear per attire: has it, show it, leave it out, give it another attire's
+std::vector<int> AttireCount();  // the attires the mod has, 1..4 (star_page.cpp)
+void ThreadsOpen(int attire);    // the Threads parts tab on that attire (threads_page.cpp)
 // the move-set: the picker (g_pick_slot >= 0 opens it), slot names, the preview of a pose
 extern int g_pick_slot;
 extern char g_pick_find[48];

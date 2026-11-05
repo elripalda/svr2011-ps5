@@ -16,13 +16,14 @@
 //
 // Here:
 //  - a character's own signs (superstar mods: sign1..4.dds) go in as
-//    id*10 + 1..4 (replacing a DLC slot's "Dummy" placeholders);
+//    10000 + key*10 + 1..4 (the mod's key: whatever id it holds - superstar_mods.cpp);
 //  - sign packs, <game>/Mods/Signs/<pack>/*.dds (a manifest.txt; a "disabled"
 //    file turns one off), go in as 6001, 6011, ... and join the general
 //    signs: the free slots of each match are drawn from the game's 16 and
 //    these;
 //  - the merged bank is handed to the match loader instead of the file's.
 #include "crowd_signs.h"
+#include "no_mods.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -42,6 +43,7 @@
 #include "generated/default/svr2011_init.h"
 #include "../modmaker/svrfmt/pac.h"
 #include "../modmaker/svrfmt/texture.h"
+#include "../modmaker/svrfmt/bytes.h"
 
 namespace fs = std::filesystem;
 
@@ -55,10 +57,7 @@ std::map<uint32_t, fs::path> g_signs;  // sign id -> its DDS (ours)
 std::vector<uint32_t> g_general;       // the general signs: the game's 16, then the packs'
 uint32_t g_bank = 0, g_bank_size = 0;  // guest: the merged bank
 
-void Wr32(uint8_t* p, uint32_t v) {
-  p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
-}
-uint32_t Rd32(const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+using svrfmt::Rd32, svrfmt::Wr32;
 
 // A sign's entry: a texture bundle with the DDS as "no01".
 svrfmt::Bytes SignEntry(const fs::path& dds) {
@@ -69,6 +68,7 @@ svrfmt::Bytes SignEntry(const fs::path& dds) {
 }
 
 void LoadPacks() {
+  if (svr2011::NoMods()) return;  // (Start Without Mods: no_mods.h)
   std::error_code ec;
   const fs::path dir = rex::filesystem::GetExecutableFolder() / "Mods" / "Signs";
   std::vector<fs::path> packs;
@@ -133,8 +133,8 @@ bool BuildBank(rex::memory::Memory* memory) {
 
 namespace svr2011 {
 
-void AddCharacterSigns(uint32_t id, const std::vector<fs::path>& dds) {
-  for (size_t k = 0; k < dds.size() && k < 4; ++k) g_signs[id * 10 + 1 + uint32_t(k)] = dds[k];
+void AddCharacterSigns(uint32_t first, const std::vector<fs::path>& dds) {
+  for (size_t k = 0; k < dds.size() && k < 4; ++k) g_signs[first + 1 + uint32_t(k)] = dds[k];
 }
 
 void InstallCrowdSigns(rex::memory::Memory* memory) {

@@ -4,7 +4,10 @@
 #include "app.h"
 #include "session_log.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <memory>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -92,6 +95,15 @@ std::string HintOf(const std::string& line) {
     const size_t e = line.find('\'', at + 17);
     std::string mod = line.substr(at + 17, e == std::string::npos ? std::string::npos : e - at - 17);
     if (const size_t dot = mod.find('.'); dot != std::string::npos) mod.resize(dot);
+    // (one of the Mod Maker Tools' own modules - hctp2jboy, hmot... - is no package to install: the converter's own
+    // error says what's wrong; a player was asked "Missing: hctp2jboy - install now?" again and again)
+    if (!g_tools.empty() && !mod.empty()) {
+      std::error_code ec;
+      const fs::path tools(g_tools), file = Wide(mod + ".py");
+      if (fs::exists(tools / file, ec)) return "";
+      for (fs::recursive_directory_iterator it(tools, ec), end; !ec && it != end; it.increment(ec))
+        if (it->path().filename() == file) return "";
+    }
     return mod == "PIL" ? "Pillow" : mod;
   }
   if (line.find("ToolMissing") != std::string::npos || (line.find("svrmod.exe") != std::string::npos && line.find("not found") != std::string::npos))
@@ -317,6 +329,82 @@ int RunCaptureJson(const std::wstring& cmdline, const std::wstring& cwd, std::st
 
 }  // namespace
 
+int RunWait(const std::wstring& cmdline, std::string& out) {
+  SECURITY_ATTRIBUTES sa = {sizeof sa, nullptr, TRUE};
+  HANDLE rd = nullptr, wr = nullptr;
+  if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  STARTUPINFOW si = {sizeof si};
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = wr, si.hStdError = wr, si.hStdInput = nullptr;
+  PROCESS_INFORMATION pi = {};
+  std::wstring cmd = cmdline;
+  const BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr,
+                                 nullptr, &si, &pi);
+  CloseHandle(wr);
+  if (!ok) {
+    CloseHandle(rd);
+    Log("Could not start: " + Utf8(cmdline));
+    return -1;
+  }
+  char buf[4096];
+  DWORD n = 0;
+  while (ReadFile(rd, buf, sizeof buf, &n, nullptr) && n) out.append(buf, n);
+  CloseHandle(rd);
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD code = DWORD(-1);
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
+  return int(code);
+}
+
+std::string ShrinkMovie(const std::wstring& in, const std::wstring& out) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const std::wstring ff = FfmpegExe(), part = out + L".part.mp4";
+  fs::create_directories(fs::path(out).parent_path(), ec);
+  fs::remove(part, ec);
+  const fs::path script = ToolsDir().empty() ? fs::path() : fs::path(ToolsDir()) / L"movie_shrink.py";
+  const bool use_script = !script.empty() && fs::exists(script, ec) && !PythonExe().empty();
+  std::wstring cmd;
+  if (use_script) {
+    cmd = Quote(PythonExe()) + L" -X utf8 " + Quote(script.wstring()) + L" " + Quote(in) + L" " + Quote(part);
+    if (!ff.empty()) cmd += L" --ffmpeg " + Quote(ff);
+  } else {
+    if (ff.empty()) return "ffmpeg is missing (Mod Maker tools: Install what's missing)";
+    if (FILE* f = _wfopen(in.c_str(), L"rb")) {  // (Bink 2: the ffmpeg builds don't read it)
+      char head[4] = {};
+      const size_t got = std::fread(head, 1, 4, f);
+      std::fclose(f);
+      if (got == 4 && head[0] == 'K' && head[1] == 'B' && head[2] == '2') return "a Bink 2 movie, which ffmpeg can't read";
+    }
+    cmd = Quote(ff) + L" -hide_banner -loglevel error -nostdin -y -i " + Quote(in) +
+          L" -vf scale=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libx264 -crf 20 -pix_fmt yuv420p -c:a aac -movflags +faststart " + Quote(part);
+  }
+  Log("movie: " + Utf8(fs::path(in).filename().wstring()) + " -> mp4 (" + (use_script ? "movie_shrink.py" : "ffmpeg") + ")");
+  std::string text;
+  const int code = RunWait(cmd, text);
+  if (code == 0 && fs::exists(part, ec) && fs::file_size(part, ec) > 0) {
+    fs::remove(out, ec);
+    fs::rename(part, out, ec);
+    if (!ec) return {};
+  }
+  fs::remove(part, ec);
+  // why: the script's JSON "error", else the last line it printed
+  std::string why;
+  if (const size_t e = text.rfind("\"error\""); e != std::string::npos) {
+    const size_t q1 = text.find('"', text.find(':', e) + 1), q2 = q1 == std::string::npos ? q1 : text.find('"', q1 + 1);
+    if (q2 != std::string::npos) why = text.substr(q1 + 1, q2 - q1 - 1);
+  }
+  if (why.empty()) {
+    std::string t = text;
+    while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+    why = t.substr(t.find_last_of('\n') == std::string::npos ? 0 : t.find_last_of('\n') + 1);
+  }
+  Log("movie: the mp4 wasn't made (exit " + std::to_string(code) + "): " + text.substr(text.size() > 2000 ? text.size() - 2000 : 0));
+  return why.empty() ? "the conversion stopped (exit " + std::to_string(code) + ")" : why;
+}
+
 void CancelTool() {
   std::lock_guard lock(g_job_mutex);
   if (!g_job) return;
@@ -367,9 +455,93 @@ bool RunCommand(const std::wstring& cmdline, std::function<void(int)> done, cons
   return true;
 }
 
+namespace {
+struct MovesAsk {
+  std::function<void()> go, cancel;
+  int frames = 0;
+};
+std::unique_ptr<MovesAsk> g_moves_ask;  // the conversion waiting for the warning's answer
+bool g_moves_ok = false;                // accepted this session
+bool g_moves_dont_show = false;         // the dialog's tick
+std::string MovesTestAnswer() {
+  const char* v = std::getenv("SVR2011_TEST_MOVES_WARNING");
+  return v ? v : "";
+}
+}  // namespace
+
+bool ConvertsMoves(const std::wstring& script, const std::vector<std::wstring>& args) {
+  if (args.empty() || args[0] != L"convert") return false;
+  if (script == L"moves_port.py") return true;
+  if (script == L"superstar_port.py") return std::find(args.begin(), args.end(), L"--no-moves") == args.end();
+  return false;
+}
+
+void MovesWarning() {
+  if (!g_moves_ask) return;
+  const char* kTitle = "Move converting is experimental###moveswarning";
+  if (!ImGui::IsPopupOpen(kTitle)) ImGui::OpenPopup(kTitle);
+  const ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(560 * g_scale, 0), ImGuiCond_Always);
+  if (!ImGui::BeginPopupModal(kTitle, nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) return;
+  ImGui::PushTextWrapPos(0);
+  ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1), "Move converting is HIGHLY EXPERIMENTAL.");
+  ImGui::Spacing();
+  ImGui::Bullet();
+  ImGui::TextWrapped("There WILL be bugs: moves may freeze, look wrong or not work at all.");
+  ImGui::Bullet();
+  ImGui::TextWrapped("By continuing you agree that your mod may break in a future update, and that you may have to "
+                     "remake it from scratch.");
+  ImGui::Spacing();
+  ImGui::TextDisabled("Cancel and nothing is converted.");
+  ImGui::PopTextWrapPos();
+  ImGui::Spacing();
+  ImGui::Checkbox("Don't show this again", &g_moves_dont_show);
+  ImGui::Spacing();
+  const std::string test = g_behind ? MovesTestAnswer() : "";
+  ++g_moves_ask->frames;
+  PushAccent();
+  if (test == "accept_dont_show" && g_moves_ask->frames == 20) g_moves_dont_show = true;  // (test: the tick, then accept)
+  const bool go = ImGui::Button("I understand - convert", ImVec2(220 * g_scale, 0)) ||
+                  ((test == "accept" || test == "accept_dont_show") && g_moves_ask->frames > 30);
+  PopAccent();
+  ImGui::SameLine();
+  const bool cancel = ImGui::Button("Cancel", ImVec2(120 * g_scale, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+                      (test == "cancel" && g_moves_ask->frames > 30);
+  if (go || cancel) {
+    auto ask = std::move(g_moves_ask);
+    ImGui::CloseCurrentPopup();
+    if (go) {
+      g_moves_ok = true;
+      if (g_moves_dont_show) g_settings.moves_warning_off = true, SaveSettings();
+      Log("moves warning: accepted" + std::string(g_moves_dont_show ? " (don't show again)" : ""));
+      WhenIdle(ask->go);
+    } else {
+      Log("moves warning: cancelled - nothing converted");
+      Status("Not converted: move converting cancelled.");
+      ask->cancel();
+    }
+  }
+  ImGui::EndPopup();
+}
+
 bool RunToolJson(const std::wstring& script, const std::vector<std::wstring>& args,
                  std::function<void(int, const std::string&)> done, const std::wstring& cwd) {
   if (!ConvertersReady()) return false;
+  // moves: the experimental warning first (once a session; a hidden test only when it asks for it)
+  if (ConvertsMoves(script, args) && !g_moves_ok && !g_settings.moves_warning_off && (!g_behind || !MovesTestAnswer().empty())) {
+    if (g_moves_ask) {
+      Status("Answer the move warning first.");
+      return false;
+    }
+    g_moves_ask = std::make_unique<MovesAsk>();
+    g_moves_ask->go = [script, args, done, cwd] { RunToolJson(script, args, done, cwd); };
+    g_moves_ask->cancel = [done] {
+      if (done) done(2, "{\"ok\": false, \"error\": \"Not converted: you cancelled the move conversion.\"}");
+    };
+    Log("moves warning: shown before " + Utf8(script) + " convert");
+    return true;
+  }
   for (size_t i = 0; i + 1 < args.size(); ++i)
     if (args[i] == L"--svrmod" && args[i + 1].empty()) {  // (SvrmodArgs: a WWE '12 - 2K17 port without svrmod.exe)
       OpenToolsPanel("Missing: svrmod.exe (the Mod Maker's pac tool, needed for WWE '12 - 2K17 discs).");

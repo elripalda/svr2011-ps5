@@ -17,6 +17,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # (its own folder: the embeddable Python doesn't add it)
 import jboy  # noqa: E402
 import svr08_stage as s8  # noqa: E402
 
@@ -32,7 +33,7 @@ KINDS = {
     89: ([0], [2]),           # gmAttackObjAndWeapon: model, coll p1 (param 2)
     47: ([0], [1]),           # CGmWireNetting: ami, wall coll 2063
     51: ([0], [1]),           # CGmThrowObject: model, coll
-    36: ([0], [1]),           # CGmShutObject: kizai_box, coll A
+    36: ([0], [8]),           # CGmShutObject: kizai_box, p8 its solid box (p1 is the floor zone in front, flat)
     37: ([0], []),            # CGmSwitch: panel (2056 = zone)
     39: ([0], []),            # CGmSwitchOnOffParticle: valve (2057 = zone)
     46: ([0], [1]),           # CGmComeOffObject: roof half, panel coll 2060
@@ -179,7 +180,7 @@ def build_models(stage, plist, tmpl, outdir, tone=1.0):
             if mid in done:
                 continue
             M = yobj.read(open(os.path.join(stage, '50101', f'{mid:05d}.yobj'), 'rb').read())
-            J = hctp2jboy.convert(M, tmpl, tone=tone)
+            J = hctp2jboy.convert(M, tmpl, tone=tone, double_sided=True)
             path = os.path.join(outdir, f'{mid}.jboy')
             open(path, 'wb').write(jboy.write(J))
             done[mid] = (path, J.textures)

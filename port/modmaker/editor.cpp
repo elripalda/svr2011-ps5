@@ -38,6 +38,7 @@
 #include "imgui.h"
 #include "svrfmt/arena_build.h"
 #include "svrfmt/arena_import.h"
+#include "svrfmt/model_objects.h"
 #include "svrfmt/png.h"
 
 namespace fs = std::filesystem;
@@ -195,7 +196,8 @@ struct Obj {
   int light_set = 100, motion = -1;
   bool entrance_only = false, match_only = false, billboard = false;
   V3 pos;           // edit offset
-  float yaw = 0;    // radians
+  float yaw = 0;    // radians (turn about the up axis)
+  float pitch = 0, roll = 0;  // radians: tilted forward / sideways (applied before the turn)
   float scale = 1;
   V3 pivot;         // bottom centre of the original geometry
   std::vector<std::vector<Vertex>> base;
@@ -203,7 +205,7 @@ struct Obj {
 };
 
 struct Snapshot {
-  std::vector<std::array<float, 6>> xf;  // pos, yaw, scale, hidden
+  std::vector<std::array<float, 8>> xf;  // pos, yaw, scale, hidden, pitch, roll
   std::vector<std::string> tex;          // each object's texture (first mesh)
 };
 
@@ -236,12 +238,17 @@ ID3D11Buffer* g_cb_mode = nullptr;   // (b1: mode.x 1 = self-lit, the textures i
 ID3D11Buffer* g_cb_light = nullptr;  // (b2: the arena's light set for the next draws - SetStageLight)
 int g_cb_light_now = -2;
 int g_cb_mode_now = -1;
+bool g_keep_blend = false;  // (the glow pass: its additive blend stays, whatever the model's own kind)
 std::set<std::string> g_self_lit;    // (SetSelfLit: screens drawn at their own brightness)
 std::set<std::string> g_led_mask;    // (SetSelfLit's masks: a screen's dot grid over it, its holes the lit dots)
 ID3D11BlendState* g_led_blend = nullptr;
-bool g_game_alpha = false;           // (SetGameTransparency: alpha cuts only on the C351-flagged models, as the game)
+// The game's see-through rules, from each model's C351 flags (on in every view; env SVR2011_MM_NO_GAME_ALPHA: the old
+// cut-everything look, for A/B shots): s / k / i / j blended, a / o added, c cut out, none opaque. Every texture's
+// alpha cut at 0.25 turned the cage trusses (s) of Hell in a Cell into blotchy holes, and WWE barriers (no flag, a
+// gloss mask in the alpha) see-through.
+bool g_game_alpha = !std::getenv("SVR2011_MM_NO_GAME_ALPHA");
 const svrfmt::Arena* g_cut_arena = nullptr;
-std::vector<char> g_cut;             // (per model: its C351 line has a transparency flag)
+std::vector<char> g_cut;             // (per model: 0 opaque, 1 cut out, 2 blended, 3 added)
 std::map<uint32_t, std::string> ModelFlagsOf(const svrfmt::Arena& arena);
 ID3D11SamplerState* g_sampler = nullptr;
 ID3D11RasterizerState* g_solid = nullptr;
@@ -274,6 +281,12 @@ float g_snap_step = 5;  // units (1 = 10 cm)
 bool g_frame_all = false;
 int g_test_view = -1;  // (TestStart)
 std::string g_test_select;
+int g_file_from = 0;  // Add object from a file: 0 any 3D program in metres, 1 in centimetres, 2 Export to Blender
+// (test aids on the --select object: --test-add-object <file>[,<from>[,<x>,<up>,<z> metres]], --test-export-object
+// <dir>, --test-remove-part <n> - run instead of the test edit by --test-edit-save)
+std::string g_test_add_object, g_test_export_dir;
+int g_test_remove_part = -1;
+std::string g_test_picture;  // (test aid --test-picture: put on the --select object as "Use a picture..." does)
 
 // camera
 V3 g_target{0, -12, 0};
@@ -299,10 +312,12 @@ ImVec2 g_vp_min, g_vp_size;
 enum class Tool { kSelect, kMove, kRotate, kScale };
 Tool g_tool = Tool::kMove;
 bool g_snap = true;
+float g_turn_snap = kPi / 12;  // (radians; 0: free)
+constexpr float kMaxMove = 10000.0f;  // (game units, 10 cm: 1 km - a sanity bound, not the game's)
 // a drag in the viewport
 int g_drag_axis = -1;  // -1 none, 0..2 axis, 3 plane
 V3 g_drag_start_pos;
-float g_drag_start_yaw = 0, g_drag_start_scale = 1;
+float g_drag_start_yaw = 0, g_drag_start_scale = 1, g_drag_start_pitch = 0, g_drag_start_roll = 0;
 V3 g_drag_hit;
 ImVec2 g_drag_mouse;
 
@@ -364,16 +379,24 @@ float4 ps(VO i) : SV_Target {
   float4 tx = t.Sample(s, i.uv);
   if (flat.w < -0.5) return float4(tx.rgb * tx.a * i.c.rgb * tint.rgb, 0);  // (glows and beams, added at full strength as the game - 0.6 left them faint)
   if (mode.x > 1.5) return float4(tint.rgb * 0.55, 1 - tx.a);  // (an LED mask: its holes are lit dots, blended)
-  if (tx.a < 0.25 && mode.y < 0.5) discard;  // (mode.y: an opaque model - the game's alpha there isn't see-through)
-  if (mode.x > 0.5) return float4(tx.rgb * tint.rgb, 1);  // (self-lit: a screen)
-  float3 n = normalize(i.n + 1e-5);
-  if (lon.x > 0.5) {  // (the arena's own light set: fills half-lit from behind, directional ones as they face)
-    float3 l = lcol[0].rgb * (0.5 + 0.5 * dot(n, ldir[0].xyz)) + lcol[1].rgb * (0.5 + 0.5 * dot(n, ldir[1].xyz));
-    [unroll] for (int k = 2; k < 6; ++k) l += lcol[k].rgb * max(0, dot(n, ldir[k].xyz));
-    return float4(tx.rgb * i.c.rgb * tint.rgb * l * lon.y, 1);
+  // mode.z: the model's see-through kind (its C351 flags): 0 opaque or cut-out, 1 blended (s k i j), 2 added (a o)
+  if (mode.z < 0.5) { if (tx.a < 0.25 && mode.y < 0.5) discard; }  // (mode.y: opaque - the game's alpha there isn't see-through)
+  else if (tx.a < 0.004) discard;
+  float3 c;
+  if (mode.x > 0.5) c = tx.rgb * tint.rgb;  // (self-lit: a screen)
+  else {
+    float3 n = normalize(i.n + 1e-5);
+    if (lon.x > 0.5) {  // (the arena's own light set: fills half-lit from behind, directional ones as they face)
+      float3 l = lcol[0].rgb * (0.5 + 0.5 * dot(n, ldir[0].xyz)) + lcol[1].rgb * (0.5 + 0.5 * dot(n, ldir[1].xyz));
+      [unroll] for (int k = 2; k < 6; ++k) l += lcol[k].rgb * max(0, dot(n, ldir[k].xyz));
+      c = tx.rgb * i.c.rgb * tint.rgb * l * lon.y;
+    } else {
+      float d = abs(dot(n, normalize(float3(0.35, -1.0, 0.25))));
+      c = tx.rgb * i.c.rgb * tint.rgb * (0.55 + 0.45 * d);
+    }
   }
-  float d = abs(dot(n, normalize(float3(0.35, -1.0, 0.25))));
-  return float4(tx.rgb * i.c.rgb * tint.rgb * (0.55 + 0.45 * d), 1);
+  if (mode.z > 1.5) return float4(c * tx.a, 0);
+  return float4(c, mode.z > 0.5 ? tx.a : 1);
 }
 )";
 
@@ -576,7 +599,6 @@ void ForgetGpu(int model = -1) {
   }
 }
 
-int DiffuseSlot(const Mesh& s);
 std::string ObjTexture(const Obj& o) {
   if (o.meshes.empty() || !g_arena) return "";
   const Model& m = g_arena->models[o.model].model;
@@ -605,12 +627,6 @@ void ToggleSelect(int i) {
   auto it = std::find(g_multi.begin(), g_multi.end(), i);
   if (it == g_multi.end()) g_multi.push_back(i);
   else g_multi.erase(it);
-}
-
-int DiffuseSlot(const Mesh& s) {
-  for (const auto& p : s.params)
-    if (p.type == 0x0f && p.name == "texDiffuse" && p.value.size() >= 4) return int(Be32(p.value.data()));
-  return -1;
 }
 
 GpuMesh* Gpu(int model, int mesh) {
@@ -665,6 +681,32 @@ void SetCb(const M4& world, const float tint[3], const float* flat = nullptr) {
   g_ctx->Unmap(g_cb, 0);
 }
 
+// A field's width that leaves room for `label` (the widest of a group, so the fields line up) at any font size.
+float LabelRoom(const char* label) {
+  return ImGui::CalcTextSize(label).x + ImGui::GetStyle().ItemInnerSpacing.x + 2;
+}
+
+int AlphaKind(int model) {
+  if (!g_arena || model < 0) return 1;
+  if (!g_game_alpha) return 1;
+  if (g_cut_arena != g_arena) {
+    g_cut_arena = g_arena;
+    g_cut.assign(g_arena->models.size(), 0);
+    const auto flags = ModelFlagsOf(*g_arena);
+    for (size_t i = 0; i < g_arena->models.size(); ++i) {
+      const auto f = flags.find(g_arena->models[i].id);
+      if (f == flags.end()) {
+        g_cut[i] = 1;  // (no line - an added object, a ring part: as before)
+        continue;
+      }
+      for (const char* w : {" c "}) if (f->second.find(w) != std::string::npos) g_cut[i] = 1;
+      for (const char* w : {" s ", " k ", " i ", " j "}) if (f->second.find(w) != std::string::npos) g_cut[i] = 2;
+      for (const char* w : {" a ", " o "}) if (f->second.find(w) != std::string::npos) g_cut[i] = 3;
+    }
+  }
+  return size_t(model) < g_cut.size() ? g_cut[size_t(model)] : 1;
+}
+
 void DrawMesh(int model, int mesh) {
   GpuMesh* g = Gpu(model, mesh);
   if (!g->vb || !g->count) return;
@@ -673,29 +715,18 @@ void DrawMesh(int model, int mesh) {
   g_ctx->IASetIndexBuffer(g->ib, DXGI_FORMAT_R16_UINT, 0);
   ID3D11ShaderResourceView* srv = TextureFor(g->tex);
   g_ctx->PSSetShaderResources(0, 1, &srv);
-  int mode = g_led_mask.count(g->tex) ? 2 : g_self_lit.count(g->tex) ? 1 : 0;
-  if (g_game_alpha && g_arena) {
-    if (g_cut_arena != g_arena) {  // (2011's transparency flags, docs: s a k c i j o as words of a model's C351 line)
-      g_cut_arena = g_arena;
-      g_cut.assign(g_arena->models.size(), 0);
-      const auto flags = ModelFlagsOf(*g_arena);
-      for (size_t i = 0; i < g_arena->models.size(); ++i) {
-        const auto f = flags.find(g_arena->models[i].id);
-        if (f == flags.end()) {
-          g_cut[i] = 1;  // (no line: as before)
-          continue;
-        }
-        for (const char* w : {" s ", " a ", " k ", " c ", " i ", " j ", " o "})
-          if (f->second.find(w) != std::string::npos) g_cut[i] = 1;
-      }
-    }
-    if (model >= 0 && size_t(model) < g_cut.size() && !g_cut[size_t(model)] && mode == 0) mode = 3;
-  }
+  const int lit = g_led_mask.count(g->tex) ? 2 : g_self_lit.count(g->tex) ? 1 : 0;
+  const int kind = lit == 2 ? 1 : AlphaKind(model);  // (0 opaque, 1 cut out, 2 blended, 3 added)
+  const int mode = lit * 4 + kind;
   if (mode != g_cb_mode_now && g_cb_mode && !g_glow_pass) {
-    if (mode == 2 || g_cb_mode_now == 2) g_ctx->OMSetBlendState(mode == 2 ? g_led_blend : nullptr, nullptr, 0xFFFFFFFF);
+    const auto blend = [](int m) -> ID3D11BlendState* {
+      return m / 4 == 2 || m % 4 == 2 ? g_led_blend : m % 4 == 3 ? g_add : nullptr;
+    };
+    if (!g_keep_blend && (g_cb_mode_now < 0 || blend(mode) != blend(g_cb_mode_now)))
+      g_ctx->OMSetBlendState(blend(mode), nullptr, 0xFFFFFFFF);
     D3D11_MAPPED_SUBRESOURCE ms;
     if (SUCCEEDED(g_ctx->Map(g_cb_mode, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
-      const float v[4] = {mode == 3 ? 0.0f : float(mode), mode == 3 ? 1.0f : 0.0f, 0, 0};
+      const float v[4] = {float(lit), kind == 1 ? 0.0f : 1.0f, kind == 2 ? 1.0f : kind == 3 ? 2.0f : 0.0f, 0};
       std::memcpy(ms.pData, v, sizeof v);
       g_ctx->Unmap(g_cb_mode, 0);
       g_cb_mode_now = mode;
@@ -728,7 +759,14 @@ void ComputePivot(Obj& o) {
 // The edit transform into the model's vertices (and strips, for hidden).
 void ApplyObj(Obj& o) {
   Model& m = g_arena->models[o.model].model;
-  const float c = std::cos(o.yaw), s = std::sin(o.yaw);
+  // R = yaw (about the up axis) * pitch (about x) * roll (about z): game axes (y down)
+  const float cy = std::cos(o.yaw), sy = std::sin(o.yaw), cp = std::cos(o.pitch), sp = std::sin(o.pitch),
+              cr = std::cos(o.roll), sr = std::sin(o.roll);
+  auto rot = [&](float x, float y, float z, float* out) {
+    const float x1 = x * cr - y * sr, y1 = x * sr + y * cr;
+    const float y2 = y1 * cp - z * sp, z2 = y1 * sp + z * cp;
+    out[0] = x1 * cy + z2 * sy, out[1] = y2, out[2] = -x1 * sy + z2 * cy;
+  };
   for (size_t k = 0; k < o.meshes.size(); ++k) {
     Mesh& mesh = m.meshes[o.meshes[k]];
     if (o.movable) {
@@ -736,14 +774,13 @@ void ApplyObj(Obj& o) {
       mesh.verts.resize(base.size());
       for (size_t i = 0; i < base.size(); ++i) {
         Vertex v = base[i];
-        const float dx = (v.pos[0] - o.pivot.x) * o.scale, dy = (v.pos[1] - o.pivot.y) * o.scale,
-                    dz = (v.pos[2] - o.pivot.z) * o.scale;
-        v.pos[0] = o.pivot.x + o.pos.x + dx * c + dz * s;
-        v.pos[1] = o.pivot.y + o.pos.y + dy;
-        v.pos[2] = o.pivot.z + o.pos.z - dx * s + dz * c;
-        const float nx = v.normal[0], nz = v.normal[2];
-        v.normal[0] = nx * c + nz * s;
-        v.normal[2] = -nx * s + nz * c;
+        float d[3], n[3];
+        rot((v.pos[0] - o.pivot.x) * o.scale, (v.pos[1] - o.pivot.y) * o.scale, (v.pos[2] - o.pivot.z) * o.scale, d);
+        v.pos[0] = o.pivot.x + o.pos.x + d[0];
+        v.pos[1] = o.pivot.y + o.pos.y + d[1];
+        v.pos[2] = o.pivot.z + o.pos.z + d[2];
+        rot(v.normal[0], v.normal[1], v.normal[2], n);
+        v.normal[0] = n[0], v.normal[1] = n[1], v.normal[2] = n[2];
         mesh.verts[i] = v;
       }
       // bounding sphere
@@ -768,6 +805,7 @@ void ApplyObj(Obj& o) {
   g_arena->models[o.model].changed = true;
   ForgetGpu(o.model);
   Edited();
+  if (o.movable) FitNodeSpheres(m);  // (the game culls by the node spheres: svrfmt/arena.h)
 }
 
 Role RoleOf(uint32_t id) {
@@ -1070,7 +1108,7 @@ void BuildObjects() {
 Snapshot Snap() {
   Snapshot s;
   for (const auto& o : g_objs) {
-    s.xf.push_back({o.pos.x, o.pos.y, o.pos.z, o.yaw, o.scale, o.hidden ? 1.f : 0.f});
+    s.xf.push_back({o.pos.x, o.pos.y, o.pos.z, o.yaw, o.scale, o.hidden ? 1.f : 0.f, o.pitch, o.roll});
     s.tex.push_back(ObjTexture(o));
   }
   return s;
@@ -1088,9 +1126,9 @@ void Restore(const Snapshot& s) {
     const auto& x = s.xf[i];
     if (i < s.tex.size() && !s.tex[i].empty() && s.tex[i] != ObjTexture(o)) SetObjTexture(o, s.tex[i]);
     if (o.pos.x == x[0] && o.pos.y == x[1] && o.pos.z == x[2] && o.yaw == x[3] && o.scale == x[4] &&
-        o.hidden == (x[5] > 0.5f))
+        o.hidden == (x[5] > 0.5f) && o.pitch == x[6] && o.roll == x[7])
       continue;
-    o.pos = {x[0], x[1], x[2]}, o.yaw = x[3], o.scale = x[4], o.hidden = x[5] > 0.5f;
+    o.pos = {x[0], x[1], x[2]}, o.yaw = x[3], o.scale = x[4], o.hidden = x[5] > 0.5f, o.pitch = x[6], o.roll = x[7];
     ApplyObj(o);
   }
 }
@@ -1111,16 +1149,12 @@ void Redo() {
   Restore(s);
 }
 
-// Ringside / entrance parts: the game's moves aim at fixed spots near them.
+// Anywhere, any way round (the edit is baked into the vertices; save grows the visibility tree's boxes to
+// match - svrfmt GrowVisibility). Ringside / entrance parts too: the game's collision and the spots its moves
+// aim at stay where they were (the inspector says so). Only sanity bounds remain.
 void Constrain(Obj& o) {
-  if (o.zone == Zone::kRingside || o.zone == Zone::kEntrance) {
-    const float lim = 5.0f;  // 50 cm
-    o.pos.x = std::clamp(o.pos.x, -lim, lim);
-    o.pos.y = std::clamp(o.pos.y, -lim, lim);
-    o.pos.z = std::clamp(o.pos.z, -lim, lim);
-    o.scale = std::clamp(o.scale, 0.8f, 1.25f);
-  }
-  o.scale = std::clamp(o.scale, 0.05f, 20.0f);
+  for (float* v : {&o.pos.x, &o.pos.y, &o.pos.z}) *v = std::clamp(*v, -kMaxMove, kMaxMove);
+  o.scale = std::clamp(o.scale, 0.01f, 100.0f);
 }
 
 int HostModel() {
@@ -1182,6 +1216,7 @@ void Duplicate(int i) {
   o.pivot = src.pivot;
   o.pos = src.pos + V3{6, 0, 6};
   o.yaw = src.yaw;
+  o.pitch = src.pitch, o.roll = src.roll;
   o.scale = src.scale;
   ApplyObj(o);
   g_sel = n;
@@ -1342,6 +1377,112 @@ void AddBox(float w, float h, float d) {
   Log("Added a box. Pick its texture on the right.");
 }
 
+// An OBJ / FBX from any 3D program (svrfmt/model_objects.h: metres or centimetres, Y up, counter-clockwise front
+// faces, textures from its materials) -> one added object standing on the floor at the view centre. from 2: a file
+// Export to Blender wrote (game units, the game's winding) - the round-trip importer, as before.
+int AddFileObject(const std::string& path, int from) {
+  const std::string label = U8(fs::u8path(path).stem());
+  if (from == 2) return ImportObject(path, label);
+  const int host = HostModel();
+  if (host < 0) { Log("This arena has no model to add objects to."); return -1; }
+  AddOptions opt;
+  opt.obj_unit_meters = from == 1 ? 0.01f : 1.0f;
+  AddReport rep;
+  const bool ok = AddObjectFile(*g_arena, host, path, opt, rep);
+  for (const auto& w : rep.warnings) Log("  " + w);
+  for (const auto& e : rep.errors) Log("  error: " + e);
+  if (!ok) {
+    if (rep.first_mesh >= 0) {  // (added, then refused - too much detail: taken out again)
+      auto& ms = g_arena->models[host].model.meshes;
+      ms.erase(ms.begin() + rep.first_mesh, ms.end());
+      ForgetGpu(host);
+    }
+    return -1;
+  }
+  const int i = AdoptNewMeshes(host, size_t(rep.first_mesh), label);
+  if (i < 0) return -1;
+  Obj& o = g_objs[i];
+  const float floor = g_area_lo >= 0 ? g_target.y : 0.0f;  // (y down: the floor at 0; an area's: below the view)
+  o.pos = {g_target.x - o.pivot.x, floor - o.pivot.y, g_target.z - o.pivot.z};
+  ApplyObj(o);
+  Log("Added " + label + ": " + std::to_string(rep.meshes_added) + " part(s), " + std::to_string(rep.textures_added) +
+      " new texture(s).");
+  return i;
+}
+
+// A folder (the system's folder picker), "" if none.
+std::string PickFolderU8(const wchar_t* title) {
+  std::string out;
+  IFileOpenDialog* dlg = nullptr;
+  if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+    DWORD opt = 0;
+    dlg->GetOptions(&opt);
+    dlg->SetOptions(opt | FOS_PICKFOLDERS);
+    dlg->SetTitle(title);
+    IShellItem* item = nullptr;
+    PWSTR path = nullptr;
+    if (SUCCEEDED(dlg->Show(nullptr)) && SUCCEEDED(dlg->GetResult(&item)) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+      out = U8(fs::path(path));
+      CoTaskMemFree(path);
+    }
+    if (item) item->Release();
+    dlg->Release();
+  }
+  return out;
+}
+
+// The object as it stands now (moved, turned, scaled) -> <dir>/<label>.obj + .mtl + its textures as PNG.
+void ExportObject(const Obj& o, const std::string& dir) {
+  std::string path, err;
+  const std::string name = o.label.substr(0, o.label.find("  ("));  // (not the "  (id)" the list shows)
+  if (ExportObjectObj(*g_arena, o.model, o.meshes, dir, &path, &err, name)) Log("Exported " + o.label + " to " + path + ".");
+  else Log("Could not export " + o.label + ": " + err);
+}
+
+// One part (mesh) of an object taken out: emptied in the arena as the game expects (svrfmt/model_objects.h); the
+// object's own copies follow, so later moves keep it out. Not on the undo list.
+bool RemovePart(Obj& o, size_t k) {
+  if (k >= o.meshes.size()) return false;
+  std::string err;
+  if (!RemoveObject(*g_arena, o.model, o.meshes[k], &err)) {
+    Log("Could not remove that part: " + err);
+    return false;
+  }
+  const Mesh& m = g_arena->models[o.model].model.meshes[size_t(o.meshes[k])];
+  o.base[k] = m.verts;
+  o.strips[k] = m.strips;
+  ApplyObj(o);
+  Log("Removed part " + std::to_string(k + 1) + " of " + o.label + ".");
+  return true;
+}
+
+void PartsPanel(Obj& o) {
+  if (o.meshes.size() < 2) return;
+  const std::string head = "Parts (" + std::to_string(o.meshes.size()) + ")";
+  if (!ImGui::CollapsingHeader(head.c_str())) return;
+  static int pick = -1, pick_of = -1;
+  if (pick_of != g_sel) pick = -1, pick_of = g_sel;
+  const Model& m = g_arena->models[o.model].model;
+  const float scale = ImGui::GetFontSize() / 17.0f;
+  ImGui::BeginChild("parts", ImVec2(0, std::min(160.0f, 22.0f * float(o.meshes.size()) + 8) * scale), true);
+  for (size_t k = 0; k < o.meshes.size(); ++k) {
+    const Mesh& s = m.meshes[size_t(o.meshes[k])];
+    size_t tris = 0;
+    for (const auto& st : s.strips) tris += StripToTriangles(st.indices).size();
+    const int slot = DiffuseSlot(s);
+    const std::string tex = slot >= 0 && slot < int(m.textures.size()) ? m.textures[slot] : "-";
+    char b[128];
+    std::snprintf(b, sizeof b, "%zu  %s  %zu triangles%s##part%zu", k + 1, tex.c_str(), tris, tris ? "" : " (removed)", k);
+    if (ImGui::Selectable(b, pick == int(k))) pick = int(k);
+  }
+  ImGui::EndChild();
+  ImGui::BeginDisabled(pick < 0);
+  if (ImGui::Button("Remove part") && RemovePart(o, size_t(pick))) pick = -1;
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  ImGui::TextDisabled("(can't be undone)");
+}
+
 // ---------------------------------------------------------------- view
 
 V3 Eye() {
@@ -1487,7 +1628,7 @@ void RenderScene() {
       case Role::kNotDrawn:
         break;
       case Role::kNormal:
-        if (o.glow) break;  // (after the solid ones)
+        if (o.glow || AlphaKind(o.model) >= 2) break;  // (after the solid ones)
         SetCb(ident, light);
         for (int k : o.meshes) DrawMesh(o.model, k);
         if (o.mirrored) {  // (the game's mirrored copy)
@@ -1550,8 +1691,26 @@ void RenderScene() {
       }
     }
   }
+  // the see-through models (C351 s k i j: blended, a o: added), after the solid ones, depth read only
+  g_ctx->OMSetDepthStencilState(g_depth_ro, 0);
+  for (const Obj& o : g_objs) {
+    if (o.hidden || o.effect || o.outside || (o.ceiling && !g_show_ceilings) || o.glow || o.role != Role::kNormal ||
+        AlphaKind(o.model) < 2)
+      continue;
+    SetStageLight(o.light_set);
+    SetCb(ident, light);
+    for (int k : o.meshes) DrawMesh(o.model, k);
+    if (o.mirrored) {
+      M4 mirror;
+      mirror.m[0] = -1;
+      SetCb(mirror, light);
+      for (int k : o.meshes) DrawMesh(o.model, k);
+    }
+  }
+  g_ctx->OMSetDepthStencilState(g_depth, 0);
   // light glows and beams, added on top
   g_ctx->OMSetBlendState(g_add, nullptr, 0xFFFFFFFF);
+  g_keep_blend = true;
   g_ctx->OMSetDepthStencilState(g_depth_ro, 0);
   g_glow_pass = true;
   SetCb(ident, light);
@@ -1578,7 +1737,9 @@ void RenderScene() {
       if (o.glow && o.mirrored && !o.hidden && !o.effect && !o.outside && o.role == Role::kNormal)
         for (int k : o.meshes) DrawMesh(o.model, k);
   }
+  g_keep_blend = false;
   g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+  g_cb_mode_now = -1;
   g_ctx->OMSetDepthStencilState(g_depth, 0);
   // the selection, as a wireframe on top
   g_ctx->RSSetState(g_wire);
@@ -1750,9 +1911,9 @@ void RingKitPanel() {
   ImGui::SameLine();
   changed |= ImGui::Checkbox("Corner pads", &g_ring.pads);
   float base = RopeBase() * 10, gap = RopeGap() * 10;  // cm
-  ImGui::SetNextItemWidth(-90);
+  ImGui::SetNextItemWidth(-LabelRoom("Low rope (cm)"));
   if (ImGui::SliderFloat("Low rope (cm)", &base, 15, 70, "%.0f")) g_ring.rope_base = base / 10, changed = true;
-  ImGui::SetNextItemWidth(-90);
+  ImGui::SetNextItemWidth(-LabelRoom("Low rope (cm)"));
   if (ImGui::SliderFloat("Rope gap (cm)", &gap, 25, 55, "%.0f")) g_ring.rope_gap = gap / 10, changed = true;
   if (RopeBase() + 2 * RopeGap() > 12.5f)
     ImGui::TextColored(ImVec4(1, 0.7f, 0.2f, 1), "The top rope would be above the posts.");
@@ -1788,6 +1949,28 @@ void LightingPanel() {
   if (ImGui::SliderFloat("Strength", &g_light.strength, 0.3f, 1.6f, "%.2f")) p = int(std::size(kPresets)) - 1, Edited();
   ImGui::TextDisabled("Every arena material's colour (not the crowd).");
   if (ImGui::Checkbox("Crowd in the seats", &g_light.crowd)) Edited();
+  ImGui::SeparatorText("In the game");
+  {
+    static const char* const kMatch[] = {"The game's (match lighting)", "The entrance's lighting",
+                                         "The entrance's, with its coloured spotlight"};
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##match_light", &g_light.match_light, kMatch, 3)) Edited();
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("How the wrestlers and the ring are lit during the match. The entrance's: as on the stage\n"
+                        "and ramp (brighter in arenas whose match lighting is dark).");
+    if (ImGui::SliderFloat("Game light", &g_light.game_scale, 0.5f, 2.0f, "x%.2f")) Edited();
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("The arena's lights in the game - wrestlers, ring and hall - times this (and the player's\n"
+                        "GRAPHICS -> ARENA BRIGHTNESS). Not shown in this view.");
+    static const char* const kTron[] = {"Titantron: the arena's screens", "Titantron: the live camera"};
+    int tron = g_light.tron_live ? 1 : 0;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##titantron", &tron, kTron, 2)) g_light.tron_live = tron == 1, Edited();
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("What the video screens (models 800-899) show during the match. The arena's own screens:\n"
+                        "the screen art it was made with. The live camera: the match itself, as in the game's own\n"
+                        "arenas. The entrance video plays on them either way.");
+  }
   ImGui::Checkbox("The arena's own stage lights", &g_stage_lights);  // (the view only: the game always uses them)
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("The view lit as the game lights this arena: each object by its own light set, and the\n"
@@ -1823,23 +2006,34 @@ void Inspector() {
   } else if (!o.movable) {
     ImGui::TextWrapped("This object is rigged (moves with bones): it can be hidden or retextured, not moved.");
   } else {
-    if (o.zone == Zone::kRingside || o.zone == Zone::kEntrance)
-      ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "Wrestlers' moves aim at this: moves are limited to 50 cm.");
+    if (o.zone == Zone::kRingside || o.zone == Zone::kEntrance) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.75f, 0.3f, 1));
+      ImGui::TextWrapped("Only its look moves; wrestlers still use the old spot.");
+      ImGui::PopStyleColor();
+    }
+    if (o.mirrored) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+      ImGui::TextWrapped("The game draws it twice, mirrored across the middle: its mirror image moves too.");
+      ImGui::PopStyleColor();
+    }
+    // (typed or dragged: Ctrl+click or double-click a field to type a value; no range but a 1 km sanity bound)
     float p[3] = {o.pos.x / 10, -o.pos.y / 10, o.pos.z / 10};  // metres, up positive
     bool ch = false;
-    ImGui::SetNextItemWidth(-60);
-    ch |= ImGui::DragFloat3("Move (m)", p, 0.02f, -200, 200, "%.2f");
+    ImGui::SetNextItemWidth(-LabelRoom("Turn (deg)"));
+    ch |= ImGui::DragFloat3("Move (m)", p, 0.01f, -kMaxMove / 10, kMaxMove / 10, "%.3f");
     if (ImGui::IsItemActivated()) PushUndo();
-    float deg = o.yaw * 180 / kPi;
-    ImGui::SetNextItemWidth(-60);
-    ch |= ImGui::DragFloat("Turn (deg)", &deg, 0.5f, -360, 360, "%.1f");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Right, up, forward in metres. Drag, or Ctrl+click to type.");
+    float deg[3] = {o.yaw * 180 / kPi, o.pitch * 180 / kPi, o.roll * 180 / kPi};
+    ImGui::SetNextItemWidth(-LabelRoom("Turn (deg)"));
+    ch |= ImGui::DragFloat3("Turn (deg)", deg, 0.25f, 0, 0, "%.2f");
     if (ImGui::IsItemActivated()) PushUndo();
-    ImGui::SetNextItemWidth(-60);
-    ch |= ImGui::DragFloat("Scale", &o.scale, 0.005f, 0.05f, 20, "%.3f");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turn (about the up axis), tilt forward, tilt sideways - any angle.");
+    ImGui::SetNextItemWidth(-LabelRoom("Turn (deg)"));
+    ch |= ImGui::DragFloat("Scale", &o.scale, 0.002f, 0.01f, 100, "%.3f");
     if (ImGui::IsItemActivated()) PushUndo();
     if (ch) {
       o.pos = {p[0] * 10, -p[1] * 10, p[2] * 10};
-      o.yaw = deg * kPi / 180;
+      o.yaw = deg[0] * kPi / 180, o.pitch = deg[1] * kPi / 180, o.roll = deg[2] * kPi / 180;
       Constrain(o);
       ApplyObj(o);
     }
@@ -1847,7 +2041,7 @@ void Inspector() {
     ImGui::SameLine();
     if (ImGui::Button("Reset")) {
       PushUndo();
-      o.pos = {}, o.yaw = 0, o.scale = 1;
+      o.pos = {}, o.yaw = 0, o.pitch = 0, o.roll = 0, o.scale = 1;
       ApplyObj(o);
     }
   }
@@ -1863,29 +2057,42 @@ void Inspector() {
       return;
     }
   }
+  ImGui::SameLine();
+  if (ImGui::Button("Export OBJ...")) {
+    const std::string dir = PickFolderU8(L"A folder for the object (.obj, .mtl and its textures)");
+    if (!dir.empty()) ExportObject(o, dir);
+  }
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("This object as it stands (moved, turned, scaled) as an OBJ with its textures: metres, Y up - "
+                      "for Blender or any 3D program, or to add it to another arena.");
+  PartsPanel(o);
   // texture
   if (!o.meshes.empty()) {
     const Model& m = am.model;
     const int slot = DiffuseSlot(m.meshes[o.meshes[0]]);
     const std::string cur = slot >= 0 && slot < int(m.textures.size()) ? m.textures[slot] : "";
-    ImGui::SetNextItemWidth(-60);
+    ImGui::SetNextItemWidth(-LabelRoom("Texture"));
     if (ImGui::BeginCombo("Texture", cur.c_str())) {
       for (const auto& b : g_arena->bundles)
         for (const auto& t : b.textures)
           if (ImGui::Selectable(t.name.c_str(), t.name == cur)) PushUndo(), SetObjTexture(o, t.name);
       ImGui::EndCombo();
     }
-    if (ImGui::Button("Use a picture...")) {
+    const bool test = !g_test_picture.empty();  // (test aid --test-picture: as if picked with this button)
+    if (ImGui::Button("Use a picture...") || test) {
       wchar_t file[MAX_PATH] = L"";
       OPENFILENAMEW ofn = {sizeof ofn};
       ofn.lpstrFilter = L"Pictures\0*.png;*.jpg;*.jpeg;*.tga;*.bmp\0";
       ofn.lpstrFile = file;
       ofn.nMaxFile = MAX_PATH;
       ofn.Flags = OFN_FILEMUSTEXIST;
-      if (GetOpenFileNameW(&ofn)) {
-        const std::string path = U8(fs::path(file));
+      std::string picked;
+      if (test) picked = g_test_picture, g_test_picture.clear(), Log("test: a picture on " + o.label);
+      else if (GetOpenFileNameW(&ofn)) picked = U8(fs::path(file));
+      if (!picked.empty()) {
+        const std::string path = picked;
         const std::string name = AddPicture(path);
-        if (name.empty()) Log("That picture could not be read.");
+        if (name.empty()) Log("That picture could not be read (PNG, JPG, BMP or TGA): nothing changed.");
         else PushUndo(), SetObjTexture(o, name), Log("New texture " + name + " on " + o.label + ".");
       }
     }
@@ -2027,7 +2234,7 @@ void RetextureFromFolder(const std::string& folder) {
 
 void AddPanel() {
   static float box[3] = {1.0f, 1.0f, 1.0f};  // metres
-  ImGui::SetNextItemWidth(-90);
+  ImGui::SetNextItemWidth(-LabelRoom("Box (m)"));
   ImGui::DragFloat3("Box (m)", box, 0.05f, 0.1f, 50, "%.2f");
   if (ImGui::Button("Add box at the view centre")) AddBox(box[0] * 10, box[1] * 10, box[2] * 10);
   if (ImGui::Button("Pictures from a folder...")) {
@@ -2050,6 +2257,12 @@ void AddPanel() {
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Every picture in the folder whose name matches one of the arena's textures replaces it (fitted to "
                       "the same size and format): a whole retexture at once, e.g. textures exported from another game.");
+  static const char* kFrom[] = {"Any 3D program (metres)", "Any 3D program (centimetres)", "Export to Blender (10 cm)"};
+  ImGui::SetNextItemWidth(-LabelRoom("File from"));
+  ImGui::Combo("File from", &g_file_from, kFrom, 3);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Blender, 3ds Max, SketchUp...: metres (or centimetres), Y up, textures from the file's "
+                      "materials. Export to Blender: a file this editor wrote, in its own units.");
   if (ImGui::Button("Add object from a file (.obj / .fbx)...")) {
     wchar_t file[MAX_PATH] = L"";
     OPENFILENAMEW ofn = {sizeof ofn};
@@ -2058,15 +2271,11 @@ void AddPanel() {
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST;
     if (GetOpenFileNameW(&ofn)) {
-      const fs::path p(file);
-      const int i = ImportObject(U8(p), U8(p.stem()));
-      if (i >= 0) {
-        g_sel = i;
-        Log("Added " + U8(p.filename()) + " (textures: a textures folder beside it, or pick one).");
-      }
+      const int i = AddFileObject(U8(fs::path(file)), g_file_from);
+      if (i >= 0) g_sel = i;
     }
   }
-  ImGui::TextDisabled("Files in game units (10 cm), as Export to Blender writes.");
+  ImGui::TextDisabled("Stands on the floor at the view centre. Textures: the file's materials (an OBJ's .mtl).");
 }
 
 void BudgetPanel() {
@@ -2110,7 +2319,7 @@ void ViewportInput(bool hovered) {
   Obj* sel = g_sel >= 0 && g_sel < int(g_objs.size()) ? &g_objs[g_sel] : nullptr;
   const bool can_edit = !g_readonly && sel && sel->movable && g_tool != Tool::kSelect;
   // the start of every selected object (a drag moves them together)
-  static std::vector<std::pair<int, std::array<float, 5>>> drag_starts;
+  static std::vector<std::pair<int, std::array<float, 7>>> drag_starts;
   if (g_grid) {  // a 1 m grid on the floor round the view's target, 5 m lines brighter
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float y = g_area_lo >= 0 ? g_target.y : kMatY + 10.0f;  // (the arena floor is a metre under the mat)
@@ -2192,6 +2401,7 @@ void ViewportInput(bool hovered) {
       PushUndo();
       g_drag_start_pos = sel->pos;
       g_drag_start_yaw = sel->yaw;
+      g_drag_start_pitch = sel->pitch, g_drag_start_roll = sel->roll;
       g_drag_start_scale = sel->scale;
       g_drag_mouse = m;
     }
@@ -2200,6 +2410,7 @@ void ViewportInput(bool hovered) {
       PushUndo();
       g_drag_axis = 4;  // rotate / scale by horizontal drag
       g_drag_start_yaw = sel->yaw;
+      g_drag_start_pitch = sel->pitch, g_drag_start_roll = sel->roll;
       g_drag_start_scale = sel->scale;
       g_drag_mouse = m;
     }
@@ -2207,7 +2418,7 @@ void ViewportInput(bool hovered) {
       drag_starts.clear();
       for (int i : Selection()) {
         const Obj& o = g_objs[i];
-        if (o.movable) drag_starts.push_back({i, {o.pos.x, o.pos.y, o.pos.z, o.yaw, o.scale}});
+        if (o.movable) drag_starts.push_back({i, {o.pos.x, o.pos.y, o.pos.z, o.yaw, o.scale, o.pitch, o.roll}});
       }
     }
   }
@@ -2241,9 +2452,12 @@ void ViewportInput(bool hovered) {
     } else if (g_drag_axis == 4) {
       const float dx = m.x - g_drag_mouse.x;
       if (g_tool == Tool::kRotate) {
-        float yaw = g_drag_start_yaw + ScreenX() * dx * 0.01f;
-        if (g_snap) yaw = std::round(yaw / (kPi / 12)) * (kPi / 12);
-        sel->yaw = yaw;
+        // (the turn by default; Shift: tilt forward, Alt: tilt sideways)
+        const float start = io.KeyShift ? g_drag_start_pitch : io.KeyAlt ? g_drag_start_roll : g_drag_start_yaw;
+        float a = start + ScreenX() * dx * 0.01f;
+        if (g_snap && g_turn_snap > 0) a = std::round(a / g_turn_snap) * g_turn_snap;
+        sel->yaw = g_drag_start_yaw, sel->pitch = g_drag_start_pitch, sel->roll = g_drag_start_roll;
+        (io.KeyShift ? sel->pitch : io.KeyAlt ? sel->roll : sel->yaw) = a;
       } else if (g_tool == Tool::kScale) {
         sel->scale = g_drag_start_scale * std::exp(dx * 0.005f);
       }
@@ -2253,11 +2467,13 @@ void ViewportInput(bool hovered) {
     // the others follow: the same move, the same turn, the same scale factor
     const V3 dpos = sel->pos - g_drag_start_pos;
     const float dyaw = sel->yaw - g_drag_start_yaw, fscale = g_drag_start_scale > 0 ? sel->scale / g_drag_start_scale : 1;
+    const float dpitch = sel->pitch - g_drag_start_pitch, droll = sel->roll - g_drag_start_roll;
     for (const auto& [i, st] : drag_starts) {
       if (i == g_sel || i < 0 || i >= int(g_objs.size())) continue;
       Obj& o = g_objs[i];
       o.pos = V3{st[0], st[1], st[2]} + dpos;
       o.yaw = st[3] + dyaw;
+      o.pitch = st[5] + dpitch, o.roll = st[6] + droll;
       o.scale = st[4] * fscale;
       Constrain(o);
       ApplyObj(o);
@@ -2378,7 +2594,8 @@ void SetArena(Arena* arena, const std::string& title) {
   if (g_test_view >= 0) ViewPreset(g_test_view);
   if (!g_test_select.empty())
     for (size_t i = 0; i < g_objs.size(); ++i)
-      if (g_objs[i].label.rfind(g_test_select, 0) == 0) {
+      if (g_test_select[0] == '#' ? g_arena->models[g_objs[i].model].id == std::atoi(g_test_select.c_str() + 1)  // (#<model id>)
+                                  : g_objs[i].label.rfind(g_test_select, 0) == 0) {
         g_sel = int(i);
         g_target = g_objs[i].pivot;
         break;
@@ -2554,7 +2771,7 @@ void SetTextureOverride(const std::string& name, ID3D11ShaderResourceView* srv) 
   else g_tex_override.erase(name);
 }
 void SetViewExtra(ViewExtraFn fn) { g_view_extra = std::move(fn); }
-void SetGameTransparency(bool on) { g_game_alpha = on, g_cut_arena = nullptr; }
+void SetGameTransparency(bool on) { g_game_alpha = on && !std::getenv("SVR2011_MM_NO_GAME_ALPHA"), g_cut_arena = nullptr; }
 void SetStageTime(float seconds, bool entrance) { g_stage_time = std::max(0.0f, seconds), g_stage_entrance = entrance; }
 
 void SetSelfLit(const std::vector<std::string>& textures, const std::vector<std::string>& masks) {
@@ -2610,6 +2827,43 @@ void TestLibrary(int lib) {
 void TestStart(int view, const std::string& select) {
   g_test_view = view;
   g_test_select = select;
+}
+void TestPicture(const std::string& path) { g_test_picture = path; }
+void TestObjects(const std::string& add, const std::string& export_dir, int remove_part) {
+  g_test_add_object = add, g_test_export_dir = export_dir, g_test_remove_part = remove_part;
+}
+bool RunObjectTests() {
+  if (g_test_add_object.empty() && g_test_export_dir.empty() && g_test_remove_part < 0) return false;
+  // the --select object: exported as it is, then a part removed
+  if (g_sel >= 0 && !g_test_export_dir.empty()) ExportObject(g_objs[g_sel], g_test_export_dir);
+  if (g_sel >= 0 && g_test_remove_part >= 0) {
+    Obj& o = g_objs[g_sel];
+    if (g_test_remove_part == 0) {  // (0: every part)
+      for (size_t k = 0; k < o.meshes.size(); ++k) RemovePart(o, k);
+    } else {
+      RemovePart(o, size_t(g_test_remove_part - 1));
+    }
+  }
+  if (!g_test_add_object.empty()) {
+    std::string file = g_test_add_object;
+    int from = 0;
+    float at[3] = {};
+    bool placed = false;
+    if (const size_t c = file.find(','); c != std::string::npos && c > 2) {  // (not the drive's colon)
+      const std::string rest = file.substr(c + 1);
+      file.resize(c);
+      placed = std::sscanf(rest.c_str(), "%d,%f,%f,%f", &from, &at[0], &at[1], &at[2]) == 4;
+    }
+    if (placed) g_target = {at[0] * 10, 0, at[2] * 10};
+    const int i = AddFileObject(file, from);
+    if (i >= 0 && placed) {
+      Obj& o = g_objs[i];
+      o.pos = {at[0] * 10 - o.pivot.x, -at[1] * 10 - o.pivot.y, at[2] * 10 - o.pivot.z};
+      ApplyObj(o);
+    }
+    Log(std::string("test objects: ") + file + (i >= 0 ? " added" : " NOT added"));
+  }
+  return true;
 }
 
 void Shutdown() {
@@ -2675,6 +2929,14 @@ std::string ManifestLines() {
     s += b;
     if (!g_light.crowd) s += "crowd=0\n";
   }
+  if (std::fabs(g_light.game_scale - 1.0f) > 0.004f) {  // (the game's arena_lights.cpp)
+    char b[48];
+    std::snprintf(b, sizeof b, "light_scale=%.2f\n", g_light.game_scale);
+    s += b;
+  }
+  if (g_light.match_light == 1) s += "match_light=entrance\n";
+  if (g_light.match_light == 2) s += "match_light=entrance_spot\n";
+  if (g_light.tron_live) s += "titantron=live\n";
   return s;
 }
 
@@ -2692,6 +2954,14 @@ void FromManifest(const std::string& text) {
       g_light.preset = int(std::size(kPresets)) - 1;
     } else if (line == "crowd=0") {
       g_light.crowd = false;
+    } else if (line.rfind("light_scale=", 0) == 0) {
+      g_light.game_scale = std::clamp(std::strtof(line.c_str() + 12, nullptr), 0.5f, 2.0f);
+    } else if (line == "match_light=entrance") {
+      g_light.match_light = 1;
+    } else if (line == "match_light=entrance_spot") {
+      g_light.match_light = 2;
+    } else if (line == "titantron=live") {
+      g_light.tron_live = true;
     } else if (line.rfind("light.strength=", 0) == 0) {
       g_light.strength = std::strtof(line.c_str() + 15, nullptr);
       g_light.preset = int(std::size(kPresets)) - 1;
@@ -2720,13 +2990,26 @@ void Draw() {
   ImGui::Checkbox("Snap", &g_snap);
   ImGui::SameLine();
   ImGui::SetNextItemWidth(70 * scale);
-  const char* steps[] = {"10 cm", "25 cm", "50 cm", "1 m"};
-  const float step_v[] = {1, 2.5f, 5, 10};
-  int si = 2;
-  for (int k = 0; k < 4; ++k)
+  const char* steps[] = {"1 cm", "5 cm", "10 cm", "25 cm", "50 cm", "1 m", "5 m"};
+  const float step_v[] = {0.1f, 0.5f, 1, 2.5f, 5, 10, 50};
+  int si = 4;
+  for (int k = 0; k < 7; ++k)
     if (std::fabs(step_v[k] - g_snap_step) < 0.01f) si = k;
-  if (ImGui::Combo("##step", &si, steps, 4)) g_snap_step = step_v[si];
+  if (ImGui::Combo("##step", &si, steps, 7)) g_snap_step = step_v[si];
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("The snap step: moves and arrow-key nudges round to it.");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(62 * scale);
+  {
+    const char* turns[] = {"free", "1\xC2\xB0", "5\xC2\xB0", "15\xC2\xB0", "45\xC2\xB0"};
+    const float turn_v[] = {0, 1, 5, 15, 45};
+    int ti = 3;
+    for (int k = 0; k < 5; ++k)
+      if (std::fabs(turn_v[k] * kPi / 180 - g_turn_snap) < 1e-4f) ti = k;
+    if (ImGui::Combo("##turn", &ti, turns, 5)) g_turn_snap = turn_v[ti] * kPi / 180;
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("The turn snap (with Snap on). Turn tool: drag turns, Shift+drag tilts forward,\n"
+                        "Alt+drag tilts sideways; the inspector takes typed angles.");
+  }
   ImGui::SameLine();
   ImGui::BeginDisabled(g_undo.empty());
   if (ImGui::Button("Undo")) Undo();

@@ -589,6 +589,131 @@ def is_static(m):
     return True
 
 
+
+# ---- vehicles: a prop that drives itself (2011's own: 518 / 519 Chuck Palumbo's bike 2540, the jeep, the limos).
+# 2011 moves one as a prop with no parent (slot +208 = 9999) on a world track of prop poses: 0x75 [count][3h root]
+# [24-bit node mask][3h x/y/z per node]; root = cm x 10 (model units / 0.01, the characters' root); node angles
+# s16 (ymks.ANG). The rider is a character on a track of his own, in step. WWE '12-2K15 keep the same bike (2540)
+# with its own nodes: their roles below (by behaviour on 2K14 210 / 409: the root channel carries the position and
+# the whole bike's turn, two channels spin about x - the wheels -, one turns about y - the steering), 2011's from
+# its 518 track: node 0 the body's turn (y heading, small x / z), 1 and 4 the steering (always equal), 2 and 3 the
+# wheels (x), 5 and 6 never move. Without a node map a vehicle keeps 2011's parked donor pose (as before).
+VEHICLE_NODES = {
+    2540: dict(root='#0c5879e5', body=0, wheels={'#fdd95b24': 2, '#fdd95b25': 3}, steer=('#fdd95b27', (1, 4)),
+               nodes=7, lights_on=('6c010005', '6c010106', '6c013204'), lights_off=('6c0132ff', '6c0101ff', '6c0100ff')),
+}
+
+
+def _yxz(q):
+    """quaternion (x, y, z, w) -> (x, y, z) radians, heading first (Y, then X, then Z)"""
+    x, y, z, w = q
+    R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                  [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                  [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+    ry = math.atan2(R[0, 2], R[2, 2])
+    rx = math.asin(max(-1.0, min(1.0, -R[1, 2])))
+    rz = math.atan2(R[1, 0], R[1, 1])
+    return rx, ry, rz
+
+
+def _s16a(rad):
+    v = int(round(rad / ymks.ANG)) & 0xFFFF
+    return v - 65536 if v >= 32768 else v
+
+
+# 2011's bike root y with its wheels on the floor (2K14 210: 1217). 2011's stage and ramp are floor level; 2K14 409
+# rides a stage 18 units up and down a ramp: per frame the vehicle and its rider move by what puts the vehicle back
+# on the floor (vehicle_ground; under GROUND_MIN raw units they stay). The cameras stay: 409 is 210 shot for another
+# arena, and its camera keys are sometimes 210's own, sometimes 12 or 18 units up - no one shift fits them.
+VEHICLE_FLOOR, GROUND_MIN = 1217, 100
+
+
+# 2K14's slope stage (its "... Slope" entrances: 409, 421, 739 - 2011's stage is floor level): 1807 raw units up
+# from z 23706 back, a ramp down to the floor at z 8723 (measured on 409's bike). A raised entrance (its entrant's
+# stage roots that far above his ringside ones) has its characters moved down by slope_shift of their own z.
+SLOPE_TOP_Z, SLOPE_FOOT_Z, SLOPE_HEIGHT = 23706.0, 8723.0, 1807.0
+
+
+def slope_shift(z):
+    """raw y down for a root at raw z on 2K14's slope stage"""
+    if z >= SLOPE_TOP_Z:
+        return SLOPE_HEIGHT
+    if z <= SLOPE_FOOT_Z:
+        return 0.0
+    return SLOPE_HEIGHT * (z - SLOPE_FOOT_Z) / (SLOPE_TOP_Z - SLOPE_FOOT_Z)
+
+
+def raised_stage(leaf, RT):
+    """the entrant stands on a raised source stage: his stage roots (segment 5) about SLOPE_HEIGHT above his ringside
+    ones (segment 15)"""
+    med = {}
+    for x, y, off in blocks(leaf):
+        if y == 0 and x in (5, 15):
+            m = Y.decode(leaf, y=off, sample=False)
+            med[x] = float(np.median([k[0][1] for k in RT.keys(m, frames11(m))]))
+    return 5 in med and 15 in med and med[15] - med[5] > SLOPE_HEIGHT * 0.6
+
+
+def vehicle_ground(m, nf, model):
+    """[raw y shift per 2011 frame] that keeps a vehicle's wheels on 2011's floor, or None (no shift needed)"""
+    vm = VEHICLE_NODES.get(model)
+    if not vm or vm['root'] not in m['tracks']:
+        return None
+    out = []
+    for f in range(nf):
+        r = Y.sample_track(m['tracks'][vm['root']], min(2 * f, m['frames'] - 1))
+        d = VEHICLE_FLOOR - float(r['pos'][1]) * 10 if r['pos'] is not None else 0.0
+        out.append(d if abs(d) >= GROUND_MIN else 0.0)
+    return out if any(out) else None
+
+
+def vehicle_track(m, nf, model, park_off=False, ground=None):
+    """a vehicle's own motion (VEHICLE_NODES) -> 2011 prop track data, or None (no map / no root channel).
+    park_off: the lights go off where the vehicle stops for good in this segment (2011's 518 does so as it parks).
+    ground: vehicle_ground's shifts."""
+    vm = VEHICLE_NODES.get(model)
+    if not vm or vm['root'] not in m['tracks']:
+        return None
+    last = m['frames'] - 1
+    tr = m['tracks']
+    recs = []
+    roots = []
+    for f in range(nf):
+        sf = min(2 * f, last)
+        r = Y.sample_track(tr[vm['root']], sf)
+        pos = r['pos'] if r['pos'] is not None else (0.0, 0.0, 0.0)
+        dy = ground[f] if ground else 0.0
+        root = tuple(max(-32768, min(32767, int(round(float(v) * 10 + (dy if a == 1 else 0))))) for a, v in enumerate(pos))
+        roots.append(root)
+        nodes = {k: (0, 0, 0) for k in range(vm['nodes'])}
+        if r['rot'] is not None:
+            rx, ry, rz = _yxz(r['rot'])
+            if dy:                       # (moved onto 2011's level ramp: the source ramp's pitch left out)
+                rx = 0.0
+            nodes[vm['body']] = (_s16a(rx), _s16a(ry), _s16a(rz))
+        for name, k in vm['wheels'].items():
+            if name in tr:
+                w = Y.sample_track(tr[name], sf)['rot']
+                if w is not None:
+                    nodes[k] = (_s16a(2 * math.atan2(w[0], w[3])), 0, 0)   # (a turn about x only: any angle)
+        sname, sks = vm['steer']
+        if sname in tr:
+            st = Y.sample_track(tr[sname], sf)['rot']
+            if st is not None:
+                for k in sks:
+                    nodes[k] = (0, _s16a(2 * math.atan2(st[1], st[3])), 0)
+        mask = sum(1 << k for k in nodes)
+        pose = bytes([0x75, 0]) + struct.pack('<3h', *root) + bytes([mask & 0xff, mask >> 8 & 0xff, mask >> 16 & 0xff])
+        for k in sorted(nodes):
+            pose += struct.pack('<3h', *nodes[k])
+        recs.append([f, b'', pose])
+    moving = [i for i in range(1, nf) if roots[i] != roots[i - 1]]
+    if moving:   # (lights on while it drives - 518's parked segment has none)
+        recs[0][1] += b''.join(bytes.fromhex(h) for h in vm['lights_on'])
+        if park_off and moving[-1] < nf - 1:
+            recs[moving[-1] + 1][1] += b''.join(bytes.fromhex(h) for h in vm['lights_off'])
+    return ymks.build_stream(ymks.make_stream([(f, ymks.join_record(ev, pose, False)) for f, ev, pose in recs], nf))
+
 # ============================================================================ convert
 
 def convert(evp13, evz13, number, game_pac=None, name=None, bind='rest', progress=None, game='wwe13'):
@@ -639,6 +764,47 @@ def convert_evp(evp13, number, stock, props11, name, rep):
     return e, src_num, nm
 
 
+# Characters without a track (the extras 1-6 and the referee, object 8) stand where their slots put them: 2011's
+# own entrances give the referee (21, -12, -10.5) in the ring segment - y -12 is the mat. 2K16 / 2K17 leave those
+# slots at 0 (their game places them), so the referee stood in the ring at floor height, sunk to his waist
+# (user report 22 Oct, 2K17 Finn Balor): such slots take 2011's layout for that object (stock entrance 560).
+EXTRAS_DONOR = 560
+
+
+def place_extras(e, tracked, stock, rep):
+    don = stock.get(EXTRAS_DONOR) if stock else None
+    dobjs = don[0]['objs'] if don else []
+    placed, hidden = [], []
+    for i, o in enumerate(e['objs']):
+        if i == 0 or i in tracked or kind(o) != 'char':
+            continue
+        slots, changed = list(o['slots']), False
+        if i < len(dobjs) and kind(dobjs[i]) == 'char':
+            for j, s in enumerate(slots):
+                if j >= len(dobjs[i]['slots']) or any(struct.unpack_from('>6f', s, 12)):
+                    continue
+                ds = dobjs[i]['slots'][j]
+                slots[j] = s[:12] + ds[12:36] + s[36:]
+                changed = changed or any(struct.unpack_from('>6f', ds, 12))
+            if changed:
+                placed.append(i)
+        # (and drawn only where 2011's own are: never - their slots are off there. 2K17 105's object 8 had its
+        # segment slots on: with no motion it stood in the ring in the bind pose, the entrant's model on it -
+        # the T-posed AJ Styles of the arena intro, user report 22 Oct)
+        if any(s[2] for s in slots):
+            slots = [s[:2] + b'\0' + s[3:] for s in slots]
+            changed = True
+            hidden.append(i)
+        if changed:
+            o['slots'] = slots
+    if placed:
+        rep['notes'].append('objects %s (extras / referee, no track, no place): 2011\'s places (entrance %d)'
+                            % (', '.join(map(str, placed)), EXTRAS_DONOR))
+    if hidden:
+        rep['notes'].append('objects %s (characters without a track): not drawn, as 2011\'s own (a bind pose)'
+                            % ', '.join(map(str, hidden)))
+
+
 def convert_tracks(e, evz13, src_num, nm, stock, rep, bind='rest', progress=None, ik=True):
     leaves = leaves_of(evz13)
     RT = WR.Retarget(bind, ik=ik)
@@ -651,6 +817,25 @@ def convert_tracks(e, evz13, src_num, nm, stock, rep, bind='rest', progress=None
                                'hidden intro (the entrant will not show); use another game\'s cut of it (2K16)')
     nwork = sum(len(blocks(l)) for _, l in todo) or 1
     done = 0
+    # a vehicle off 2011's floor (a raised source stage): per segment, its shifts for the vehicle, rider and cameras
+    ground = {}
+    for i, leaf in todo:
+        o = e['objs'][i]
+        if kind(o) == 'prop' and o['model'] in VEHICLE_NODES and \
+                all(struct.unpack_from('>H', sl, 208)[0] == 9999 for sl in o['slots']):
+            for x, y, off in blocks(leaf):
+                if y == 0 and x not in ground:
+                    m = Y.decode(leaf, y=off, sample=False)
+                    g = vehicle_ground(m, frames11(m), o['model'])
+                    if g:
+                        ground[x] = g
+                        rep['notes'].append('segment %d: the vehicle rides up to %.1f units off the floor (a raised '
+                                            'stage): it and its rider moved onto 2011\'s floor (cameras as they are)' % (x, max(map(abs, g)) / 100))
+    # no vehicle to go by: a raised source stage from the entrant's own heights (2K14's slope entrances)
+    slope = not ground and ent in leaves and raised_stage(leaves[ent], RT)
+    if slope:
+        rep['notes'].append('raised source stage (its entrant %.1f units up on the stage): the characters moved onto '
+                            '2011\'s floor-level stage and ramp by where they stand (cameras as they are)' % (SLOPE_HEIGHT / 100))
     for i, leaf in todo:
         o = e['objs'][i]
         k = kind(o)
@@ -667,7 +852,13 @@ def convert_tracks(e, evz13, src_num, nm, stock, rep, bind='rest', progress=None
                 if y != 0:
                     rep['dropped'].append('object %d (%d,%d): character track y%d' % (i, x, y, y))
                     continue
-                data = WR.body_track(RT.keys(m, nf), evs)
+                keys = RT.keys(m, nf)
+                g = ground.get(x) if i == ent else None
+                if g:
+                    keys = [((r[0], r[1] + g[min(f, len(g) - 1)], r[2]), a) for f, (r, a) in enumerate(keys)]
+                elif slope:
+                    keys = [((r[0], r[1] + slope_shift(r[2]), r[2]), a) for r, a in keys]
+                data = WR.body_track(keys, evs)
                 if i == ent:   # (the Biped finger bones -> 2011's y2 / y3 finger tracks: finger_retarget.py)
                     for yy, hd in FR.finger_tracks(m, nf, FT).items():
                         ents.append(dict(y=yy, x=x, id=25000 + i, frames=nf, rt=S.RT_2011, data=hd, share=False,
@@ -676,9 +867,18 @@ def convert_tracks(e, evz13, src_num, nm, stock, rep, bind='rest', progress=None
                 if y not in (0, 1):
                     rep['dropped'].append('object %d (%d,%d): camera track y%d' % (i, x, y, y))
                     continue
-                data = camera_track(m, nf, evs)
+                data = camera_track(m, nf, evs)   # (cameras keep their place: 409's match 210's at some keys)
             elif k in ('rope', 'turnbuckle'):
                 data = rope_track(m, nf, evs)
+            elif k == 'prop' and o['model'] in VEHICLE_NODES and not is_static(m) and \
+                    all(struct.unpack_from('>H', sl, 208)[0] == 9999 for sl in o['slots']):
+                # (a vehicle on its own world track: its motion, not 2011's parked pose; lights off where it parks)
+                data = vehicle_track(m, nf, o['model'], park_off=True, ground=ground.get(x))
+                if data is None:
+                    rep['warnings'].append('object %d (%d,%d): vehicle %d without its root channel: no track' % (i, x, y, o['model']))
+                    continue
+                rep['notes'].append('object %d (%d,%d): vehicle %d - its own motion (%d frames: position, turn, wheels, '
+                                    'steering)' % (i, x, y, o['model'], nf))
             elif k == 'prop':
                 don = prop_donor(stock, o['model'])
                 if don:
@@ -706,6 +906,7 @@ def convert_tracks(e, evz13, src_num, nm, stock, rep, bind='rest', progress=None
         for x in dents:
             ents.append(dict(y=x['y'], x=x['x'], id=25000 + i, frames=x['frames'], rt=S.RT_2011, data=x['data'],
                              share=False, tail_off=None))
+    place_extras(e, {z['id'] - 25000 for z in ents}, stock, rep)
     ents.sort(key=lambda z: ymks.key_of(z['id'], z['x'], z['y']))
     bank = ymks.Bank(b'YMKs' + struct.pack('<I', 0x100) + bytes(8) + S.T11, ents)
     bank.lead = b''

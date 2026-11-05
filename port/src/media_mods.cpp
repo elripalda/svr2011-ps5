@@ -44,8 +44,10 @@
 //    it, and the game's "is the object still sounding" (sub_82BB69E8) says
 //    yes while it plays (else music players think it ended at once). Volume:
 //    the game's music / SFX / voice settings (*(0x82EC4C18)+36: floats).
+#include "big_roster.h"
 #include "media_mods.h"
 #include "host_case.h"  // [ps5 port]
+#include "no_mods.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -99,6 +101,7 @@ std::vector<Voice> g_voices;
 fs::path Game() { return rex::filesystem::GetExecutableFolder(); }
 
 std::vector<Pack> ReadPacks() {
+  if (svr2011::NoMods()) return {};  // (Start Without Mods: no_mods.h)
   std::vector<Pack> packs;
   std::error_code ec;
   for (const auto& e : fs::directory_iterator(Game() / "Mods" / "Media", ec)) {
@@ -312,9 +315,9 @@ REX_HOOK_RAW(sub_828B5BC0) {
     const uint8_t* e = base + record + 260 + 0x1C0;
     const uint32_t id = uint32_t(base[desc] << 24 | base[desc + 1] << 16 | base[desc + 2] << 8 | base[desc + 3]);
     // (the same id's profile in the CHAR/PRO table, and the record in CHAR/DAT)
-    const uint32_t si = id < 512 ? uint32_t(base[0x82DB3610 + id * 2] << 8 | base[0x82DB3610 + id * 2 + 1]) : 999;
-    const uint8_t* tp = si < 512 ? base + 0x82E7C920 + si * 1056 : nullptr;
-    const uint8_t* tr = si < 512 ? base + 0x82E407C0 + si * 260 : nullptr;
+    const uint32_t si = id < 512 ? svr2011::RosterIndex(base, id) : 999;
+    const uint8_t* tp = si < 512 ? base + svr2011::RosterEntry(0x82E7C920, 1056, si) : nullptr;
+    const uint8_t* tr = si < 512 ? base + svr2011::RosterEntry(0x82E407C0, 260, si) : nullptr;
     REXLOG_INFO("[svr2011] match profile: id {} music {} movie {} entrance {} | table {} {} {} | copy==table {} "
                 "record==table {} | record {:08X} desc {:08X}",
                 id, uint32_t(e[0x10] << 8 | e[0x11]), uint32_t(e[0x12] << 8 | e[0x13]), uint32_t(e[0x14] << 8 | e[0x15]),

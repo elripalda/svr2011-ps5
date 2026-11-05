@@ -20,7 +20,10 @@
 // Picking one goes through the game's own checks (sub_82734CA0).
 // Modded characters: add their ids to kManagers.
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -29,6 +32,7 @@
 
 #include "generated/default/svr2011_init.h"
 #include "superstar_mods.h"
+#include "../modmaker/svrfmt/bytes.h"
 
 REXCVAR_DEFINE_BOOL(managers_tile, true, "Gameplay",
                     "Character select: the \"?\" tile opens the managers (Paul Bearer, The Hurricane, ...) "
@@ -44,16 +48,10 @@ constexpr uint32_t kManagers[] = {147, 186, 251, 296, 274};
 constexpr uint32_t kScreen = 272, kPlayer = 284, kCol = 88, kRow = 72;
 constexpr uint32_t kListIndex = 5228, kListMode = 28916;
 constexpr uint32_t kLists = 8116, kListSize = 2580, kManagerList = 7, kMasterList = 6;
+constexpr uint32_t kListIds = 322;  // (a list's room: count, 322 ids, 322 flags)
 constexpr uint32_t kTileKindRandom = 4;
 
-uint32_t Rd32(const uint8_t* base, uint32_t a) {
-  const uint8_t* p = base + a;
-  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
-}
-void Wr32(uint8_t* base, uint32_t a, uint32_t v) {
-  uint8_t* p = base + a;
-  p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
-}
+using svrfmt::Rd32, svrfmt::Wr32;
 
 // Fills the list at `list` (count, ids, enable flags) with the managers.
 void FillManagers(uint8_t* base, uint32_t list) {
@@ -64,6 +62,7 @@ void FillManagers(uint8_t* base, uint32_t list) {
     ++n;
   }
   for (uint32_t id : svr2011::SuperstarModIds()) {  // (arenas branch: superstar mods, superstar_mods.cpp)
+    if (n >= kListIds) break;  // (the list's room: big_roster can have more mods than that)
     Wr32(base, list + 4 + n * 4, id);
     Wr32(base, list + 4 + 1288 + n * 4, 1);
     ++n;
@@ -73,12 +72,24 @@ void FillManagers(uint8_t* base, uint32_t list) {
 
 bool ManagersOpen(uint8_t* base, uint32_t cursor) { return Rd32(base, cursor + kListIndex) == kManagerList; }
 
+// Problem reports ("the select screen got stuck"): a line when a character select sets its players up - once per
+// screen, again after 15 s (the same screen object comes back for the next match).
+void NoteSelectOpen(uint32_t screen) {
+  static uint32_t last = 0;
+  static auto at = std::chrono::steady_clock::time_point{};
+  const auto now = std::chrono::steady_clock::now();
+  if (screen == last && now - at < std::chrono::seconds(15)) return;
+  last = screen, at = now;
+  REXLOG_INFO("[svr2011] character select: open (screen {:08X})", screen);
+}
+
 }  // namespace
 
 // The cursor's lists copied from the screen's (cursor, source).
 REX_EXTERN(__imp__sub_8245DE00);
 REX_HOOK_RAW(sub_8245DE00) {
   const uint32_t cursor = ctx.r3.u32;
+  NoteSelectOpen(Rd32(base, cursor + kScreen));
   __imp__sub_8245DE00(ctx, base);
   if (REXCVAR_GET(managers_tile)) FillManagers(base, cursor + kLists + kManagerList * kListSize);
 }
@@ -87,6 +98,7 @@ REX_HOOK_RAW(sub_8245DE00) {
 REX_EXTERN(__imp__sub_82448A90);
 REX_HOOK_RAW(sub_82448A90) {
   const uint32_t out = ctx.r4.u32;
+  NoteSelectOpen(ctx.r3.u32);
   __imp__sub_82448A90(ctx, base);
   if (REXCVAR_GET(managers_tile) && out) FillManagers(base, out + kManagerList * kListSize);
 }
@@ -95,6 +107,17 @@ REX_HOOK_RAW(sub_82448A90) {
 REX_EXTERN(__imp__sub_824621F8);
 REX_HOOK_RAW(sub_824621F8) {
   const uint32_t cursor = ctx.r3.u32;
+  // Test aid SVR2011_TEST_TILE=<column>,<row>: A on the grid is A on that tile (scripted input can't steer the
+  // cursor reliably there - big roster's portrait shots open the Mods list this way)
+  if (const char* tile = std::getenv("SVR2011_TEST_TILE"); tile && Rd32(base, cursor + kListMode) == 0) {
+    int col = 0, row = 0;
+    if (std::sscanf(tile, "%d,%d", &col, &row) == 2) {
+      Wr32(base, cursor + kCol, uint32_t(col));
+      Wr32(base, cursor + kRow, uint32_t(row));
+    }
+  }
+  REXLOG_INFO("[svr2011] character select: player {} A on the tile at column {} row {}{}", Rd32(base, cursor + kPlayer),
+              Rd32(base, cursor + kCol), Rd32(base, cursor + kRow), Rd32(base, cursor + kListMode) ? " (a list is open)" : "");
   // (Match Creator sets the lists up without the two calls above: fill them here)
   if (REXCVAR_GET(managers_tile) && Rd32(base, cursor + kListMode) == 0 &&
       Rd32(base, cursor + kLists + kManagerList * kListSize) == 0)

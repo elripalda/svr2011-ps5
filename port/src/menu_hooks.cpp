@@ -11,6 +11,7 @@
 
 #include "frame_rate.h"
 #include "menu_hooks.h"
+#include "thread_cpu.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -42,13 +43,20 @@
 #include "graphics_page.h"
 #include "jukebox.h"
 #include "backgrounds_page.h"
+#include "report_page.h"
+#include "weapons_page.h"
 #include "discord_presence.h"
 #include "online.h"
+#include "caw_limits.h"
+#include "match_record.h"
 #include "match_types.h"
 #include "mystery_opponent.h"
 #include "superstar_mods.h"
 #include "touch_controls.h"
 #include "native/native_renderer.h"
+#if SVR2011_DEBUG_SUITE
+#include "debug_suite/debug_suite.h"
+#endif
 
 namespace {
 
@@ -61,6 +69,8 @@ constexpr uint32_t kJukeboxLabelId = 0xAFC5;
 constexpr uint32_t kJukeboxTextId = 0xAFC6;
 constexpr uint32_t kControlsLabelId = 0xAFC7;
 constexpr uint32_t kBackgroundsLabelId = 0x0FA0B200;  // (not 0xAFC8: the game's own, the help bar's A)
+constexpr uint32_t kWeaponsLabelId = 0x0FA0B201;
+constexpr uint32_t kReportLabelId = 0x0FA0B202;  // (REPORT A PROBLEM: OPTIONS' row - match_types.cpp - and the pause menu's)
 // Character select: the name beside the "?" tile ("Random", looked up by the
 // panel code in sub_82465728 for tile kind 4) - that tile opens the managers
 // (src/managers.cpp), so it reads "Mods" there (the superstar mods are in its list).
@@ -75,6 +85,8 @@ constexpr uint32_t kControlsRow = 5;           // its 6th entry (after CHEAT COD
 constexpr uint32_t kGraphicsRow = 6;           // after CONTROLS
 constexpr uint32_t kLanguageRow = 7;           // after GRAPHICS
 constexpr uint32_t kBackgroundsRow = 8;        // after LANGUAGE
+constexpr uint32_t kWeaponsRow = 9;            // after BACKGROUNDS
+constexpr uint32_t kReportRow = 10;            // after WEAPONS (match_types.cpp adds it)
 constexpr uint32_t kExitRow = 7;               // main menu: after SHOP (row 6)
 // Main-menu object fields (sub_82447210 and friends).
 constexpr uint32_t kMenuGroup = 380;   // current group (< 1000) or screen id
@@ -89,8 +101,37 @@ uint32_t g_jukebox_text = 0;
 uint32_t g_language_label = 0;  // "LANGUAGE"
 uint32_t g_controls_label = 0;  // "CONTROLS"
 uint32_t g_backgrounds_label = 0;  // "BACKGROUNDS"
+uint32_t g_weapons_label = 0;  // "WEAPONS"
+uint32_t g_report_label = 0;   // "REPORT A PROBLEM"
 uint32_t g_extra_label = 0;     // "Mods" (the "?" tile opens the managers: src/managers.cpp)
 rex::memory::Memory* g_guest_memory = nullptr;  // (the match start's log line)
+
+// CREATE AN ENTRANCE's motion presets (DIVA / SUPERSTAR / LEGEND nn: entrance scripts 480-563 left from older
+// games) by whose entrance they are - English only, the other languages keep the game's text. The names are the
+// scripts' own (EVP +0x22, pac\evt) and the DLC.pac ENEX/LSD rows {entrance, string id}; the ones whose script
+// name doesn't say who (Diva 03, General Powerfull, Brian Kendrick next to The Brian Kendrick, General Entrance)
+// keep the game's label. (Player request, 20 Oct.)
+struct PresetName {
+  uint32_t id;
+  const char* name;
+};
+constexpr PresetName kPresetNames[] = {
+    {0x2009, "MARIA"}, {0x200A, "TORRIE WILSON"}, {0x200B, "ASHLEY"}, {0x200C, "VICTORIA"}, {0x200D, "CANDICE"},
+    {0x200E, "JILLIAN"}, {0x200F, "TRISH STRATUS"}, {0x2010, "VAMPIRE DIVA"}, {0x2011, "GYMNAST DIVA"},
+    {0x2017, "KURT ANGLE"}, {0x2018, "BOOKER T"}, {0x2019, "KING BOOKER"}, {0x201A, "SABU"}, {0x201B, "SANDMAN"},
+    {0x201D, "KENNY DYKSTRA"}, {0x201E, "BOBBY LASHLEY"}, {0x201F, "GREGORY HELMS"}, {0x2020, "KEVIN THORN"},
+    {0x2021, "BALLS MAHONEY"}, {0x2022, "LANCE CADE"}, {0x2023, "TREVOR MURDOCH"}, {0x2024, "BIG DADDY V"},
+    {0x2025, "SNITSKY"}, {0x2027, "CHUCK PALUMBO"}, {0x2028, "TAZZ"}, {0x2029, "HARDCORE HOLLY"},
+    {0x202B, "CHRIS JERICHO (CLASSIC)"}, {0x202C, "RANDY ORTON (CLASSIC)"}, {0x202D, "SHANE MCMAHON"},
+    {0x202E, "TOMMY DREAMER"}, {0x202F, "CURT HAWKINS"}, {0x2030, "CHARLIE HAAS"}, {0x2031, "SUPER CRAZY"},
+    {0x2032, "BATISTA (CLASSIC)"}, {0x2033, "THE BOOGEYMAN"}, {0x2034, "JIMMY WANG YANG"}, {0x2035, "JEFF HARDY"},
+    {0x2036, "JBL"}, {0x2037, "UMAGA"}, {0x2038, "THE BRIAN KENDRICK"}, {0x2039, "THE GREAT KHALI"},
+    {0x203A, "JESSE"}, {0x203B, "BOXER"}, {0x203C, "VIP"}, {0x203D, "LADIES MAN"}, {0x203E, "CLUMSY SUPERSTAR"}, {0x207C, "ZOMBIE"},
+    {0x2053, "HULK HOGAN"}, {0x2054, "MILLION DOLLAR MAN"}, {0x2055, "MR. PERFECT"}, {0x2056, "DUSTY RHODES"},
+    {0x2057, "JUNKYARD DOG"}, {0x2058, "BOB ORTON JR."}, {0x2059, "EDDIE GUERRERO"}, {0x205A, "MICK FOLEY"},
+    {0x205B, "RIC FLAIR"}, {0x205C, "VADER"}, {0x205D, "DOINK THE CLOWN"},
+};
+std::map<uint32_t, uint32_t> g_preset_text;  // string id -> guest string (English only)
 
 uint32_t Be32(const uint8_t* p) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
@@ -115,6 +156,7 @@ std::mutex g_menu_mutex;
 std::map<std::pair<uint32_t, uint32_t>, std::string> g_menu_texts;
 std::atomic<uint32_t> g_menu_selects{0};
 std::atomic<uint32_t> g_menu_selected{0};  // (group << 16 | row of the last one)
+std::atomic<uint32_t> g_main_row{~0u};      // (the main menu's - group 1 - last choice: 2 Road to WrestleMania)
 
 void ReadMenuLabels() {
   g_menu_labels_read = true;
@@ -225,6 +267,9 @@ void ScriptMenuTable(const uint8_t* table, size_t size) {
   g_menu_texts_stale = true;  // (read again at the menu's next use: the rows' places moved)
 }
 
+// (by its place, not its label: the label is in the player's language)
+bool InRoadToWrestleMania() { return g_main_row.load() == 2; }
+
 uint32_t ScriptMenuSelects(uint32_t* group, uint32_t* row) {
   const uint32_t last = g_menu_selected.load();
   *group = last >> 16;
@@ -251,35 +296,49 @@ void InstallMenuHooks(rex::memory::Memory* memory) {
     const char* jukebox_text;
     const char* controls;
     const char* backgrounds;
+    const char* weapons;
+    const char* report;
   };
   static const Labels kLabels[] = {
       {1, "GRAPHICS", "EXIT", "ACHIEVEMENTS",
        "View your achievements: what you've unlocked and how to earn the rest.", "LANGUAGE", "JUKEBOX",
-       "Choose which songs play in the menus.", "CONTROLS", "BACKGROUNDS"},
+       "Choose which songs play in the menus.", "CONTROLS", "BACKGROUNDS", "WEAPONS", "REPORT A PROBLEM"},
       {4, "GRAPHISMES", "QUITTER", "SUCC\xC3\x88S",
        "Consultez vos succ\xC3\xA8s : ceux d\xC3\xA9" "bloqu\xC3\xA9s et comment obtenir les autres.", "LANGUE", "JUKEBOX",
-       "Choisissez les musiques jou\xC3\xA9" "es dans les menus.", "COMMANDES", "ARRI\xC3\x88RE-PLANS"},
+       "Choisissez les musiques jou\xC3\xA9" "es dans les menus.", "COMMANDES", "ARRI\xC3\x88RE-PLANS", "ARMES",
+       "SIGNALER UN PROBL\xC3\x88ME"},
       {3, "GRAFIK", "BEENDEN", "ERFOLGE",
        "Deine Erfolge: was du freigeschaltet hast und wie du den Rest bekommst.", "SPRACHE", "JUKEBOX",
-       "W\xC3\xA4hle, welche Songs in den Men\xC3\xBC" "s laufen.", "STEUERUNG", "HINTERGR\xC3\x9C" "NDE"},
+       "W\xC3\xA4hle, welche Songs in den Men\xC3\xBC" "s laufen.", "STEUERUNG", "HINTERGR\xC3\x9C" "NDE", "WAFFEN",
+       "PROBLEM MELDEN"},
       {5, "GR\xC3\x81" "FICOS", "SALIR", "LOGROS",
        "Mira tus logros: los que has desbloqueado y c\xC3\xB3mo conseguir el resto.", "IDIOMA", "JUKEBOX",
-       "Elige qu\xC3\xA9 canciones suenan en los men\xC3\xBA" "s.", "CONTROLES", "FONDOS"},
+       "Elige qu\xC3\xA9 canciones suenan en los men\xC3\xBA" "s.", "CONTROLES", "FONDOS", "ARMAS",
+       "INFORMAR DE UN PROBLEMA"},
       {6, "GRAFICA", "ESCI", "OBIETTIVI",
        "I tuoi obiettivi: quelli sbloccati e come ottenere gli altri.", "LINGUA", "JUKEBOX",
-       "Scegli quali brani suonano nei men\xC3\xB9.", "COMANDI", "SFONDI"},
+       "Scegli quali brani suonano nei men\xC3\xB9.", "COMANDI", "SFONDI", "ARMI", "SEGNALA UN PROBLEMA"},
   };
   const uint32_t language = rex::cvar::Query<uint32_t>("user_language");
   const Labels* l = &kLabels[0];
   for (const Labels& k : kLabels)
     if (k.language == language) l = &k;
+  if (l == &kLabels[0])  // (English - also the fallback for other ids: CREATE AN ENTRANCE's presets by name)
+    for (const PresetName& pn : kPresetNames) {
+      const uint32_t n = uint32_t(std::strlen(pn.name) + 1);
+      if (const uint32_t t = memory->SystemHeapAlloc(n)) {
+        std::memcpy(memory->TranslateVirtual<char*>(t), pn.name, n);
+        g_preset_text[pn.id] = t;
+      }
+    }
   const size_t n_graphics = std::strlen(l->graphics) + 1, n_exit = std::strlen(l->exit) + 1,
                n_ach = std::strlen(l->achievements) + 1, n_text = std::strlen(l->achievements_text) + 1,
                n_language = std::strlen(l->language_label) + 1, n_jukebox = std::strlen(l->jukebox) + 1,
                n_jukebox_text = std::strlen(l->jukebox_text) + 1, n_controls = std::strlen(l->controls) + 1,
-               n_backgrounds = std::strlen(l->backgrounds) + 1;
+               n_backgrounds = std::strlen(l->backgrounds) + 1, n_weapons = std::strlen(l->weapons) + 1,
+               n_report = std::strlen(l->report) + 1;
   g_label = memory->SystemHeapAlloc(
-      uint32_t(n_graphics + n_exit + n_ach + n_text + n_language + 6 + n_jukebox + n_jukebox_text + n_controls + n_backgrounds + 16));
+      uint32_t(n_graphics + n_exit + n_ach + n_text + n_language + 6 + n_jukebox + n_jukebox_text + n_controls + n_backgrounds + n_weapons + n_report + 16));
   if (!g_label) {
     REXLOG_WARN("menu: no guest memory for the GRAPHICS label");
     return;
@@ -303,7 +362,13 @@ void InstallMenuHooks(rex::memory::Memory* memory) {
   std::memcpy(memory->TranslateVirtual<char*>(g_controls_label), l->controls, n_controls);
   g_backgrounds_label = g_controls_label + uint32_t(n_controls);
   std::memcpy(memory->TranslateVirtual<char*>(g_backgrounds_label), l->backgrounds, n_backgrounds);
+  g_weapons_label = g_backgrounds_label + uint32_t(n_backgrounds);
+  std::memcpy(memory->TranslateVirtual<char*>(g_weapons_label), l->weapons, n_weapons);
+  g_report_label = g_weapons_label + uint32_t(n_weapons);
+  std::memcpy(memory->TranslateVirtual<char*>(g_report_label), l->report, n_report);
 }
+
+std::string GameString(PPCContext& ctx, uint8_t* base, uint32_t id) { return LabelText(ctx, base, id); }
 
 }  // namespace svr2011
 
@@ -325,6 +390,10 @@ REX_HOOK_RAW(sub_82153EF8) {
   }
   if (const uint32_t s = svr2011::MatchTypeString(ctx.r4.u32)) {  // (match_types.h: added rows)
     ctx.r3.u64 = s;
+    return;
+  }
+  if (const auto it = g_preset_text.find(ctx.r4.u32); it != g_preset_text.end()) {
+    ctx.r3.u64 = it->second;
     return;
   }
   if (g_label && ctx.r4.u32 == kGraphicsLabelId) {
@@ -357,6 +426,14 @@ REX_HOOK_RAW(sub_82153EF8) {
   }
   if (g_backgrounds_label && ctx.r4.u32 == kBackgroundsLabelId) {
     ctx.r3.u64 = g_backgrounds_label;
+    return;
+  }
+  if (g_weapons_label && ctx.r4.u32 == kWeaponsLabelId) {
+    ctx.r3.u64 = g_weapons_label;
+    return;
+  }
+  if (g_report_label && ctx.r4.u32 == kReportLabelId) {
+    ctx.r3.u64 = g_report_label;
     return;
   }
   if (g_language_label && ctx.r4.u32 == kLanguageLabelId) {
@@ -426,6 +503,7 @@ REX_HOOK_RAW(sub_82447210) {
     const uint8_t* menu = base + ctx.r3.u32;
     const uint32_t group = Be32(menu + kMenuGroup), cursor = Be32(menu + kMenuCursor);
     g_menu_selected = group << 16 | (cursor & 0xFFFF);
+    if (group == 1) g_main_row = cursor;
     ++g_menu_selects;
     // The entry's label, for the log ("menu select: OPTIONS (group 5 row 3)").
     std::string label;
@@ -434,6 +512,7 @@ REX_HOOK_RAW(sub_82447210) {
       label = LabelText(ctx, base, it->second);
     REXLOG_INFO("[svr2011] menu select: {}{}group {:X} row {}{}", label, label.empty() ? "" : " (", group, cursor,
                 label.empty() ? "" : ")");
+    svr2011::LoadWatchMenuSelect(label.c_str());
     svr2011::TouchGameInMatch(false);  // (the touch controller's MENU layout)
     svr2011::SetFrameRateInMatch(false);  // (menus at 60 fps)
     svr2011::native::SetMatchScene(false);  // (wide screens: menus at 16:9)
@@ -452,6 +531,14 @@ REX_HOOK_RAW(sub_82447210) {
     }
     if (group == kOptionsGroup && cursor == kBackgroundsRow) {
       svr2011::OpenBackgroundsPage();
+      return;
+    }
+    if (group == kOptionsGroup && cursor == kWeaponsRow) {
+      svr2011::OpenWeaponsPage();
+      return;
+    }
+    if (group == kOptionsGroup && cursor == kReportRow) {
+      svr2011::OpenReportPage(false);
       return;
     }
     if (group == kMyWweGroup && cursor == kAchievementsRow) {
@@ -501,6 +588,9 @@ REX_HOOK_RAW(sub_826E1C88) {
   svr2011::native::SetMatchScene(true);  // (wide screens: full width)
   svr2011::SetDiscordScene(svr2011::DiscordScene::kEntrances);
   svr2011::ArmMatchStart(nullptr);  // (switched here already)
+#if SVR2011_DEBUG_SUITE
+  svr2011::dbg::OnEntrances(true);
+#endif
   if (!REXCVAR_GET(unlock_30fps)) svr2011::SetSceneThirtyFps(true);
 }
 
@@ -521,12 +611,16 @@ REX_HOOK_RAW(sub_823EEB98) {
         free_mb = uint32_t(uint64_t(heap->GetUnreservedPageCount()) * heap->page_size() >> 20);
     }
     REXLOG_INFO("[svr2011] match starts (match {} this session; guest memory {} MB free)", ++matches, free_mb);
+    svr2011::NoteMatchLoading(false);  // (model_mem.cpp's load watch)
     svr2011::TouchGameInMatch(true);  // (the touch controller's MATCH layout)
     svr2011::native::SetMatchScene(true);  // (wide screens: full width)
     svr2011::SetDiscordScene(svr2011::DiscordScene::kMatch);
     svr2011::SetFrameRateInMatch(true);  // (the chosen frame rate)
     svr2011::MysteryOpponentReveal("the match runs");  // (mystery_opponent.h)
   });
+  svr2011::MatchRecordMatchLoads();  // (the match's rand() seed: match_record.h)
+  svr2011::NoteMatchLoading(true);    // (model_mem.cpp's load watch)
+  svr2011::ArenaPlaysAsAtLoad(base);  // (a custom arena on another arena's tile: its arena now - arena_mods.h)
   __imp__sub_823EEB98(ctx, base);
 }
 
@@ -534,11 +628,32 @@ REX_HOOK_RAW(sub_823EEB98) {
 REX_EXTERN(__imp__sub_826E1D28);
 REX_HOOK_RAW(sub_826E1D28) {
   REXLOG_INFO("[svr2011] entrances over");
+#if SVR2011_DEBUG_SUITE
+  svr2011::dbg::OnEntrances(false);
+#endif
   svr2011::MysteryOpponentReveal("the entrances' end");  // (mystery_opponent.h)
   svr2011::SetDiscordScene(svr2011::DiscordScene::kMatch);
   __imp__sub_826E1D28(ctx, base);
   svr2011::SetSceneThirtyFps(false);
   svr2011::ApplyFrameRate(base);  // (frame_rate.h)
+}
+
+// An entrance event's handler (sub_821D4490(?, person, event), called from an event table) for a person whose object
+// is gone reads person +0x8B0 from 0: 2.1.8 reports 246b25 / 2db71e - the main thread crashed (lr 821D4498, read of
+// guest 0x8B0) as the second wrestler's entrance began, mod superstars, a few times a session. Skipped, logged.
+REX_EXTERN(__imp__sub_821D4490);
+REX_HOOK_RAW(sub_821D4490) {
+  // (test aid SVR2011_TEST_ENTRANCE_NULL=1: the first such event as if its person were gone)
+  if (static bool once = std::getenv("SVR2011_TEST_ENTRANCE_NULL") != nullptr; once && ctx.r4.u32) once = false, ctx.r4.u64 = 0;
+  if (ctx.r4.u32 == 0) {
+    static int told = 0;
+    if (told++ < 5)
+      REXLOG_WARN("[svr2011] entrance: an event for a person who isn't there skipped (event {:02X} {:02X}, caller {:08X})",
+                  ctx.r5.u32 ? base[ctx.r5.u32] : 0, ctx.r5.u32 ? base[ctx.r5.u32 + 1] : 0, uint32_t(ctx.lr));
+    ctx.r3.u64 = 1;  // (as its own "not this state" path returns)
+    return;
+  }
+  __imp__sub_821D4490(ctx, base);
 }
 
 REX_EXTERN(__imp__sub_826E1AE8);
@@ -655,3 +770,4 @@ void ArmWatch(uint8_t* base) {
 }
 }  // namespace
 #endif  // _WIN32
+

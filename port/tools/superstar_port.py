@@ -9,6 +9,8 @@ the Mod Maker calls (docs/MOD_MAKER_3_PLAN.md section 4, docs/OTHER_GAMES.md).
     py superstar_port.py moveset-pack --game <id> --src <...> --item <key> --rows all|0x012,0x14E [--taunts-only] --out <dir>
     py superstar_port.py detect  --src <one character pac> [--game <id>] [--svrmod <exe>]
     py superstar_port.py convert --src <one character pac> [--game <id>] [--item <id>] --out <dir> [--name S] [--base N]
+    py superstar_port.py attires --src <PS2 disc | one PS2 character archive> [--game <id>] [--item <key>] --out <dir>
+        (every attire drawn as a picture; convert --attires 0,3,5,9 then takes up to four of them, in that order)
 
 One character pac (tools/lone_pac.py): a 360 ch<id>.pac of any game here (plus Legends of WrestleMania) or a PS2
 character archive (CH.PAC / CH2.PAC: --item one of detect's characters, hex). The game is read from the file;
@@ -40,8 +42,10 @@ Games:
     svr2010   SvR 2010 - everything (svr10_superstar.py: model, renders, theme, titantron,
               ratings, abilities, the moveset and the moves 2011 lacks as a move pack)
     svr2009   SvR 2009 - model (svr08_char.py), renders, theme, titantron, ratings, entrance,
-              announcer; the moveset stays the base's for now (the 2009 slot map is next)
+              announcer, the moveset (moveset_maps.json svr2009) and the moves 2011 lacks
     svr2008   SvR 2008 - the same as 2009 (ids: 2011 id = 2008 id + 100)
+    low       Legends of WrestleMania - as 2009 (its own ids; ratings fitted from its own scheme, abilities
+              guessed from them; the moveset by move name - moveset_maps.json low, no motions ported)
     svr2007   SvR 2007 - the same, its per-part textures baked (svr07_char.py), XACT themes (xact.py);
               ratings stay the base's
     wwe12     WWE '12 - model (w13_char.py, within the vertex budget), attires, renders, theme
@@ -83,15 +87,17 @@ GAMES = [
     dict(id='svr2009', name='WWE SmackDown vs. Raw 2009', platform='x360', disc_hint='54510826', status='ready'),
     dict(id='svr2008', name='WWE SmackDown vs. Raw 2008', platform='x360', disc_hint='5451080B', status='ready'),
     dict(id='svr2007', name='WWE SmackDown vs. Raw 2007', platform='x360', disc_hint='545107E0', status='ready'),
-    dict(id='ps2_jbi', name='WWF SmackDown! Just Bring It', platform='ps2', disc_hints=['SLES_504.77', 'SLUS_202.69'], status='ready'),
-    dict(id='ps2_sym', name='WWE SmackDown! Shut Your Mouth', platform='ps2', disc_hints=['SLES_512.83', 'SLUS_205.12'], status='ready'),
+    dict(id='low', name='WWE Legends of WrestleMania', platform='x360', disc_hint='54510838', status='ready'),
+    dict(id='ps2_jbi', name='WWF SmackDown! Just Bring It', platform='ps2', disc_hints=['SLES_504.77', 'SLUS_203.16', 'SLUS_202.69', 'SLUS_201.22'], status='ready'),
+    dict(id='ps2_sym', name='WWE SmackDown! Shut Your Mouth', platform='ps2', disc_hints=['SLES_512.83', 'SLUS_204.83', 'SLUS_205.12'], status='ready'),
     dict(id='ps2_hctp', name='WWE SmackDown! Here Comes the Pain', platform='ps2', disc_hints=['SLES_520.36', 'SLUS_207.87'], status='ready'),
-    dict(id='ps2_svr04', name='WWE SmackDown! vs. Raw (PS2)', platform='ps2', disc_hints=['SLES_527.81', 'SLUS_209.36'], status='ready'),
-    dict(id='ps2_svr06', name='WWE SmackDown! vs. Raw 2006 (PS2)', platform='ps2', disc_hints=['SLES_536.76', 'SLUS_211.34'], status='ready'),
+    dict(id='ps2_svr04', name='WWE SmackDown! vs. Raw (PS2)', platform='ps2', disc_hints=['SLES_527.81', 'SLUS_210.60', 'SLUS_209.36'], status='ready'),
+    dict(id='ps2_svr06', name='WWE SmackDown! vs. Raw 2006 (PS2)', platform='ps2', disc_hints=['SLES_536.76', 'SLUS_212.86', 'SLUS_211.34'], status='ready'),
     dict(id='ps2_svr07', name='WWE SmackDown vs. Raw 2007 (PS2)', platform='ps2', disc_hints=['SLES_544.89', 'SLUS_214.27'], status='ready'),
-    dict(id='ps2_svr08', name='WWE SmackDown vs. Raw 2008 (PS2)', platform='ps2', disc_hints=['SLES_548.79'], status='ready'),
-    dict(id='ps2_svr09', name='WWE SmackDown vs. Raw 2009 (PS2)', platform='ps2', disc_hints=['SLES_552.51'], status='ready'),
-    dict(id='ps2_svr10', name='WWE SmackDown vs. Raw 2010 (PS2)', platform='ps2', disc_hints=['SLES_555.45'], status='ready'),
+    dict(id='ps2_svr08', name='WWE SmackDown vs. Raw 2008 (PS2)', platform='ps2', disc_hints=['SLES_548.79', 'SLUS_216.45'], status='ready'),
+    dict(id='ps2_svr09', name='WWE SmackDown vs. Raw 2009 (PS2)', platform='ps2', disc_hints=['SLES_552.51', 'SLUS_218.10'], status='ready'),
+    dict(id='ps2_svr10', name='WWE SmackDown vs. Raw 2010 (PS2)', platform='ps2', disc_hints=['SLES_555.45', 'SLUS_219.01'], status='ready'),
+    dict(id='ps2_svr11', name='WWE SmackDown vs. Raw 2011 (PS2)', platform='ps2', disc_hints=['SLES_556.35', 'SLUS_219.39'], status='ready'),
     dict(id='wwe12', name="WWE '12", platform='x360', disc_hint='54510890', status='ready'),
     dict(id='wwe13', name="WWE '13", platform='x360', disc_hint='545108B4', status='ready'),
     dict(id='wwe2k14', name='WWE 2K14', platform='x360', disc_hint='545408B2', status='ready'),
@@ -106,7 +112,13 @@ class BadInput(Exception):
     pass
 
 
-def missing(rel):
+def missing(rel, src=None):
+    """a needed file isn't in the game files: a folder that isn't a whole disc (no default.xex / SYSTEM.CNF) is often
+    DLC (2.1.8 report 20261103-040523-d343a2) - what to pick instead"""
+    if src and os.path.isdir(src) and not any(os.path.isfile(os.path.join(src, f)) for f in ('default.xex', 'SYSTEM.CNF')):
+        return ('the folder has no %s: it isn\'t a whole game (DLC, or part of a disc?). DLC superstars can\'t be read '
+                'from the DLC alone - use the game\'s disc image or its whole extracted folder (with default.xex); a DLC '
+                'superstar\'s model can come in on its own as One file: its pac/ch/chNNN.pac' % rel)
     return 'the game files have no %s (an incomplete extract? use the whole disc folder or the ISO)' % rel
 
 
@@ -123,8 +135,73 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+_step = ['starting']   # (the step under way: a crash names it - explain)
+_template_note = []    # (a warning when ch104.pac wasn't the game's own - template104)
+_template_ok = {}
+
+
+def _complete_template(path):
+    """A stock-like template: its first model has the body, the face animation / collision / offsets parts
+    (0x28 0x32 0x50 0x64) and the standard 2011 skeleton (koshi, l_ashi as ch104's)."""
+    if path in _template_ok:
+        return _template_ok[path]
+    ok = False
+    try:
+        import ch_tool
+        import jboy
+        import svrfmt
+        _, groups = ch_tool.epk8_read(open(path, 'rb').read())
+        kids = {i: d for i, d in svrfmt.pach_read(ch_tool.unpack(groups[0][1][0][1]))}
+        if all(k in kids for k in (0, 0x28, 0x32, 0x50, 0x64)):
+            nodes = {n['name']: n for n in jboy.read(ch_tool.unpack(kids[0])).nodes}
+            ok = (abs(nodes['koshi']['t'][0] + 1.869) < 0.02 and abs(nodes['l_ashi']['t'][0] - 4.348) < 0.02)
+    except Exception:   # noqa: BLE001
+        ok = False
+    _template_ok[path] = ok
+    return ok
+
+
+def template104(pac11):
+    """2011's template for a built model: ch104.pac (skeleton frames, face animation, collision, cube map). One that
+    was replaced - no face animation / offsets parts ("KeyError: 40", user report 22 Oct) or another skeleton -
+    gives way to a stock superstar with the same skeleton, with a warning."""
+    for cid in (104, 103, 100, 106, 115, 126):
+        path = os.path.join(pac11, 'ch', 'ch%d.pac' % cid)
+        if _complete_template(path):
+            if cid != 104 and not _template_note:
+                _template_note.append('your game\'s pac\\ch\\ch104.pac isn\'t the original (the converter builds on it): '
+                                      'ch%d.pac, the same skeleton, was used instead - put the original back with the '
+                                      'launcher\'s Install tab (Verify game files)' % cid)
+                progress(1, 'template: ch%d.pac (ch104.pac is not the original)' % cid)
+            return path
+    return os.path.join(pac11, 'ch', 'ch%d.pac' % 104)   # (none: the converter's own error names it)
+
+
 def progress(pct, text):
+    _step[0] = text
     print('progress %d %s' % (pct, text), file=sys.stderr, flush=True)
+
+
+def explain(e, a):
+    """An unexpected error in plain words - the step, the tool file and line, what went wrong - never a bare
+    'KeyError: 40' (user report 22 Oct). The whole traceback goes to stderr (the Mod Maker's log) and detail."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    tb = traceback.extract_tb(e.__traceback__)
+    ours = [f for f in tb if os.path.dirname(os.path.abspath(f.filename)) == here] or tb
+    f = ours[-1] if ours else None
+    what = {KeyError: 'something it looked up (%s) isn\'t there - a part, entry or bone the file was expected to have'
+                      % (e.args[0] if e.args else '?'),
+            IndexError: 'a table in the file is shorter than expected',
+            struct.error: 'the file\'s data didn\'t read as expected (%s)' % e,
+            ValueError: 'a value in the file wasn\'t what the converter expected (%s)' % e,
+            ZeroDivisionError: 'a size or count in the file is zero',
+            MemoryError: 'the computer ran out of memory'}
+    text = next((v for t, v in what.items() if isinstance(e, t)), '%s' % (e or type(e).__name__))
+    item = a.get('item') or (os.path.basename(a.get('src') or '') if a.get('src') else '')
+    return ('Converting %s stopped at the "%s" step: %s.%s The full details are in the Mod Maker\'s log (Report a '
+            'problem sends them).' % (('"%s"' % item) if item else 'it', _step[0], text,
+                                     (' (%s in %s line %d, %s.)' % (type(e).__name__, os.path.basename(f.filename),
+                                                                    f.lineno, f.name)) if f else ''))
 
 
 # --------------------------------------------------------------------------- source
@@ -184,7 +261,7 @@ class Src:
         """get(rel), or a plain BadInput naming the missing file (an incomplete extract)"""
         p = self.get(rel)
         if p is None:
-            raise BadInput(missing(rel))
+            raise BadInput(missing(rel, self.folder))
         return p
 
     def get_dir(self, rel, pred=lambda n: True):
@@ -272,6 +349,26 @@ class Game09:
                             self._ssf[(n.decode(), i)] = d
         return self._ssf
 
+    # menu/LoadHD.pac LOAD S000-S037: 38 featured superstars' loading pictures in their own order (no ids) - by hand
+    # from the pictures (duplicates: the first one; pictures not told apart for sure left out: 6, 10, 12, 13, 18,
+    # 21, 22, 27, 33)
+    LOAD_PICTURES = {102: 0, 103: 1, 111: 2, 118: 3, 125: 4, 130: 5, 139: 7, 158: 8, 160: 9, 157: 11, 208: 15, 114: 17,
+                     131: 19, 123: 20, 165: 23, 178: 23, 174: 25, 135: 26, 161: 28, 179: 29, 168: 30, 107: 31, 176: 32,
+                     195: 37}
+
+    def loading_picture(self, i):
+        """the superstar's 512 x 512 loading picture (LoadHD S<n>: loadtex01, LOAD_PICTURES), or None"""
+        import arena_port
+        n = self.LOAD_PICTURES.get(i)
+        p = self.src.get('pac/menu/LoadHD.pac') if n is not None else None
+        if not p:
+            return None
+        try:
+            return next((d for nm, d in arena_port.group_textures(open(p, 'rb').read(), 'S%03d' % n)
+                         if nm.lower() == 'loadtex01'), None)
+        except (OSError, KeyError, ValueError):
+            return None
+
     def chpac(self, i):
         return self.src.get('pac/ch/ch%d.pac' % i)
 
@@ -313,6 +410,65 @@ class Game09:
         return [c for c in sorted(self.g.dat) if 100 <= c < 400 and self.named(c)
                 and not self.name(c).upper().startswith(('MOTION', 'MOVES', 'EDIT', 'DLC', 'DUMMY', 'MATERIAL', 'LEGEND MOTEST'))
                 and (self.has_chpac(c) or self.src.no_models())]
+
+
+class GameLoW(Game09):
+    """WWE Legends of WrestleMania (2009, SvR 2009's engine; docs/OTHER_GAMES.md): chEtc.pac CHAR/DAT 262 B =
+    2009's with 12 rating bytes (twice) where 2009 keeps 8 - made into 2009's record here (name +34 after the
+    header, short +170, gender +208, weight class +209, scale +28); its ratings are another scheme (0x01 =
+    unused) - ratings_port's 'low' formula, rough. CHAR/PRO 504 B, entrance block +0xE4 as 2009. Renders DLC_HD.pac groups SSFA / SSFB /
+    SSFC at the top (2009 nests them in MENU), entries named by the decimal id. Titantrons movies/titantron/
+    <movie id>.bik. Its ids are its own (100 The Rock): 2011's superstar of the same name, else none (0)."""
+
+    year = 9
+    label = 'Legends of WrestleMania'
+    suffix = '_low'
+    ratings_game = 'low'   # (ratings_port: its own scheme, fitted; no abilities in its records - guessed from them)
+
+    def __init__(self, src):
+        super().__init__(src)
+        h, g, t = svrfmt.epac_read(open(os.path.join(self.g.pac, 'ch', 'chEtc.pac'), 'rb').read())
+        dat = next(b for ty, es in g for n, b in es if (ty, n) == (b'CHAR', b'DAT '))
+        self.raw_dat = {i: ch_tool.unpack(d) for i, d in svrfmt.pach_read(ch_tool.unpack(dat))}   # (as stored)
+        self.g.dat = {i: r[0:8] + r[12:20] + r[24:] for i, r in self.g.dat.items()}   # (2009's layout)
+        self._g11 = self._id11 = None
+
+    def bind11(self, g11):
+        self._g11, self._id11 = g11, None
+
+    def id11(self, i):
+        if self._g11 is None:
+            return 0
+        if self._id11 is None:
+            S = svr10()
+            by = {S.norm(self._g11.name(c)): c for c in sorted(self._g11.dat) if 100 <= c < 400 and self._g11.named(c)}
+            self._id11 = {c: by.get(S.norm(self.name(c)), 0) for c in self.g.dat if self.named(c) and c not in self.NOT_2011s}
+        return self._id11.get(i, 0)
+
+    NOT_2011s = {136}   # (its Ted DiBiase is the father; 2011's, 261, the son)
+
+    def ssf(self):
+        if self._ssf is None:
+            self._ssf = {}
+            h, g, t = svrfmt.epac_read(open(self.src.get('pac/DLC_HD.pac'), 'rb').read())
+            for ty, es in g:
+                if ty in (b'SSFA', b'SSFB', b'SSFC'):
+                    for n, b in es:
+                        if n.strip(b'\0 ').isdigit():
+                            self._ssf[(ty.decode(), int(n))] = b
+        return self._ssf
+
+    def roster(self):
+        return [c for c in super().roster() if not self.name(c).upper().startswith(('REFEREE', 'HOWARD FINKEL'))]
+
+    def loading_picture(self, i):
+        """menu/LoadHD.pac LOAD S<id>: loadtex01, the superstar's 512 x 512 loading picture (DDS), or None"""
+        import arena_port
+        try:
+            raw = open(self.src.get('pac/menu/LoadHD.pac'), 'rb').read()
+            return next((d for nm, d in arena_port.group_textures(raw, 'S%d' % i) if nm.lower() == 'loadtex01'), None)
+        except (OSError, KeyError, ValueError):
+            return None
 
 
 class Game08(Game09):
@@ -388,6 +544,19 @@ class Game08(Game09):
         return [c for c in sorted(self.g.dat) if c < 100 and self.named(c)
                 and not self.name(c).upper().startswith(('MOTION', 'MOVES', 'EDIT', 'DLC', 'DUMMY'))
                 and (self.has_chpac(c) or self.src.no_models())]
+
+    def loading_picture(self, i):
+        """menu/LoadHD.pac LOAD S<id, 3 digits>: load01_B01, the superstar's 1024 x 512 loading picture (DDS), or None
+        (SvR 2007 has no such group: None)"""
+        import arena_port
+        try:
+            p = self.src.get('pac/menu/LoadHD.pac')
+            if not p:
+                return None
+            return next((d for nm, d in arena_port.group_textures(open(p, 'rb').read(), 'S%03d' % i)
+                         if nm.lower() == 'load01_b01'), None)
+        except (OSError, KeyError, ValueError):
+            return None
 
 
 class Game07(Game08):
@@ -482,26 +651,65 @@ def pad_render(dds, size=512):
     return svr08_char.dds_encode(canvas, 'DXT5')
 
 
+def load_picture(dds):
+    """a source game's loading picture of the superstar (any size) -> the mod's load.dds: 1024 x 512 DXT5 (the NOW
+    LOADING screen's size, superstar_mods loading=), the picture on the right half, the left half a darkened,
+    blurred stretch of it"""
+    from PIL import Image, ImageEnhance, ImageFilter
+    import svr08_char
+    src = Image.open(io.BytesIO(dds)).convert('RGBA')
+    im = src.convert('RGB')
+    if im.size == (1024, 512):   # (already the screen's size: SvR 2008)
+        return svr08_char.dds_encode(im.convert('RGBA'), 'DXT5')
+    # (a render with a cut-out - alpha - (WWE '13 menuHD): the figure alone over the backdrop; its colour under
+    # alpha 0 is a flat matte that showed as a box)
+    cut = src.getchannel('A').getextrema()[0] < 128
+    canvas = ImageEnhance.Brightness(im.resize((1024, 512), Image.LANCZOS).filter(ImageFilter.GaussianBlur(18))).enhance(0.45)
+    if cut:
+        canvas = Image.new('RGB', (1024, 512), (18, 16, 20))
+        glow = Image.new('RGB', (1024, 512), (0, 0, 0))
+        glow.paste(im.resize((1024, 512), Image.LANCZOS), mask=src.getchannel('A').resize((1024, 512), Image.LANCZOS))
+        canvas = Image.blend(canvas, ImageEnhance.Brightness(glow.filter(ImageFilter.GaussianBlur(24))).enhance(0.6), 0.5)
+    k = min(512 / im.width, 512 / im.height)
+    pic = src.resize((int(im.width * k), int(im.height * k)), Image.LANCZOS)
+    canvas.paste(pic.convert('RGB'), (1024 - pic.width - (512 - pic.width) // 2, (512 - pic.height) // 2),
+                 mask=pic.getchannel('A') if cut else None)
+    return svr08_char.dds_encode(canvas.convert('RGBA'), 'DXT5')
+
+
+# The children 2011's own entrance-gear models (kind 4: Undertaker 00010304) have none of: face animation, portraits,
+# blood overlays (the gear is worn for the entrance only). 0x408 (2008 / 2010 kind 4: the coat flaps' cloth settings,
+# hira_* bones) is kept.
+GEAR_DROP = (0x64, 0xc8, 0xc9, 0x7530, 0x7531, 0x7532)
+
+
 def model_from_2008_family(src_pac, cid, pac11, out, portrait, hex_names):
     """svr08_char's conversion of the wrestler (kind 2) entries of a 2008-family ch pac
-    (2008: EMD names id attire kind in decimal, 2009: 2 hex digits). -> [(entry, 2011 name)]"""
+    (2008: EMD names id attire kind in decimal, 2009: 2 hex digits), and each kept attire's entrance gear (kind 4: the
+    whole wrestler in a coat / hat for the entrance - 2008's Undertaker 0304) the same way. -> [(entry, 2011 name)];
+    .gear the gear entries made ([2011 name])"""
     import svr08_char
-    tp = svr08_char.Template(os.path.join(pac11, 'ch', 'ch104.pac'))
     h, g, t = svrfmt.epac_read(open(src_pac, 'rb').read())
     emd = next(es for ty, es in g if ty == b'EMD ')
-    ents = []
+    ents, gear_src = [], {}
     for n, b in emd:
         s = n.decode('latin1').strip('\0 ')
-        if len(s) != 4 or s[3] != '2':
+        if len(s) != 4 or s[3] not in '24':
             continue
-        ents.append((s, int(s[2]), {i: svr08_char.unp(x) for i, x in svrfmt.pach_read(svr08_char.unp(b))}))
+        kids = {i: svr08_char.unp(x) for i, x in svrfmt.pach_read(svr08_char.unp(b))}
+        if s[3] == '4':
+            gear_src[int(s[2])] = (s, kids)
+        else:
+            ents.append((s, int(s[2]), kids))
     if not ents:
         raise RuntimeError('no wrestler (kind 2) model in %s' % os.path.basename(src_pac))
     ents.sort(key=lambda e: e[1])
     first = ents[0][2]
+    # (the skeleton the source is bound to: ch104's, or 2011's diva skeleton for a diva - svr08_char.template_for)
+    tp, tcid = svr08_char.template_for(template104(pac11), first[0])
     entries, kept = [], []
     import model_budget
-    budget_notes = []
+    budget_notes = ['skeleton: ch%d\'s (a diva\'s)' % tcid] if tcid else []
     for k, (s, att, kids) in enumerate(ents[:4]):
         o = svr08_char.attire(kids, tp, portrait, [0x20], first)
         # a wrestler's vertex buffers get 192 pages in a match (model_budget.py): over that the
@@ -519,8 +727,29 @@ def model_from_2008_family(src_pac, cid, pac11, out, portrait, hex_names):
         name = b'%06d%02d' % (cid, k * 10 + 2)
         entries.append((name, svrfmt.pach_write([(i, svrfmt.bpe_encode(o[i], compress=True)) for i in sorted(o)])))
         kept.append((s, name.decode()))
-    svr08_char.write_epk8(os.path.join(pac11, 'ch', 'ch104.pac'), entries, out)
+    gear_made = []
+    for k, (s, att, kids) in enumerate(ents[:4]):   # (the kept attires' entrance gear, kind 4)
+        if att not in gear_src:
+            continue
+        gs, gkids = gear_src[att]
+        if 0 not in gkids or gkids[0][:4] != b'JBOY' or 0xa not in gkids:
+            budget_notes.append('attire %s: entrance gear %s has no model to convert: left out' % (s, gs))
+            continue
+        o = svr08_char.attire(gkids, tp, None, [0x20], first)
+        for c in GEAR_DROP:
+            o.pop(c, None)
+        if 0x408 in gkids:
+            o[0x408] = gkids[0x408]
+        pg, _ = model_budget.attire_pages(o)
+        if pg > model_budget.LIMIT:   # (the gear loads instead of the match model: the same vertex budget)
+            budget_notes.append('attire %s: entrance gear %s is %d of %d pages of vertex memory: left out' % (s, gs, pg, model_budget.LIMIT))
+            continue
+        name = b'%06d%02d' % (cid, k * 10 + 4)
+        entries.append((name, svrfmt.pach_write([(i, svrfmt.bpe_encode(o[i], compress=True)) for i in sorted(o)])))
+        gear_made.append(name.decode())
+    svr08_char.write_epk8(template104(pac11), entries, out)
     model_from_2008_family.notes = budget_notes
+    model_from_2008_family.gear = gear_made
     return kept, [e[0] for e in ents[4:]]
 
 
@@ -569,14 +798,42 @@ def write_mod(mod, man, out_svrmod, rep=None, pac11=None):
             except Exception as e:   # noqa: BLE001
                 if rep is not None:
                     rep['warnings'].append('%s: bone rests not checked (prop_bones: %s)' % (f_, e))
-        for d_ in fit_budget(os.path.join(mod, 'ch.pac'), os.path.join(pac11, 'ch', 'ch104.pac')):
+        for d_ in fit_budget(os.path.join(mod, 'ch.pac'), template104(pac11)):
             if rep is not None:
                 rep['dropped'].append(d_)
-    order = ['type', 'id', 'name', 'short', 'base', 'author', 'made_with', 'version', 'ratings', 'abilities', 'moves',
-             'entrance', 'announcer', 'call', 'height', 'song', 'movie']
+    if os.path.exists(os.path.join(mod, 'ch.pac')):   # (a model over the old window: newer games only - model_budget)
+        import model_budget
+        nv = model_budget.needs(os.path.join(mod, 'ch.pac'))
+        if nv:
+            man['needs'] = nv
+            if rep is not None:
+                rep['notes'].append('the model is over %d vertex pages: it needs version %s or newer (older games leave '
+                                    'it out)' % (model_budget.OLD_LIMIT, nv))
+    order = ['type', 'id', 'name', 'short', 'base', 'author', 'made_with', 'version', 'needs', 'ratings', 'abilities',
+             'moves', 'entrance', 'announcer', 'call', 'height', 'song', 'movie']
     txt = ''.join('%s=%s\n' % (k, man[k]) for k in order if k in man)
     txt += ''.join('%s=%s\n' % (k, v) for k, v in man.items() if k not in order)   # (attire<N>_name= ...)
     open(os.path.join(mod, 'manifest.txt'), 'w', newline='\n').write(txt)
+    if pac11 and os.path.exists(os.path.join(mod, 'ch.pac')):
+        # Superstar Threads parts from the model's masks (tools/threads_parts.py); a failure never fails the port
+        try:
+            import threads_parts
+            # (a model without masks - SvR 2006-2009, PS2 - gets them painted from its clothes' colours first)
+            made = threads_parts.add_masks(mod, write=True, backup=False)
+            if any(n for _, _, n, _ in made) and rep is not None:
+                rep['notes'].append('Superstar Threads: masks made for %s' % ', '.join(
+                    '%s attire %d (%d)' % (f, a, n) for f, a, n, _ in made if n))
+            parts = threads_parts.build(mod, os.path.dirname(os.path.normpath(pac11)))
+            if parts:
+                threads_parts.write(mod, parts)
+                if rep is not None:
+                    rep['notes'].append('Superstar Threads: %d part(s) in %d attire(s)' %
+                                        (sum(len(a['parts']) for a in parts), len(parts)))
+            elif rep is not None:
+                rep['notes'].append('Superstar Threads: not listed (the model has no Threads masks)')
+        except Exception as e:   # noqa: BLE001
+            if rep is not None:
+                rep['warnings'].append('Superstar Threads parts not made (threads_parts: %s)' % e)
     tmp = out_svrmod + '.tmp'
     with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
         for root, dirs, files in os.walk(mod):
@@ -603,7 +860,7 @@ def abilities_step(game, g, cid, man, note):
     """the source's abilities as 2011's (tools/abilities_port.py) into man['abilities']; notes what was mapped
     or guessed (none: the base's)"""
     import abilities_port
-    game = {'Game09': 'svr2009', 'Game08': 'svr2008', 'Game07': 'svr2007'}.get(game, game)
+    game = {'Game09': 'svr2009', 'Game08': 'svr2008', 'Game07': 'svr2007', 'GameLoW': 'low'}.get(game, game)
     ratings = [int(x) for x in man['ratings'].split(',')] if man.get('ratings') else None
     ids, ar = abilities_port.map_abilities(game, cid, g, ratings)
     if ids:
@@ -618,6 +875,8 @@ def build09(cid, outdir, o, rep):
     if cid not in g9.g.dat or not g9.named(cid):
         raise BadInput('%s has no superstar %d' % (g9.label, cid))
     name = g9.name(cid)
+    if hasattr(g9, 'bind11'):   # (Legends of WrestleMania: its own ids, 2011's by name)
+        g9.bind11(g11)
     i11 = g9.id11(cid)
     mid = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') + g9.suffix
     work = os.path.join(outdir, '.work_%d' % cid)
@@ -651,6 +910,12 @@ def build09(cid, outdir, o, rep):
         note('renders: %s SSFB/SSFC %d (padded to 512 x 512)' % (g9.label, cid))
     else:
         warn('no %s render: the base\'s are used' % g9.label)
+    if hasattr(g9, 'loading_picture'):   # (the NOW LOADING screen's picture: superstar_mods loading=)
+        lp = g9.loading_picture(cid)
+        if lp:
+            open(os.path.join(mod, 'load.dds'), 'wb').write(load_picture(lp))
+            man['loading'] = 'load.dds'
+            note('loading picture: %s LoadHD S%d -> load.dds (1024 x 512)' % (g9.label, cid))
     # model
     progress(25, 'model')
     if o.get('model') == '11' and same11 and g11.chpac(i11):
@@ -658,7 +923,7 @@ def build09(cid, outdir, o, rep):
         note('model: 2011\'s own ch%d.pac (--model 11)' % i11)
     elif g9.has_chpac(cid) and g9.year == 7:   # (per-part textures: baked into 2011's sheets)
         import svr07_char
-        kept7, extra = svr07_char.convert(g9.chpac(cid), os.path.join(mod, 'ch.pac'), os.path.join(pac11, 'ch', 'ch104.pac'),
+        kept7, extra = svr07_char.convert(g9.chpac(cid), os.path.join(mod, 'ch.pac'), template104(pac11),
                                           cid, portrait)
         note('model: %s ch%02d.pac attires %s converted (svr07_char: %s)' % (
             g9.label, cid, ', '.join('%s -> %s' % k[:2] for k in kept7), '; '.join(k[2] for k in kept7)))
@@ -671,6 +936,8 @@ def build09(cid, outdir, o, rep):
     elif g9.has_chpac(cid):
         kept, extra = model_from_2008_family(g9.chpac(cid), cid, pac11, os.path.join(mod, 'ch.pac'), portrait, True)
         note('model: %s ch%d.pac attires %s converted (svr08_char)' % (g9.label, cid, ', '.join('%s -> %s' % k for k in kept)))
+        if getattr(model_from_2008_family, 'gear', None):
+            note('entrance gear: %s' % ', '.join(model_from_2008_family.gear))
         for n in getattr(model_from_2008_family, 'notes', []):
             (warn if 'may crash' in n else note)(n)
         for e in extra:
@@ -679,18 +946,23 @@ def build09(cid, outdir, o, rep):
         warn('%s has no model for %d: the base\'s is used' % (g9.label, cid))
     # ratings
     r = g9.g.dat[cid]
-    if any(x not in (0, 50) for x in r[:7]):
+    if getattr(g9, 'ratings_game', None):
+        pass   # (below: its own formula)
+    elif any(x not in (0, 50) for x in r[:7]):
         man['ratings'] = ','.join(str(max(0, x - 1)) for x in r[:7])
         note('ratings %s %s -> %s' % (g9.label, list(r[:8]), man['ratings']))
-    if type(g9).__name__ == 'Game07':   # (another scale: fitted, tools/ratings_port.py)
+    rg = 'svr2007' if type(g9).__name__ == 'Game07' else getattr(g9, 'ratings_game', None)
+    if rg:   # (another scale: fitted, tools/ratings_port.py)
         import ratings_port
-        rr, rrep = ratings_port.map_ratings('svr2007', cid, g9)
+        rr, rrep = ratings_port.map_ratings(rg, cid, g9)
         if rr:
             man['ratings'] = ','.join(map(str, rr))
         note(ratings_port.report_line(g9.label, rr, rrep))
     abilities_step(type(g9).__name__, g9, cid, man, note)
     # moves
-    if not o.get('no_moves') and base != i11:
+    if getattr(g9, 'no_moves', None):
+        note(g9.no_moves)
+    elif not o.get('no_moves') and base != i11:
         progress(40, 'moveset')
         moveset_step(g9, cid, base, o, work, mod, man, rep, prog=(40, 55))
     # entrance
@@ -1128,16 +1400,20 @@ class GameW2K16(GameW2K15):
 
 
 def attires(pachs):
-    """2K16+ model PACHs (no kind in a name) -> [(EPK8 name, PACH)]: the entrance-gear model (0x5208..
-    children) and exact copies left out; at most 4 (the game's attires). Names as the game's "%06d%02d":
+    """2K16+ model PACHs (no kind in a name) -> [(EPK8 name, PACH)]: exact copies left out; at most 4 (the game's
+    attires). An attire's entrance-gear pieces (extra JBOY children 0x5208.., Jericho 2K16's) stay in it:
+    w13_char.gear makes them that attire's kind-4 gear model; attires.gear_pieces counts them. Names as the game's "%06d%02d":
     character id (the template's 104; the game puts the mod's slot id in), attire * 10 + kind 2. (They were
     "%04d0402" by attire: every attire had digit 0 - all "attire 1" to the game, the second one never offered,
     and a match asking for attire 2 hung on NOW LOADING - Asuka / Rollins / Jericho 2K17.)"""
     out, seen = [], set()
+    attires.gear_pieces = 0
     for b in pachs:
         kids = dict(svrfmt.pach_read(ch_tool.unpack(b)))
-        if 0x5208 in kids or 0 not in kids:
+        if 0 not in kids:
             continue
+        pieces = [i for i in kids if 0x5208 <= i < 0x5300]
+        attires.gear_pieces += len(pieces)   # (w13_char makes them the attire's kind-4 gear model)
         key = ch_tool.unpack(kids[0])
         if key in seen:
             continue
@@ -1305,7 +1581,7 @@ def model_w(g, cid, pac11, out, portrait):
             gear = [(n, b) for t, es in g.MP.read_pac(raw) if t == b'EMD ' for n, b in es
                     if len(n) == 8 and n.endswith(b'4') and n[:7] in own]
         model_w.gear = [n.decode('latin1') for n, _ in gear]
-        w13_char.write_epk8(os.path.join(pac11, 'ch', 'ch104.pac'), [(b'EMD ', n, b) for n, b in kept + gear], tmp)
+        w13_char.write_epk8(template104(pac11), [(b'EMD ', n, b) for n, b in kept + gear], tmp)
         raw = open(tmp, 'rb').read()
     open(tmp, 'wb').write(raw)
     ptmp = None
@@ -1313,7 +1589,8 @@ def model_w(g, cid, pac11, out, portrait):
         ptmp = tmp + '.portrait.dds'
         open(ptmp, 'wb').write(portrait)
     with contextlib.redirect_stdout(sys.stderr):
-        w13_char.convert(tmp, out, os.path.join(pac11, 'ch', 'ch104.pac'), ptmp)
+        w13_char.convert(tmp, out, template104(pac11), ptmp)
+    model_w.extras = list(getattr(w13_char.convert, 'extras', []))   # (extra models left out: the report's dropped[])
     for f in (tmp, ptmp):
         try:
             if f:
@@ -1348,6 +1625,17 @@ def fit_budget(path, tmpl):
                 if bad:
                     raise BadInput('attire %s: its hair settings are ones the game can\'t take (%s) - a converter bug, '
                                    'please report it' % (n, '; '.join(bad)))
+            if (0x3c in kids and n.endswith('4') and w13_char.hair_chain_count(kids[0x3c])
+                    and w13_char.model_bytes(kids) > w13_char.CHAIN_MODEL_BYTES_MAX):
+                # (entrance gear - kind 4 - too big for moving hair: its hair stands still for the entrance rather
+                # than the gear going - 2K14 Hollywood Hogan's T-shirt and feather boa, 1 025 384 bytes. 2011's own
+                # gear models have no hair settings either: Undertaker 00010104, Cena 00013904)
+                kids.pop(0x3c, None)
+                kids.pop(0x3d, None)
+                blob = w13_char.pack_kids(kids)
+                changed = True
+                out.append('entrance gear %s: its hair stands still (too big for moving hair: %d bytes)'
+                           % (n, w13_char.model_bytes(kids)))
             if 0x3c in kids and w13_char.hair_chain_count(kids[0x3c]):
                 # (moving hair: the models must fit the room the largest stock attire takes, or the match load
                 # crashes / hangs - Asuka 2K17; the blood overlays go first, then the eyelashes)
@@ -1479,6 +1767,10 @@ def buildW(cid, outdir, o, rep):
         import model_budget
         pages = model_budget.model_pages(os.path.join(mod, 'ch.pac'))
         note('model: %s ch%d.pac, %d attires (w13_char)' % (gw.label, cid, len(pages)))
+        gear_now = sorted(n for n in pac_children(os.path.join(mod, 'ch.pac')) if n.endswith('4'))
+        if gear_now:
+            note('entrance gear: %s%s' % (', '.join(gear_now), ' (the %s gear pieces merged into the body)' % gw.label
+                                          if hasattr(gw, 'model_entries') else ''))
         for n_, pg, parts in pages:
             if pg > model_budget.LIMIT:
                 note('attire %s: %d of %d pages - the game leaves the blood overlays out' % (n_, pg, model_budget.LIMIT))
@@ -1590,7 +1882,7 @@ SINGLE = {   # game -> mod id suffix (labels: lone_pac.LABELS)
     'svr2007': '_07', 'svr2008': '_08', 'svr2009': '_09', 'low': '_low', 'svr2010': '_10', 'wwe12': '_12', 'wwe13': '_13',
     'wwe2k14': '_2k14', 'wwe2k15': '_2k15', 'wwe2k16': '_2k16', 'wwe2k17': '_2k17',
     'ps2_jbi': '_jbi', 'ps2_sym': '_sym', 'ps2_hctp': '_hctp', 'ps2_svr04': '_svr04', 'ps2_svr06': '_svr06',
-    'ps2_svr07': '_svr07', 'ps2_svr08': '_svr08', 'ps2_svr09': '_svr09', 'ps2_svr10': '_svr10'}
+    'ps2_svr07': '_svr07', 'ps2_svr08': '_svr08', 'ps2_svr09': '_svr09', 'ps2_svr10': '_svr10', 'ps2_svr11': '_svr11ps2'}
 SINGLE_MISSING = ["pictures / renders (the base's)", "theme (the base's)", "titantron (the base's)",
                   "entrance (the base's)", "moveset (the base's)", "ratings and abilities (the base's)",
                   'name and profile (--name, else the file name)', 'attire names']
@@ -1700,21 +1992,27 @@ def build_single(cid, outdir, o, rep):
                                                                       str(e)[:120]))
         if left:
             drop('attires past %d (2011 has 4 at most): %s' % (g.max_attires, ', '.join(left)))
-        if game in ('wwe2k16', 'wwe2k17'):
-            drop('entrance gear: the %s gear model (children 0x5208) is not converted yet' % label)
-        else:
-            gear = model_w.gear if model_w.gear is not None else [n for n in pac_children(out) if n.endswith('4')]
+        for e in getattr(model_w, 'extras', []):
+            drop(e)
+        gear = [n for n in pac_children(out) if n.endswith('4')]
     elif game == 'svr2007':
         import svr07_char
         with contextlib.redirect_stdout(sys.stderr):
-            kept7, extra = svr07_char.convert(pac, out, os.path.join(pac11, 'ch', 'ch104.pac'), cid, None)
+            kept7, extra = svr07_char.convert(pac, out, template104(pac11), cid, None)
         note('attires %s (svr07_char)' % ', '.join('%s -> %s' % k[:2] for k in kept7))
+        for s7, _n, parts in kept7:   # (each attire's parts: a modded pac's own show in the report)
+            note('attire %s: %s' % (s7, parts))
+            if 'NOT IN THE PAC' in parts:
+                warn('attire %s names textures the pac does not carry - those parts are plain grey (a modded file?)' % s7)
+        if getattr(svr07_char.convert, 'skeleton', None):
+            note('skeleton: ch%d (a diva)' % svr07_char.convert.skeleton)
         for e in extra:
             drop('attire %s (a mod holds 4)' % e)
     elif game in ('svr2008', 'svr2009', 'low'):
         with contextlib.redirect_stdout(sys.stderr):
             kept, extra = model_from_2008_family(pac, cid, pac11, out, None, True)
         note('attires %s (svr08_char)' % ', '.join('%s -> %s' % k for k in kept))
+        gear = list(getattr(model_from_2008_family, 'gear', None) or [])
         for n in getattr(model_from_2008_family, 'notes', []):
             (warn if 'may crash' in n else note)(n)
         for e in extra:
@@ -1730,7 +2028,7 @@ def build_single(cid, outdir, o, rep):
         def base_bust(pac_dir, group, i):   # (the 2010 bust is in the disc's DLC_HD.pac: the base's portrait)
             p = os.path.join(pac11, 'ch', 'ch%d.pac' % base)
             if not os.path.exists(p):
-                p = os.path.join(pac11, 'ch', 'ch104.pac')
+                p = template104(pac11)
             emd = [b for t, n, b in svr10_char.epk8_entries(p) if t == b'EMD ']
             return dict(svrfmt.pach_read(ch_tool.unpack(emd[0])))[0xc8]
         svr10_char.dlc_render = base_bust
@@ -1740,17 +2038,24 @@ def build_single(cid, outdir, o, rep):
         finally:
             svr10_char.dlc_render = own
         note("portrait (0xc8 / 0xc9): the base's - SvR 2010 keeps its bust in the disc's DLC_HD.pac")
+        gear = [n for n in pac_children(out) if n.endswith('4')]
     else:   # PS2 character archive: ps2_char.py on a folder that looks like the disc (lone_pac.ps2_disc)
         chars = {int(c['id'], 16): c['attires'] for c in lone_pac.ps2_characters(pac, game, work, __import__('moves_port').cache_dir(pac11, work))}
         if cid not in chars:
             raise BadInput('%s has no character %x (it has %s)' % (os.path.basename(pac), cid,
                                                                      ' '.join('%x' % c for c in sorted(chars))))
         ats = chars[cid]
-        if len(ats) > 4:
-            drop('attires %s (a mod holds 4)' % ', '.join(str(x) for x in ats[4:]))
+        if o.get('attires'):   # (--attires: which of the source's become the mod's four, in that order)
+            pick = [int(x) for x in str(o['attires']).split(',') if x.strip()]
+            bad = [x for x in pick if x not in ats]
+            if bad or not pick or len(pick) > 4:
+                raise BadInput('--attires: up to 4 of %s (attires lists them)' % ', '.join(str(x) for x in ats))
+            ats = pick
+        elif len(ats) > 4:
+            drop('attires %s (a mod holds 4; --attires to choose)' % ', '.join(str(x) for x in ats[4:]))
         tmpl = os.path.join(pac11, 'ch', 'ch%d.pac' % base)
         if not os.path.exists(tmpl):
-            tmpl = os.path.join(pac11, 'ch', 'ch104.pac')
+            tmpl = template104(pac11)
         pw = os.path.join(work, 'ps2_char')
         import subprocess
         r = subprocess.run([sys.executable, os.path.join(HERE, 'ps2_char.py'), lone_pac.ps2_disc(pac, game, work),
@@ -1811,8 +2116,8 @@ def open_game(game, src, svrmod=None):
         g.render_ids = {i for (t, i) in g.ssf if t == 'SSFB'}
         g.entrance_block_ = g.entrance_block
         return g
-    if game in ('svr2009', 'svr2008', 'svr2007'):
-        g = {'svr2009': Game09, 'svr2008': Game08, 'svr2007': Game07}[game](src)
+    if game in ('svr2009', 'svr2008', 'svr2007', 'low'):
+        g = {'svr2009': Game09, 'svr2008': Game08, 'svr2007': Game07, 'low': GameLoW}[game](src)
         g.render_ids = {i for (t, i) in g.ssf() if t == 'SSFB'}
         g.dat = g.g.dat
         return g
@@ -1844,6 +2149,8 @@ def cmd_list(a):
     src = Src(a['src'], os.path.join(a.get('cache') or os.path.join(HERE, 'work', 'src'), a['game']))
     g = open_game(a['game'], src, a.get('svrmod'))
     g11, snd = game11(a['pac11'])
+    if hasattr(g, 'bind11'):
+        g.bind11(g11)
     play = playable11(g11)
     out = []
     for c in g.roster():
@@ -2149,6 +2456,8 @@ def cmd_moveset(a):
     work = tempfile.mkdtemp(prefix='svr_moveset_')
     try:
         src, g, cache = verb_game(a, work)
+        if getattr(g, 'no_moves', None):   # (Legends of WrestleMania)
+            raise BadInput(g.no_moves)
         rep = dict(notes=[], warnings=[], dropped=[])
         if a['game'] == 'svr2010':   # (its own move path: svr10_superstar.Moves)
             rows, moves_txt, pack, base = svr10_moveset(a, g, src, cid, g11, cache)
@@ -2200,6 +2509,8 @@ def cmd_moveset_pack(a):
         shutil.rmtree(work)
     os.makedirs(work)
     src, g, cache = verb_game(a, work)
+    if getattr(g, 'no_moves', None):   # (Legends of WrestleMania)
+        raise BadInput(g.no_moves)
     rep = dict(notes=[], warnings=[], dropped=[])
     if a['game'] == 'svr2010':   # (its own move path: svr10_superstar.Moves + svr10_moves + movepack)
         nm = re.sub(r'[^a-z0-9]+', '_', g.name(cid).lower()).strip('_') if cid in g.dat else 'moves'
@@ -2251,7 +2562,10 @@ def convert_single(a):
     outdir = os.path.abspath(a['out'])
     os.makedirs(outdir, exist_ok=True)
     if game.startswith('ps2_'):   # (an archive of characters: --item the character, as detect lists it - hex)
-        chars = lone_pac.ps2_characters(a['src'], game, os.path.join(outdir, '.lone'), __import__('moves_port').cache_dir(a['pac11'], os.path.join(outdir, '.lone')))
+        with open(a['src'], 'rb') as f:
+            if f.read(4) == b'PAC ' and not a.get('name'):   # (one entry: always character 1 - named by the file)
+                a = dict(a, name=os.path.splitext(os.path.basename(a['src']))[0])
+        chars =lone_pac.ps2_characters(a['src'], game, os.path.join(outdir, '.lone'), __import__('moves_port').cache_dir(a['pac11'], os.path.join(outdir, '.lone')))
         if a.get('item'):
             try:
                 cid = int(a['item'], 16)
@@ -2278,8 +2592,48 @@ def convert_single(a):
         o['base'] = int(o['base'])
     out, mod = build_single(cid, outdir, o, rep)
     rep.update(ok=True, out=out, folder=mod, game=game)
+    gear_flag(rep)
     progress(100, 'done')
     return rep
+
+
+def cmd_attires(a):
+    """attires --src <disc image | one character archive> [--game G] [--item K] --out D: every attire of a PS2
+    character drawn (ps2_char --attire-pictures) -> {ok, game, id, attires: [{attire, model_id, picture, meshes,
+    see_through, drawn_solid}]} - the numbers --attires takes. A disc: --game ps2_* and --item from list (decimal);
+    one file: --item from detect (hex; left out when it holds one character)."""
+    import lone_pac
+    import subprocess
+    if not a.get('src') or not a.get('out'):
+        raise BadInput('attires needs --src and --out')
+    outdir = os.path.abspath(a['out'])
+    os.makedirs(outdir, exist_ok=True)
+    tmpl = template104(a['pac11'])
+    if os.path.isfile(a['src']) and not discfs_image(a['src']):
+        game, _ = single_game(a)
+        if not game.startswith('ps2_'):
+            raise BadInput('attires is for PS2 characters (%s keeps its attires in the pac: convert takes the first 4)'
+                           % lone_pac.LABELS.get(game, game))
+        chars = lone_pac.ps2_characters(a['src'], game, os.path.join(outdir, '.lone'),
+                                        __import__('moves_port').cache_dir(a['pac11'], os.path.join(outdir, '.lone')))
+        if a.get('item'):
+            cid = int(a['item'], 16)
+        elif len(chars) == 1:
+            cid = int(chars[0]['id'], 16)
+        else:
+            raise BadInput('%s holds %d characters: say which with --item (detect lists them)' % (
+                os.path.basename(a['src']), len(chars)))
+        disc = lone_pac.ps2_disc(a['src'], game, os.path.join(outdir, '.lone'))
+    else:
+        if not str(a.get('game', '')).startswith('ps2_') or not a.get('item'):
+            raise BadInput('attires on a disc: --game ps2_* and --item (from list)')
+        cid, disc = int(a['item']), a['src']
+    r = subprocess.run([sys.executable, os.path.join(HERE, 'ps2_char.py'), disc, '%x' % cid, outdir, '--template', tmpl,
+                        '--attire-pictures'], capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise BadInput('ps2_char failed: %s' % (r.stderr or r.stdout)[-600:])
 
 
 def cmd_convert(a):
@@ -2307,7 +2661,7 @@ def cmd_convert(a):
     for k in ('base', 'entrance', 'call', 'max_port'):
         if o.get(k) is not None:
             o[k] = int(o[k])
-    fn = {'svr2010': build10, 'svr2009': build09, 'svr2008': build09, 'svr2007': build09, 'wwe12': buildW, 'wwe13': buildW,
+    fn = {'svr2010': build10, 'svr2009': build09, 'svr2008': build09, 'svr2007': build09, 'low': build09, 'wwe12': buildW, 'wwe13': buildW,
           'wwe2k14': buildW, 'wwe2k15': buildW, 'wwe2k16': buildW,
           'wwe2k17': buildW}.get(a['game'])
     if fn is None and a['game'].startswith('ps2_'):
@@ -2315,8 +2669,16 @@ def cmd_convert(a):
         fn = ps2_port.build_ps2
     out, mod = fn(cid, outdir, o, rep)
     rep.update(ok=True, out=out, folder=mod)
+    gear_flag(rep)
     progress(100, 'done')
     return rep
+
+
+def gear_flag(rep):
+    """rep['gear']: the mod's entrance-gear entries (kind 4: a coat / hat worn for the entrance) - the Mod Maker marks
+    such superstars with a coat and offers their gear to other mods"""
+    pac = os.path.join(rep.get('folder') or '', 'ch.pac')
+    rep['gear'] = sorted(n for n in pac_children(pac) if n.endswith('4')) if os.path.exists(pac) else []
 
 
 def main(argv):
@@ -2354,6 +2716,8 @@ def main(argv):
                                              + (['--svrmod', a['svrmod']] if a.get('svrmod') else [])
                                              + (['--game', a['game']] if a.get('game') else [])
                                              + ['--cache', __import__('moves_port').cache_dir(a['pac11'], os.path.join(HERE, 'work'))]))
+        elif cmd == 'attires':   # (a PS2 character's attires as pictures, to choose --attires)
+            res = cmd_attires(a)
         elif cmd == 'convert' and os.path.isfile(a.get('src') or '') and not discfs_image(a['src']):
             rep_path = os.path.join(os.path.abspath(a['out']), 'report.json') if a.get('out') else None
             res = cmd_convert(a)
@@ -2390,12 +2754,15 @@ def main(argv):
         return 2
     except Exception as e:   # noqa: BLE001
         traceback.print_exc(file=sys.stderr)
-        res = {'ok': False, 'error': '%s: %s' % (type(e).__name__, e), 'opens': 'superstar'}
+        res = {'ok': False, 'error': explain(e, a), 'opens': 'superstar',
+               'detail': ''.join(traceback.format_exception(type(e), e, e.__traceback__))[-3000:]}
         if rep_path:
             os.makedirs(os.path.dirname(rep_path), exist_ok=True)
             json.dump(res, open(rep_path, 'w'), indent=1)
         print(json.dumps(res))
         return 3
+    if _template_note and isinstance(res, dict):
+        res.setdefault('warnings', []).extend(_template_note)
     if rep_path:
         os.makedirs(os.path.dirname(rep_path), exist_ok=True)
         json.dump(res, open(rep_path, 'w'), indent=1)

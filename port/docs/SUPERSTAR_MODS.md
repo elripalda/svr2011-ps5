@@ -11,7 +11,7 @@ New playable characters from `<game>/Mods/Superstars/<folder>/`, up to 72.
 
 | file | |
 |---|---|
-| `manifest.txt` | `type=superstar`, `id=`, `name=` (31 chars), `short=`, `base=<id>`, `style=<name>`, `ratings=<7 numbers>`, `abilities=<ids>`, `moves=<file>`, `entrance=<number>`, `announcer=<NAME>`, `author=`, `version=`, `song=<file>`, `movie=<file>`, `call=<0-83>`, `height=<scale>`, `pose=<id>`, `voice=<file>`, `attire2..4=<file>`, `attire2..4_name=<text>`, `attire1..4_entrance=<number>` |
+| `manifest.txt` | `type=superstar`, `id=`, `name=` (31 chars), `short=`, `base=<id>`, `style=<name>`, `ratings=<7 numbers>`, `abilities=<ids>`, `moves=<file>`, `entrance=<number>`, `announcer=<NAME>`, `author=`, `version=`, `song=<file>`, `movie=<file>`, `call=<0-83>`, `height=<scale>`, `pose=<id>`, `voice=<file>`, `attire2..4=<file>`, `attire2..4_name=<text>`, `attire1..4_entrance=<number>`, `cae=<file>` |
 | `ch.pac` | the model pac (EPK8, like `pac/ch/chNNN.pac`). It can be any character's: the `EMD` names get the slot's id |
 | `theme.<ext>` | (optional) the entrance song: .mp3 .m4a .aac .wav .flac .wma .ogg |
 | `movie.bik` | (optional) the entrance movie: a 320x320 Bink, made in the launcher's Movies tab |
@@ -19,6 +19,7 @@ New playable characters from `<game>/Mods/Superstars/<folder>/`, up to 72.
 | `render_full.dds` | (optional) a separate 512 x 512 full-body picture for SSFB (the select screen in some modes); without it SSFB is `render.dds` too |
 | `voice.<ext>` | (optional) a recording of the name: the ring announcer "says" it |
 | `attireN.pac` | (optional, N = 2-4) another model pac: its first attire becomes the mod's attire N |
+| `threads.txt` | (optional) its Superstar Threads parts, from `tools/threads_parts.py` (see Superstar Threads) |
 | `moves.txt` | (optional, `moves=`) its own moves over the base's: lines `0xOFF=<move id>`, OFF a byte offset in the profile's move block (0..0x1BF, even) |
 | `disabled` | (optional) turns the mod off |
 
@@ -241,6 +242,24 @@ tab), `manifest.txt`:
   0x7530) are left out of the overlay copy; still over, the mod is left out,
   with a log line.
 
+#### A superstar from another game as attires of a game superstar
+
+The Mod Maker, From another game -> Superstar: after converting, **Or put it on a game superstar as an
+attire...** opens the Attires page with the converted mod taken in ("From a superstar mod..." on the Attires
+page takes an installed one, a .svrmod or a project the same way). Pick the game superstar, the attire number
+and **Its attire** (which of the ported attires); save or install, then again for the next attire.
+
+What follows the attire: the model (with its entrance gear, unless left out) and the entrance ("Keep its
+entrance": `entrance=`). What can't: the moveset, theme / music, titantron, ratings, abilities and name call are
+the superstar's profile (CHAR/PRO and the record), one per superstar for every attire - so they stay the game
+superstar's. (The game's only attire-dependent entrance - Rey Mysterio's attire 1 - is code, and Swagger's
+attire 1 music the same; none of it is data an attire mod can carry.) For his whole moveset and theme too, install
+the converted superstar as a superstar mod of its own.
+
+Test aids: `--port-test "superstar@wwe13,<disc folder>,101,--base 101 --no-port" --port-as-attire
+"101,3,1,Stone Cold 13;<save .svrmod>"` (convert, then attire 3 of 101 from its attire 1); `--attire
+101,4,<mod .svrmod>,<save>` with `--attire-from 2,Stone Cold 13 B`.
+
 Tested: an attire mod replacing Mark Henry's attire 1 with Sabu's model plays
 in a match; new attires (guest pacs) on Mark Henry (2) and Chris Jericho (3 and
 4, the launcher's move) play in matches (13 Oct).
@@ -324,6 +343,10 @@ the slot. A save made with the mod keeps the player's own edits.
   `song=` / `movie=`. Any entrance number works: a stock one, or one a move
   pack adds (converted from another game: `tools/entrance_port.py`,
   docs/OTHER_GAMES_ENTRANCES.md).
+- **`cae=<file>`:** a created entrance (CREATE AN ENTRANCE's ADVANCED
+  CREATION: motion, pyro and the rest per scene) as a 284-byte entrance block,
+  big-endian as the game holds it. The mod's slot plays it until the player
+  makes their own. Details: docs/ENTRANCE_ATTIRES.md 1.
 - **`attire<N>_entrance=<number>`** (N = 1-4, the mod's attire): that attire
   walks out with its own entrance, with or without a title - like Rey
   Mysterio's "Evil" attire, which the stock game does in code. A created
@@ -434,12 +457,83 @@ it.
 - The game's own IK solver (sub_823A4DD8) wasn't decoded; the preview's IK is
   an approximation that looks right on Jericho, The Rock and a Diva.
 
+## Superstar Threads
+
+`src/superstar_threads.cpp`, `tools/threads_parts.py`. Threads lists the
+superstars of `edit\edit.pac` EDIT/SSTL: one PACH child, a u16 count (68), then
+484-byte records:
+
+| bytes | |
+|---|---|
+| 0 | u32 id (little-endian) |
+| 4 | 48 u32 part-name string ids, 12 per attire (attire a, part p at (a-1)*12+p-1); -1 = none |
+| 196, 244, 292 | per part: area (the camera: 1 head, 2 arms, 3 chest, 5 waist / hands, 6 legs, 8 feet), view, kind |
+| 340 | per part: its default RGB |
+
+Part p of an attire paints where channel (p-1) % 4 (R G B A) of that attire's
+`Mask1` / `Mask2` / `Mask3` texture is set; the masks sit in the model's EMD
+entry next to `color` (children 0x0d-0x0f) and no mesh uses them. The names are
+the game's (string.pac group 0600 and its translations): ELBOW PADS, TRUNKS 1,
+KNEE PADS DESIGN 2 ... Each name always comes with the same area / view / kind.
+
+A superstar's three slots are the last 324 bytes of his 1056-byte profile
+(+0x2DC, +0x348, +0x3B4: 108 bytes each; +0 = -1 when empty, else the attire it
+started from; RGB per part from +4, the name at +0x28).
+
+At start the port writes `Mods\SuperstarOverlay\threads.pac`: the game's SSTL
+plus a record for each listed mod, as EDIT/SSTM. The game's lookup of
+`/EDIT/SSTL` is pointed at it; edit.pac is never written.
+
+- **Same model as its base** (attire-1 models byte for byte: an attire swap, a
+  renamed copy): the base's record under the mod's id.
+- **`threads.txt`** in the mod folder: its own parts. Lines
+  `<attire>.<part>=<name id>,<rrggbb>` (`format=1` first; `#` starts a
+  comment). The name id must be one a stock record uses; its area / view / kind
+  are taken from the stock parts of that name. `tools/threads_parts.py <mod
+  folder>` writes it from the model's masks: each used channel is named after
+  the body area under it (the bone weights of the vertices that sample it, and
+  their height) - TRUNKS 1 / 2 for two large waist channels, TRUNKS DESIGN n for
+  small ones, KNEE PADS, KICKPADS, BOOTS, SOLES ... - and gets the texture's
+  colour there as its default. `--json` is for the Mod Maker, `--names` lists the
+  usable names. superstar_port.py and svr10_superstar.py run it on every mod they
+  make. On the stock models it names the Rock's 8 parts as the game does, and
+  the others close to it.
+- **Models without masks** (ports from SvR 2006-2009 and the PS2 games):
+  `threads_parts.py <mod> --make-masks` paints them first (`--dry-run --preview
+  <png>` shows them over the colour texture). The skin's colour is read off the
+  head meshes (warm, mid-bright texels: not hair, beard or eyes); a texel of a
+  clothing mesh whose colour is far from it (RGB distance over 60) is cloth -
+  per texel, as a legs mesh holds trousers and knees. Cloth regions in the
+  texture (specks and seams opened away) get the body area under them and their
+  colour; regions of one area and colour make one channel, and the biggest
+  eight (arms, top, waist, legs, feet in that order) go into Mask1 / Mask2
+  (children 0x0d / 0x0e, A4R4G4B4, value 11 as the stock masks; BPE-compressed -
+  the game unpacks in place - by svrmod.exe or, without it, the Python coder,
+  about 20 s an attire). Left out: thin or skin-surrounded dark patterns
+  (tattoos), small skin-coloured regions (chest hair). Each mask's DDS reserved
+  words (+32) hold "SVRT" and its channels' body groups, so the names follow the
+  painter's group even where a model's hands sample its trousers' texels.
+  Height is measured along the skeleton (foot- to head-weighted vertices), as PS2
+  models stand in a T-pose. Empty masks (the PS2 converter writes blank ones) and
+  another model's (a template's: most of what they mark lies outside this
+  model's colour triangles) are replaced; `--remake-masks` replaces any. The
+  pac's first version is kept in `<mod>\.threads_backup`. superstar_port.py does
+  it on every mod it makes whose model needs it. Tested in game: Sabu (SvR 2008:
+  GLOVES, TRUNKS 1/2, TIGHTS, BOOTS, BOOTS DESIGN, SOLES; attire 2 adds a
+  SINGLET) and Goldberg (PS2 HCTP: WRIST TAPE, TRUNKS, KNEE PADS, BOOTS - his
+  tattoos left alone); Carlito (SvR 2008) gets TRUNKS and TIGHTS.
+- **Neither:** not listed; the log says why ("... has no threads.txt (Mod
+  Maker: make Threads parts)").
+- **Slots:** kept by the mod's folder in `Saves\.threads\<folder>.bin` (324
+  bytes), not by the id it holds this run. They are put into its profile as it
+  is set up (empty when there is no file - never the base's), and written when
+  the game saves (the file is removed when all three are empty).
+
 ## Known limits
 
 - A mod has at most 4 attires.
-- Superstar Threads doesn't list mods (nor the managers). It lists the COS
-  table's characters, a table with room for only about 13 more, and saves
-  attires by its rows. Use attire pacs instead.
+- Superstar Threads lists a mod only with its base's model or a threads.txt, and paints only models
+  with masks (see above).
 - WWE Universe lists are not checked. The select screen itself is: one on one, tag team (2 on 2), and the
   COM side.
 

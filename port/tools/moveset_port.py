@@ -19,6 +19,7 @@ banks), on a free record in the template's thousand: moves_port's YMBs path. Sub
 keep the base's.
 """
 import collections
+import glob
 import json
 import os
 import shutil
@@ -118,6 +119,8 @@ def port_moveset(c):
         nm = c.waze.get(v, '')
         if sl.get('fixed'):
             continue
+        if not v or (v not in c.waze and v not in w11):   # (an empty slot - 0 - or no move record: the base's; 0 was
+            continue                                    # "ported" as MOVE 0 into Rumble slots, Mankind '13)
         if getattr(c, 'select', None) is not None and to not in c.select:   # (moveset-pack --rows: these slots only)
             continue
         bank = (sl.get('bank') or '').strip()
@@ -125,7 +128,16 @@ def port_moveset(c):
             cand = [v]
         else:
             cand = sorted(by11.get(_norm(nm), set())) if nm else []
-        fit = [x for x in cand if x in moved and (to in in_slot[x] or menu_of.get(to, '') in in_menu[x])]
+        fit = [x for x in cand if x in moved and MP.usable11(w11, x) and (to in in_slot[x] or menu_of.get(to, '') in in_menu[x])]
+        # (a taunt - 9000-9999, as 2007-2011 keep them - only in a taunt slot, and the ring movement sets (BASE) only
+        # as 2011 itself has them: SvR 2007's map put Booker T's and Kurt Angle's taunts in the ring in / out slots and
+        # strike slots - in a Hell in a Cell they ran on forever or froze, report 20261101-180328)
+        if 9000 <= v < 10000 and menu_of.get(to) != 'Taunts':
+            rows.append((so, to, v, nm, 'base kept (a taunt in a %s slot)' % (menu_of.get(to) or 'move'), base[to // 2]))
+            continue
+        if bank == 'BASE' and not fit:
+            rows.append((so, to, v, nm, 'base kept (a ring movement slot: 2011\'s own sets only)', base[to // 2]))
+            continue
         if fit:
             area[to // 2] = fit[0]
             rows.append((so, to, v, nm, 'same move in 2011', fit[0]))
@@ -152,8 +164,14 @@ def port_moveset(c):
                                                              'porting off'), base[to // 2]))
     pack = None
     if to_port:
-        free = [i for i in sorted(w11) if i not in g11m.moved and i > 1000]
-        used = set()
+        # (never a stock one's, nor one another mod's pack already defines: packs are merged by move id - Mankind's
+        # signature 2437 was Maria's and Bob Orton's 2437 too, whose waze line took its signature bits, 29 Oct)
+        taken = other_pack_ids(c.pac11, '%s %d' % (c.gid, c.cid))
+        free = [i for i in sorted(w11) if i not in g11m.moved and i > 1000 and i not in in_slot and i not in taken]
+        used = set(taken)   # (moves_port's own re-pick under a bank's id limit avoids them too: _avoid)
+        # (a re-port gives each slot the id its last version had: the free pool shifts with what else is installed, so
+        # the hashed pick alone moved Mankind 2.0.3's signatures / finishers off 2.0.2's ids)
+        prev = own_pack_slots(c.pac11, '%s %d' % (c.gid, c.cid))
         pdir = os.path.join(c.work, 'moveset_port')
         if os.path.exists(pdir) and not getattr(c, 'dry', False):
             shutil.rmtree(pdir)
@@ -173,6 +191,10 @@ def port_moveset(c):
             new_id = None
             if getattr(c, 'same_ids', False) and v in w11 and v not in g11m.moved and v > 1000 and v not in used:
                 new_id = v   # (SvR 2007-2009: 2011 keeps the move's own record, without a motion)
+            if new_id is None:
+                old = next((prev[to] for to in tos if prev.get(to) and prev[to] not in used), None)
+                if old is not None and old in w11 and old not in g11m.moved and old not in in_slot:
+                    new_id = old
             pool = free
             if v in templ:   # (a taunt: a record in the template's thousand - 9000-9999; elsewhere the match didn't find it)
                 pool = [i for i in free if i // 1000 == templ[v] // 1000] or free
@@ -188,7 +210,7 @@ def port_moveset(c):
             used.add(new_id)
             r = {'notes': [], 'warnings': [], 'dropped': []}
             a = dict(game=c.gid, item=str(v), out=os.path.join(pdir, str(v)), pac11=c.pac11, svrmod=c.svrmod,
-                     id=str(new_id), _g=c.mgame, _g11=g11m)
+                     id=str(new_id), _g=c.mgame, _g11=g11m, _avoid=used)
             if v in templ:
                 a['template'] = str(templ[v])
             a['cat'] = (slots.get(tos[0]) or {}).get('bank') or ''   # (template categories: the slot's - moves_port)
@@ -216,10 +238,23 @@ def port_moveset(c):
             finally:
                 stages, MP.DEADLINE, MP.QUIET, MP.STAGES = MP.STAGES, None, False, None
             log('%s ported in %.1f s (%s)' % (line, time.time() - t0, stage_times(stages)))
+            if r.get('id') and r['id'] != new_id:   # (moves_port moved it under its template banks' id limit)
+                used.discard(new_id)
+                new_id = r['id']
+                used.add(new_id)
             for to in tos:
                 area[to // 2] = new_id
                 rows.append((None, to, v, nm, 'ported (template %s)' % r.get('template'), new_id))
             lines += open(os.path.join(r['folder'], 'pack.txt')).read().splitlines()
+            # (a signature / finisher: the record needs categories 2 and 3 - every one of 2011's roster's has them; a
+            # template without them left the slot empty - Mankind's Double Arm DDT 2 on Spin Fisherman Suplex 1)
+            tb = w11.get(int(r.get('template') or 0), (b'', ''))[0]
+            if any(to in SPECIAL_SLOTS for to in tos) and len(tb) == 16 and not (tb[0] & 0x0C) == 0x0C:
+                bits = bytearray(tb)
+                bits[0] |= 0x0C
+                lines.append('waze %d %s' % (new_id, bits.hex()))
+                c.rep['notes'].append('moveset: "%s" given the signature / finisher categories (its template %s had '
+                                      'none)' % (nm, r.get('template')))
             motions.append(os.path.join(r['folder'], 'motions'))
         if lines:
             pack = os.path.join(c.work, 'moveset_pack')
@@ -232,6 +267,85 @@ def port_moveset(c):
             open(os.path.join(pack, 'pack.txt'), 'w', newline='\n').write('\n'.join(lines) + '\n')
     moves_txt = ['0x%03X=%d' % (k * 2, v) for k, v in enumerate(area) if v != base[k]]
     return {'moves_txt': moves_txt, 'rows': rows, 'pack': pack}
+
+
+SPECIAL_SLOTS = (0x1E, 0x20, 0x22, 0x24)   # (2011's signature 1/2 and finisher 1/2 - pro_slots.json)
+
+
+def other_pack_ids(pac11, source=None):
+    """the move ids the move packs beside the game define (waze / wazecopy / wazename lines): the Bundled Mods'
+    .svrmod files and the installed Mods' folders of the game folder that holds pac11. A pack whose manifest has
+    source=<source> is the superstar being ported again and is left out (a re-port keeps its ids: Mankind 2.0.3,
+    ported beside an installed 2.0.2, got four new signature / finisher ids - move-sets made on 2.0.2 lost them)"""
+    import re
+    import zipfile
+    game = os.path.dirname(os.path.abspath(pac11))
+    pat = re.compile(r'^(?:waze|wazecopy|wazename)\s+(\d+)\s', re.M)
+    mine = re.compile(r'^source\s*=\s*%s\s*$' % re.escape(source), re.M) if source else None
+    ids = set()
+    for f in glob.glob(os.path.join(game, 'Bundled Mods', '*.svrmod')):
+        try:
+            with zipfile.ZipFile(f) as z:
+                names = z.namelist()
+                if mine and any(n.endswith('manifest.txt') and mine.search(z.read(n).decode('utf-8', 'replace'))
+                                for n in names):
+                    continue
+                for n in names:
+                    if n.endswith('pack.txt'):
+                        ids.update(int(x) for x in pat.findall(z.read(n).decode('utf-8', 'replace')))
+        except (OSError, zipfile.BadZipFile):
+            continue
+    for f in glob.glob(os.path.join(game, 'Mods', '**', 'pack.txt'), recursive=True):
+        try:
+            man = os.path.join(os.path.dirname(os.path.dirname(f)), 'manifest.txt')   # (<mod>/moves/pack.txt)
+            if mine and os.path.exists(man) and mine.search(open(man, encoding='utf-8', errors='replace').read()):
+                continue
+            ids.update(int(x) for x in pat.findall(open(f, encoding='utf-8', errors='replace').read()))
+        except OSError:
+            continue
+    return ids
+
+
+def own_pack_slots(pac11, source):
+    """{moveset offset: move id} of the slots the superstar's installed version (manifest source=<source>, in the
+    Bundled Mods or the Mods) filled with its own ported moves (ids its pack copies - wazecopy - or sets the
+    category bits of - waze: an SvR 2007-2009 move on its own 2011 record) - {} if none"""
+    import re
+    import zipfile
+    game = os.path.dirname(os.path.abspath(pac11))
+    mine = re.compile(r'^source\s*=\s*%s\s*$' % re.escape(source), re.M)
+    texts = []
+    for f in glob.glob(os.path.join(game, 'Bundled Mods', '*.svrmod')):
+        try:
+            with zipfile.ZipFile(f) as z:
+                rd = {n: z.read(n).decode('utf-8', 'replace') for n in z.namelist()
+                      if n.endswith(('manifest.txt', 'moves.txt', 'pack.txt'))}
+        except (OSError, zipfile.BadZipFile):
+            continue
+        texts.append(rd)
+    for man in glob.glob(os.path.join(game, 'Mods', '**', 'manifest.txt'), recursive=True):
+        d = os.path.dirname(man)
+        rd = {}
+        for n in ('manifest.txt', 'moves.txt', os.path.join('moves', 'pack.txt')):
+            try:
+                rd[n.replace(os.sep, '/')] = open(os.path.join(d, n), encoding='utf-8', errors='replace').read()
+            except OSError:
+                pass
+        texts.append(rd)
+    for rd in texts:
+        if not any(n.endswith('manifest.txt') and mine.search(t) for n, t in rd.items()):
+            continue
+        copied = {int(x) for n, t in rd.items() if n.endswith('pack.txt')
+                  for x in re.findall(r'^(?:wazecopy|waze)\s+(\d+)\s', t, re.M)}
+        out = {}
+        for n, t in rd.items():
+            if n.endswith('moves.txt') and not n.endswith('pack.txt'):
+                for o, i in re.findall(r'^0x([0-9A-Fa-f]+)=(\d+)\s*$', t, re.M):
+                    if int(i) in copied:
+                        out[int(o, 16)] = int(i)
+        if out:
+            return out
+    return {}
 
 
 def merge_pack(pack, mod):

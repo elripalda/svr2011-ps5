@@ -13,11 +13,15 @@
 //     without it holds the match back the same way;
 //   - a mod superstar's id is each PC's own (slots.txt): ids are translated
 //     where the lobby's records, picks and superstar blocks arrive;
-//   - the lobby's CHAT says what each player lacks.
+//   - the lobby's CHAT says what each player lacks;
+//   - weapon mods (weapon_mods.h) by their own keys: the host's mod weapons
+//     that every player has play in its Extreme Rules matches.
 #pragma once
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct PPCContext;
 
@@ -48,5 +52,17 @@ bool OnlineModsMayStart(uint8_t* base, uint32_t L);
 // A superstar (this game's id) every player in the lobby has - a stock one,
 // or a mod all have: for the host's own picks (CPU slots, Mystery Opponent).
 bool OnlineModEveryoneHas(uint32_t id);
+// A match's move in an online session: false when it's from a move pack not
+// every player of the lobby has (and the stock game can't play it) - then it
+// plays its category's default, the same on every game (cam_mod_moves.cpp).
+bool OnlinePackMoveAllowed(uint16_t id);
+// The host's mod weapons for this lobby's Extreme Rules matches, those every player has (weapon_mods.h; the host
+// decides from its WEAPONS page, the others echo it before START): {this game's weapon id, count}.
+std::vector<std::pair<int, int>> OnlineModWeapons();
+// (a client) What the lobby's tables say this game lacks of the host's superstar mods and the session's arena:
+// their labels (mod_transfer.h's offer when the link goes through the relay and nothing can come).
+std::vector<std::string> OnlineModsLackedFromHost();
+// (a client) The session's host's name, as its mod table says ("" none yet).
+std::string OnlineModsHostName();
 
 }  // namespace svr2011

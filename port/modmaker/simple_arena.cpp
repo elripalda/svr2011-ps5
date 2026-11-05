@@ -3,6 +3,7 @@
 // step's controls - beside a 3D view of the arena. The full page and the 3D editor stay one click away and nothing is
 // lost going back and forth.
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -35,8 +36,9 @@ const simple::Step kSteps[kSaCount] = {
     {"Finish", "Check everything, then save your arena or put it in the game."},
 };
 
-// The games with arenas the converters take (arena_port.py `games`: SvR 2007 - 2010 ready, WWE '12 - 2K17 native).
-const char* const kArenaGames[] = {"svr2007", "svr2008", "svr2009", "svr2010", "wwe12", "wwe13", "wwe2k14", "wwe2k15", "wwe2k16", "wwe2k17"};
+// The games with arenas the converters take (arena_port.py `games`: SvR 2007 - 2010 and Legends of WrestleMania ready,
+// WWE '12 - 2K17 native).
+const char* const kArenaGames[] = {"svr2007", "svr2008", "svr2009", "svr2010", "low", "wwe12", "wwe13", "wwe2k14", "wwe2k15", "wwe2k16", "wwe2k17"};
 bool NativeGame(const std::string& key) { return key.rfind("wwe", 0) == 0; }
 
 int g_start_mode = -1;      // 0 an arena in the game, 1 from my other games, 2 an empty hall
@@ -50,8 +52,9 @@ std::string g_name_typed;   // the name the player typed (kept when the start ch
 // then name=, banner=<picture>, tex=<texture>:<picture> (apron:<picture>: the first apron), sign=<picture>,
 // load=<picture>, step=<n>, save=<file.svrmod> (saved, the log beside it, quit)
 std::vector<std::string> g_test;
-int g_test_stage = -1;  // 0 start, 1 wait for the arena, 2 the rest, 3 done
+int g_test_stage = -1;  // 0 start, 1 wait for the arena, 2 the rest, 3 done, 4 installing
 int g_test_step = -1;
+std::string g_test_log;  // (install=: the log file written when the install is done)
 
 // ---- pictures
 
@@ -74,6 +77,10 @@ bool PictureBox(const char* id, Picture* shown, float w, float h, const wchar_t*
   if (ImGui::Button("Pick a picture...", ImVec2(w, 0))) {
     const std::wstring f = PickFile(false, title, kPictureFilter, 1);
     if (!f.empty() && LoadPicture(f, got)) picked = true;
+    else if (!f.empty()) {
+      Status("That file isn't a picture the Mod Maker can read (PNG, JPG, BMP, TGA, or a DXT1 / DXT5 DDS).");
+      Log("Simple arena: not a picture it reads - " + Utf8(f));
+    }
   }
   ImGui::EndGroup();
   std::vector<std::wstring> dropped;
@@ -245,15 +252,16 @@ void StartFromDisc() {
   if (choosing || (g_disc_key.empty() && !lone)) {
     if (ImGui::Button("One arena file (.pac)...")) {
       static const COMDLG_FILTERSPEC kPac[1] = {{L"An arena file (bgNN.pac)", L"*.pac"}};
-      const std::wstring f = PickFile(false, L"One arena file from another game (SvR 2007 - WWE 2K17: pac\\bg\\bgNN.pac)", kPac, 1);
-      if (!f.empty()) g_lone_file = f, port_page::ClearEmbeddedResult(), choosing = false;
+      const std::wstring f = PickFile(false, L"One arena file from another game (SvR 2007 - WWE 2K17: pac\\bg\\bgNN.pac)", kPac, 1,
+                                      nullptr, nullptr, OtherGameStart());
+      if (!f.empty()) OtherGamePicked(f), g_lone_file = f, port_page::ClearEmbeddedResult(), choosing = false;
     }
     ImGui::SameLine();
     ImGui::TextDisabled("(no disc: just the arena's bgNN.pac, e.g. one a friend sent)");
   }
   if (!n && choosing) ImGui::TextColored(kWarn, "None of your games with arenas is in My game discs yet.");
   if (missing && choosing) {
-    ImGui::TextDisabled("%d more game%s with arenas can be added (SvR 2007 - 2010, WWE '12 - 2K17).", missing, missing == 1 ? "" : "s");
+    ImGui::TextDisabled("%d more game%s with arenas can be added (SvR 2007 - 2010, Legends of WrestleMania, WWE '12 - 2K17).", missing, missing == 1 ? "" : "s");
     ImGui::SameLine();
     if (ImGui::SmallButton("My game discs...")) GoTo(PageId::kDiscs);
   }
@@ -292,11 +300,14 @@ void StartFromDisc() {
     if (go) {
       const disc_list::Game* g = g_lone_file.empty() ? disc_list::GameByKey(g_disc_key) : nullptr;
       const std::string stem = Utf8(fs::path(got).stem().wstring());
+      const std::string scanned = port_page::EmbeddedName();  // (the game's own name of the arena, from the scan)
       const std::string name = !g_name_typed.empty() ? g_name_typed
                                : !g_lone_file.empty() ? stem
+                               : !scanned.empty()     ? scanned
                                                       : std::string(g ? g->name : "Arena") + " " + stem.substr(stem.rfind('_') + 1);
+      const std::wstring picture = port_page::EmbeddedPicture();  // (the disc's picture: banner + loading screen)
       port_page::ClearEmbeddedResult();
-      other_page::ConvertArena(got, g_native_host, name, false);
+      other_page::ConvertArena(got, g_native_host, name, false, picture);
     }
     return;
   }
@@ -371,6 +382,10 @@ void StepPictures() {
       Image img;
       if (PictureBox(name.c_str(), pic, tw, h, Wide("A picture for " + name).c_str(), img, name.c_str())) {
         if (ReplaceArenaTexture(name, img)) Log("Simple arena: " + name + " replaced");
+        else {
+          Status(name + " couldn't take that picture (its texture is of a kind the Mod Maker doesn't rewrite).");
+          Log("Simple arena: " + name + " NOT replaced (" + std::to_string(img.w) + "x" + std::to_string(img.h) + ")");
+        }
       }
       const auto sz = g_sizes.find(name);
       ImGui::TextDisabled("%s", name.c_str());
@@ -571,6 +586,14 @@ void StepFinish() {
 
 void TestRun() {
   if (g_test_stage < 0 || g_test.empty()) return;
+  if (g_test_stage == 4) {  // (install=1: once the build and the copy are done, the result into the log, then close)
+    if (Busy()) return;
+    g_test_stage = 3;
+    Log("simple arena test: install done (the status line above says where)");
+    WriteLogTo(fs::path(Wide(g_test_log)).wstring());
+    PostMessageW(g_wnd, WM_CLOSE, 0, 0);
+    return;
+  }
   if (g_test_stage == 0) {
     const std::string s = g_test[0];
     std::vector<std::string> p;
@@ -607,12 +630,21 @@ void TestRun() {
     return;
   }
   if (g_test_stage == 1) {
+    static const auto since = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - since > std::chrono::minutes(20)) {  // (never an arena: the log says why)
+      Log("simple arena test: no arena after 20 minutes - stopped");
+      if (!g_test_log.empty()) WriteLogTo(fs::path(Wide(g_test_log)).wstring());
+      PostMessageW(g_wnd, WM_CLOSE, 0, 0);
+      g_test_stage = 3;
+      return;
+    }
     if (!g_proj.edited || Busy() || editor::Busy()) return;
     g_test_stage = 2;
   }
   if (g_test_stage != 2) return;
   g_test_stage = 3;
   std::wstring save;
+  bool install = false;
   for (size_t k = 1; k < g_test.size(); ++k) {
     const std::string& t = g_test[k];
     const size_t eq = t.find('=');
@@ -625,10 +657,12 @@ void TestRun() {
     else if (key == "sign") AddSigns({Wide(v)});
     else if (key == "step") g_simple_step = std::clamp(std::atoi(v.c_str()), 0, int(kSaCount) - 1);
     else if (key == "save") save = Wide(v);
+    else if (key == "install") install = v == "1", g_test_log = v == "1" ? g_test_log : v;  // (install=1 | install=<log file>)
     else if (key == "tex") {  // <texture>:<picture> (apron: the first apron picture)
       std::string tex = v.substr(0, v.find(':')), file = v.substr(v.find(':') + 1);  // (the first colon: names have none)
       if (tex == "apron") tex = Groups()[0].names.empty() ? "" : Groups()[0].names[0];
       if (!tex.empty() && LoadPicture(Wide(file), img)) Log(std::string("simple arena test: ") + tex + (ReplaceArenaTexture(tex, img) ? " replaced" : " NOT replaced"));
+      else if (!tex.empty()) Log("simple arena test: " + tex + " - not a picture it reads: " + file);
     }
   }
   if (g_test_step >= 0) g_simple_step = g_test_step;
@@ -641,6 +675,13 @@ void TestRun() {
     std::vector<Problem> problems;
     ArenaProblems(problems);
     for (const auto& p : problems) Log(std::string("simple arena test: problem (step ") + std::to_string(p.step) + ") " + p.text);
+  }
+  if (install || !g_test_log.empty()) {  // (Finish's "Put it in the game": into the game's Mods\Arenas, the game not started)
+    if (g_test_log.empty()) g_test_log = Utf8((save.empty() ? fs::path(L"simple_arena_install") : fs::path(save)).wstring()) + ".log";
+    Log("simple arena test: install");
+    InstallMod(false);
+    g_test_stage = 4;
+    return;
   }
   if (!save.empty()) {
     SaveModTo(save, [save](bool ok) {
@@ -663,6 +704,8 @@ void TestSimpleStart(const std::string& spec) {
     if (c > at) g_test.push_back(spec.substr(at, c - at));
     at = c + 1;
   }
+  for (const auto& t : g_test)  // (install=<log file>: known from the start - a run that never gets an arena writes it too)
+    if (t.rfind("install=", 0) == 0 && t != "install=1") g_test_log = t.substr(8);
   g_test_stage = g_test.empty() ? -1 : 0;
 }
 

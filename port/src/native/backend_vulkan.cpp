@@ -9,6 +9,8 @@
 #include "native/gpu.h"
 #include "frame_rate.h"
 
+#include <atomic>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <iterator>
@@ -39,6 +41,8 @@ namespace {
 
 // The depth buffers' format (DepthFormat): ReportDevice picks it.
 plume::RenderFormat g_depth_format = plume::RenderFormat::D24_UNORM_S8_UINT;
+// The GPU's largest 2D image side (VkPhysicalDeviceLimits; 0 until ReportDevice): the render scale's limit.
+std::atomic<uint32_t> g_max_image_side{0};
 
 // What a player's log needs to tell why the native renderer does or doesn't
 // run on their GPU (Mali, old Adreno drivers): the device, the features it
@@ -59,6 +63,7 @@ bool ReportDevice(const rex::external_frame::VulkanDevice& d) {
   get_properties(physical, &props);
   VkPhysicalDeviceFeatures features;
   get_features(physical, &features);
+  g_max_image_side = props.limits.maxImageDimension2D;
   // (vulkan_simulate_mali: the SDK hides Mali's missing features - here the
   // formats it can't filter or read too, so their paths run on another GPU)
   const bool simulated = rex::cvar::GetFlagByName("vulkan_simulate_mali") == "true";
@@ -323,5 +328,47 @@ class VulkanBackend final : public Backend {
 }  // namespace
 
 std::unique_ptr<Backend> CreateVulkanBackend() { return std::make_unique<VulkanBackend>(); }
+
+
+uint32_t VulkanMaxImageSide() { return g_max_image_side.load(); }
+
+// VK_EXT_memory_budget on the emulator's physical device: the device-local heaps' use and budget (phones: the shared
+// memory the driver gives the GPU).
+bool VulkanVideoMemory(uint64_t* used, uint64_t* budget) {
+  const rex::external_frame::VulkanDevice* d = rex::external_frame::GetVulkanDevice();
+  if (!d || !d->get_instance_proc_addr || !d->physical_device) return false;
+  static std::mutex mutex;
+  static int supported = -1;
+  static PFN_vkGetPhysicalDeviceMemoryProperties2 props2 = nullptr;
+  std::lock_guard lock(mutex);
+  const auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(d->get_instance_proc_addr);
+  const auto instance = static_cast<VkInstance>(d->instance);
+  const auto pd = static_cast<VkPhysicalDevice>(d->physical_device);
+  if (supported < 0) {
+    supported = 0;
+    const auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(gipa(instance, "vkEnumerateDeviceExtensionProperties"));
+    props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(gipa(instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    uint32_t n = 0;
+    if (enumerate && props2 && enumerate(pd, nullptr, &n, nullptr) == VK_SUCCESS) {
+      std::vector<VkExtensionProperties> ext(n);
+      if (enumerate(pd, nullptr, &n, ext.data()) == VK_SUCCESS)
+        for (const auto& e : ext)
+          if (!std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) supported = 1;
+    }
+  }
+  if (!supported) return false;
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {};
+  b.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+  VkPhysicalDeviceMemoryProperties2 p = {};
+  p.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+  p.pNext = &b;
+  props2(pd, &p);
+  uint64_t u = 0, g = 0;
+  for (uint32_t i = 0; i < p.memoryProperties.memoryHeapCount; ++i)
+    if (p.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) u += b.heapUsage[i], g += b.heapBudget[i];
+  if (!g) return false;
+  *used = u, *budget = g;
+  return true;
+}
 
 }  // namespace svr2011::native::backend

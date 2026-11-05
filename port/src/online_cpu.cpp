@@ -51,6 +51,7 @@
 #include "online_mods.h"
 #include "online_overlay.h"
 #include "online_rules.h"
+#include "util.h"
 
 REXCVAR_DEFINE_BOOL(online_cpu_slots, true, "Online",
                     "CPU players in online Player Matches: the host's Y on a vacant lobby slot");
@@ -264,9 +265,10 @@ REX_HOOK_RAW(sub_824E6510) {
     PicturesFrame(ctx, base, L);
     g_lobby_seen = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now().time_since_epoch()).count();
-    static uint32_t last_state = 0xFFFFFFFF;
+    static uint32_t last_state = 0xFFFFFFFF, last_cursor = 0xFFFFFFFF;
     if (LogOn() && state != last_state) REXLOG_INFO("online cpu: lobby state {} (cursor slot {})", state, j);
-    last_state = state;
+    else if (LogOn() && j != last_cursor) REXLOG_INFO("online cpu: lobby cursor slot {} (state {})", j, state);
+    last_state = state, last_cursor = j;
     if (LogOn()) {  // (the slot records when one changes: state, net player, superstar)
       static std::string last;
       std::string now = fmt::format("joined {} me {}:", Rd32(base + L + 24), Rd32(base + L + 20));
@@ -531,6 +533,50 @@ REX_HOOK_RAW(sub_82893958) {
   if (ready) ctx.r3.u64 = 1;
 }
 
+// The match's pad exchange - sub_82893BD0(N) sends this machine's pad,
+// sub_82893E18(N) takes each entry's (both hooked in net_stats.cpp, which
+// makes this scope around them): both take a lobby slot (this machine's
+// +2232, an entry's +4) to be below the entry count +2236, as in the game,
+// where the humans fill the first slots. With CPU slots the count is the
+// humans' (sub_824E5398 above), so a human in a higher slot - 3P with 2P a CPU
+// - neither sent nor took a pad: that wrestler stood still on every machine
+// (2.1.8 report 9d0eae; 4P with three humans the same). For the call the count
+// reaches the highest human slot, the entries past the real ones say "no slot"
+// (-1: skipped), and the left count +2248 goes up alike (its "everyone else has
+// left": +2248 + 1 == the count, stays what it was).
+namespace svr2011 {
+OnlineCpuPadScope::OnlineCpuPadScope(uint8_t* base, uint32_t net) : base_(base) {
+  const uint32_t L = Lobby(base);
+  if (!net || !L || !CpuCount(base, L)) return;
+  const uint32_t count = Rd32(base + net + 2236);
+  if (!count || count > 6) return;
+  uint32_t top = Rd32(base + net + 2232);  // (this machine's slot)
+  if (top >= 6) top = 0;
+  for (uint32_t i = 0; i < count; ++i)
+    if (const uint32_t slot = Rd32(base + net + 72 * i + 4); slot < 6) top = std::max(top, slot);
+  const uint32_t wide = top + 1;
+  if (wide <= count) return;
+  net_ = net, count_ = count, wide_ = wide, left_ = Rd32(base + net + 2248);
+  for (uint32_t i = count; i < wide; ++i) {
+    slots_[i] = Rd32(base + net + 72 * i + 4);
+    Wr32(base + net + 72 * i + 4, 0xFFFFFFFF);
+  }
+  Wr32(base + net + 2236, wide);
+  Wr32(base + net + 2248, left_ + wide - count);
+  static int logged = 0;
+  if (logged++ < 4)
+    REXLOG_INFO("online cpu: pad exchange over {} entries for the human in slot {} ({} entries)", wide, top, count);
+}
+
+OnlineCpuPadScope::~OnlineCpuPadScope() {
+  if (!net_) return;
+  for (uint32_t i = count_; i < wide_; ++i) Wr32(base_ + net_ + 72 * i + 4, slots_[i]);
+  Wr32(base_ + net_ + 2236, count_);
+  // (back by what was added: a player who left during the call still counts)
+  Wr32(base_ + net_ + 2248, Rd32(base_ + net_ + 2248) - (wide_ - count_));
+}
+}  // namespace svr2011
+
 // The lobby's help bar: the screen picks its bar id every frame (sub_824E5578,
 // then sub_824E3E60(screen, &id) adjusts it), and the bar is only rebuilt
 // when the id changes (the host's lobby has a few - 1286, and others by what
@@ -702,9 +748,7 @@ uint32_t TagFor(const std::string* render) {
   return kPictureTag | uint32_t(g_given.size() - 1);
 }
 
-int64_t NowMs() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
+using svr2011::NowMs;
 
 // A slot's player's online id (the network library's: the lobby's table at
 // L + 0x2CF20 was empty on the host for a joiner's slot).

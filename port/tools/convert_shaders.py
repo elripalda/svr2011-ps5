@@ -94,10 +94,13 @@ def fxc_source(text):
 # does: clamp(rsqrt(x), FLT_MIN, FLT_MAX) (FLT_MIN being -FLT_MAX there). fxc
 # takes floats as finite and drops such a clamp, so rsqrt(0) stayed infinite and
 # a zero vector normalised (0 * inf) was NaN - D3D11 drew the ringside floor and
-# the barricade tops white. The clamps go through a function whose result is
-# precise (kept as written; /Gis would make every operation precise).
-FINITE_HELPER = ("float SvrFinite(float x) { precise float y = clamp(x, asfloat(0xff7fffff), asfloat(0x7f7fffff)); "
-                 "return y; }\n")
+# the barricade tops white. The clamps go through a function on the float's bits
+# (integer operations: nothing fxc or a driver can fold away): the magnitude
+# capped at FLT_MAX, the sign kept - +-inf (and NaN) become +-FLT_MAX, finite
+# values pass bit for bit. (The first version, a `precise` float clamp, broke
+# the wrestlers' skin on Fermi GPUs - GT 430, report 20261102-175019-77d3c2.)
+FINITE_HELPER = ("float SvrFinite(float x) { uint u = asuint(x); "
+                 "return asfloat((u & 0x80000000u) | min(u & 0x7fffffffu, 0x7f7fffffu)); }\n")
 FINITE_TAIL = ", FLT_MIN, FLT_MAX)"
 
 
@@ -262,6 +265,9 @@ def main():
                                    os.path.join(out, "hlsl_d3d11"), model)
                 if err and (not name.startswith("debug_") or name.startswith("debug_solid")):
                     results.append((name, "own " + ext[1:], err))
+    # FSR 2's passes (fsr2_shaders.py: DXIL + SPIR-V, Direct3D 12 / Vulkan only).
+    import fsr2_shaders
+    results += [(name, "fsr2 " + what, err) for name, what, err in fsr2_shaders.build(out)]
     failed = [r for r in results if r[1]]
     with open(os.path.join(out, "report.txt"), "w") as rep:
         rep.write(f"{len(files)} shaders, {len(files) - len(failed)} converted to DXIL, SPIR-V and DXBC\n")

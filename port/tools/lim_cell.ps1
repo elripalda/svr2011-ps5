@@ -5,6 +5,7 @@
 #   .\lim_cell.ps1 -Name cell1 -Rule 31 [-Env "SVR2011_TEST_CELL=1","SVR2011_TEST_CELL_ROOF=-80"] [-Secs 90]
 param([string]$Name = "cell", [string]$Rule = "", [string[]]$Env = @(), [int]$Secs = 90, [int]$ShotEvery = 15,
       [string]$People = "JOHN CENA,RANDY ORTON", [string]$Arena = "1", [string[]]$Extra = @(), [string[]]$AfterStart = @(), [switch]$Human)
+$env:SVR2011_AUDIO_MUTE = "1"  # (test games stay muted even if their command line is lost)
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 if (-not ("WC" -as [type])) {
@@ -55,6 +56,7 @@ $env:SVR2011_USER_DATA = Join-Path $runs "test_userdata_lim"; $env:SVR2011_NATIV
 $set += "SVR2011_INPUT_FILE", "SVR2011_CONFIG", "SVR2011_USER_DATA", "SVR2011_NATIVE_WINDOW_POS", "SVR2011_WINDOW_BEHIND"
 $log = Join-Path $runs "lim_$Name.log"; Remove-Item $log -ErrorAction SilentlyContinue
 $a = @("--log_file=`"$log`"", "--log_level=info", "--audio_mute=true", "--fullscreen=false", "--monitor=2") + $Extra
+Use-SvrTestServer -GameDir $game -GameArgs $a | Out-Null
 $p = Start-Process (Join-Path $game "svr2011.exe") -WorkingDirectory $game -ArgumentList $a -PassThru -WindowStyle Minimized
 try {
     for ($t = 0; $t -lt 100; $t++) { $p.Refresh(); if ($p.HasExited -or $p.MainWindowHandle -ne [IntPtr]::Zero) { break }; Start-Sleep -Milliseconds 100 }

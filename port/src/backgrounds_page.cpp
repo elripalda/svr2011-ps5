@@ -23,6 +23,7 @@
 // 256 A8R8G8B8) turns transparent.
 
 #include "backgrounds_page.h"
+#include "no_mods.h"
 
 #include <algorithm>
 #include <array>
@@ -55,6 +56,7 @@
 
 #include "generated/default/svr2011_init.h"
 #include "graphics_page.h"
+#include "util.h"
 
 REXCVAR_DEFINE_STRING(menu_backgrounds_off, "", "UI",
                       "MY WWE -> OPTIONS -> BACKGROUNDS: the main menu pictures that are off (their numbers 1-12, "
@@ -110,10 +112,7 @@ uint32_t Le32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1]) << 8 | 
 
 fs::path Folder() { return rex::filesystem::GetExecutableFolder() / "Mods" / "Backgrounds"; }
 
-std::string Upper(std::string t) {
-  for (char& c : t) c = char(std::toupper(static_cast<unsigned char>(c)));
-  return t;
-}
+using svr2011::Upper;
 
 std::vector<std::string> Lines(const fs::path& file) {
   std::vector<std::string> out;
@@ -152,6 +151,7 @@ std::string NameFromFile(std::string f) {
 
 // The custom pictures on disk, by folder name and file.
 void ScanCustoms() {
+  if (svr2011::NoMods()) return;  // (Start Without Mods: no_mods.h)
   std::vector<Custom> out;
   std::error_code ec;
   std::vector<fs::path> dirs;

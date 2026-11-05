@@ -403,11 +403,17 @@ void UseFolderFor(State& s, const std::string& key, const std::wstring& folder, 
 }
 
 void PickGameFolder(Kind k, State& s) {
-  const std::wstring f = PickFolder(L"A folder with the game's files (the one holding its pac folder)");
+  const std::wstring f = PickFolder(L"A folder with the game's files (the one holding its pac folder)", OtherGameStart(s.game));
   if (f.empty()) return;
+  if (const std::string why = disc_list::NotGameFiles(f); !why.empty()) {
+    Status(why);
+    Log("simple port: " + Utf8(f) + " - " + why);
+    return;
+  }
   bool xbox = true;
   const std::string id = disc_list::Identify(f, &xbox);
   const disc_list::Game* g = id.empty() ? nullptr : disc_list::GameById(id);
+  OtherGamePicked(f, g ? g->key : s.game);
   if (g && !ConverterGame(ScriptOf(k), *g).empty()) return UseFolderFor(s, g->key, f, id);  // (its game read off it)
   g_folder = f;
 }
@@ -448,8 +454,9 @@ void SourceCards(Kind k, State& s) {
   if (k == kEntrance) {
     if (Card("src_file", "One file", "an entrance pac (Nyujyo0.pac, Entrance01.pac, EVTENT.PAC ...)", !s.file.empty(), w, h)) {
       static const COMDLG_FILTERSPEC kPac[1] = {{L"An entrance file (*.pac)", L"*.pac"}};
-      const std::wstring f = PickFile(false, L"An entrance file from another game (Nyujyo0.pac, Entrance01.pac, EVTENT.PAC ...)", kPac, 1);
-      if (!f.empty()) LoneFile(s, f);
+      const std::wstring f = PickFile(false, L"An entrance file from another game (Nyujyo0.pac, Entrance01.pac, EVTENT.PAC ...)", kPac, 1,
+                                      nullptr, nullptr, OtherGameStart(s.game));
+      if (!f.empty()) OtherGamePicked(f, s.game), LoneFile(s, f);
     }
   } else if (Card("src_file", "One file", k == kMoves ? "a move-set isn't in one file: pick a folder with m.pac + misc.pac"
                                                       : "taunts aren't in one file: pick a folder with m.pac + misc.pac",
@@ -514,6 +521,42 @@ void StepGame(Kind k, State& s) {
 
 // ---- step: the item (a superstar's entrance, or a superstar)
 
+// Which superstars a convert found entrance gear for (a coat or hat: superstar_port's report "gear"), kept in the
+// converters' work folder (gear_flags.txt "<converter game>|<item>\t<entries>") - the list marks them from then on,
+// without reading the disc at list time.
+std::map<std::string, int>& GearFlags() {
+  static std::map<std::string, int> m;
+  static bool read = false;
+  if (read) return m;
+  read = true;
+  Bytes t;
+  if (!svrfmt::ReadFile(PathStr(WorkDir() / L"gear_flags.txt"), t)) return m;
+  const std::string s(t.begin(), t.end());
+  for (size_t at = 0; at < s.size();) {
+    size_t e = s.find('\n', at);
+    if (e == std::string::npos) e = s.size();
+    const std::string l = s.substr(at, e - at);
+    at = e + 1;
+    if (const size_t tab = l.find('\t'); tab != std::string::npos) m[l.substr(0, tab)] = std::atoi(l.c_str() + tab + 1);
+  }
+  return m;
+}
+int GearFlag(const std::string& key) {
+  const auto& m = GearFlags();
+  const auto it = m.find(key);
+  return it == m.end() ? 0 : it->second;
+}
+void SetGearFlag(const std::string& key, int n) {
+  auto& m = GearFlags();
+  if (m.count(key) && m[key] == n) return;
+  m[key] = n;
+  std::string t;
+  for (const auto& [k, v] : m) t += k + "\t" + std::to_string(v) + "\n";
+  std::error_code ec;
+  fs::create_directories(WorkDir(), ec);
+  svrfmt::WriteFile(PathStr(WorkDir() / L"gear_flags.txt"), Bytes(t.begin(), t.end()));
+}
+
 void StepItem(Kind k, State& s) {
   if (!HasSource(s)) {
     ImGui::TextDisabled(s.file.empty() ? "Pick the game first." : "Reading your file...");
@@ -556,6 +599,13 @@ void StepItem(Kind k, State& s) {
     if (ImGui::IsRectVisible(ImVec2(tw, th))) {
       if (Picture* pic = PictureFor(pics, k == kEntrance ? std::string() : key, name)) pic->Draw(tw, tw);
       else ImGui::Dummy(ImVec2(tw, tw));
+      if (k != kEntrance && GearFlag(ConverterGame(kMoves, s.game) + "|" + key) > 0) {  // (a coat: entrance gear)
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 sz = ImGui::CalcTextSize("COAT");
+        const ImVec2 a(p.x + 3 * g_scale, p.y + 3 * g_scale), b(a.x + sz.x + 6 * g_scale, a.y + sz.y + 2 * g_scale);
+        dl->AddRectFilled(a, b, IM_COL32(20, 20, 24, 210), 3 * g_scale);
+        dl->AddText(ImVec2(a.x + 3 * g_scale, a.y + 1 * g_scale), IM_COL32(255, 210, 120, 255), "COAT");
+      }
     } else {
       ImGui::Dummy(ImVec2(tw, tw));
     }
@@ -568,6 +618,8 @@ void StepItem(Kind k, State& s) {
     if (ImGui::IsItemClicked() && !on) Pick(k, s, key, name);
     if (ImGui::IsItemHovered()) {
       std::string tip = name;
+      if (k != kEntrance && GearFlag(ConverterGame(kMoves, s.game) + "|" + key) > 0)
+        tip += "\nHas entrance gear (a coat or hat worn on the way to the ring)";
       if (k == kEntrance) {
         if (r["has_pyro"].Truthy()) tip += "\nWith fireworks";
         if (r["has_movie"].Truthy()) tip += "\nWith their titantron video";
@@ -757,64 +809,6 @@ struct PlayJob {
 };
 PlayJob g_play;
 
-// A pack's motions for one move as a bank the 3D view plays: the target bank's header (pack.txt `motion` lines name
-// it: <pac> <GROUP/ENTRY/child>), then the pack's entries and data.
-std::shared_ptr<const Bytes> PackBank(const fs::path& pack, int id) {
-  Bytes t;
-  if (!svrfmt::ReadFile(PathStr(pack / L"pack.txt"), t)) return nullptr;
-  const std::string text(t.begin(), t.end());
-  struct Part {
-    int x, y, frames;
-    std::string file;
-  };
-  std::vector<Part> parts;
-  std::string pac, where;
-  for (size_t at = 0; at < text.size();) {
-    size_t nl = text.find('\n', at);
-    if (nl == std::string::npos) nl = text.size();
-    const std::string line = text.substr(at, nl - at);
-    at = nl + 1;
-    char word[16] = "", p[64] = "", w[96] = "", file[260] = "";
-    int mid = 0, x = 0, y = 0, frames = 0;
-    if (std::sscanf(line.c_str(), "%15s %63s %95s %d %d %d %d %259s", word, p, w, &mid, &x, &y, &frames, file) == 8 &&
-        !std::strcmp(word, "motion") && mid == id) {
-      if (pac.empty()) pac = p, where = w;
-      parts.push_back({x, y, frames, file});
-    }
-  }
-  if (parts.empty()) return nullptr;
-  const size_t s1 = where.find('/'), s2 = s1 == std::string::npos ? s1 : where.find('/', s1 + 1);
-  if (s2 == std::string::npos) return nullptr;
-  std::string group = where.substr(0, s1);
-  const std::string entry = where.substr(s1 + 1, s2 - s1 - 1);
-  const int child = std::atoi(where.c_str() + s2 + 1);
-  while (group.size() < 4) group += ' ';
-  Bytes raw, head;
-  if (!ReadPacEntry(fs::path(g_game) / L"pac" / fs::u8path(pac), entry.c_str(), raw, group.c_str())) return nullptr;
-  std::vector<svrfmt::PachEntry> kids;
-  if (svrfmt::PachRead(svrfmt::Unpack(raw), kids))
-    for (const auto& kid : kids)
-      if (int(kid.id) == child) head = svrfmt::Unpack(kid.data);
-  if (head.size() < 0x114) return nullptr;
-  auto bank = std::make_shared<Bytes>(head.begin(), head.begin() + 0x110);
-  const uint32_t n = uint32_t(parts.size());
-  bank->resize(0x114 + 16 * size_t(n));
-  svrfmt::PutLe32(&(*bank)[0x110], n);
-  Bytes data;
-  for (uint32_t i = 0; i < n; ++i) {
-    Bytes d;
-    if (!svrfmt::ReadFile(PathStr(pack / fs::u8path(parts[i].file)), d)) return nullptr;
-    uint8_t* e = &(*bank)[0x114 + 16 * i];
-    e[0] = uint8_t(parts[i].y), e[1] = uint8_t(parts[i].x), e[2] = uint8_t(id), e[3] = uint8_t(id >> 8);
-    svrfmt::PutLe32(e + 4, uint32_t(data.size()));
-    svrfmt::PutLe32(e + 8, uint32_t(parts[i].frames));
-    svrfmt::PutLe32(e + 12, 0);
-    data.insert(data.end(), d.begin(), d.end());
-  }
-  bank->insert(bank->end(), data.begin(), data.end());
-  return bank;
-}
-
 void PlayRow(Kind k, State& s, const Json& r) {
   const std::string st = r["status"].Str();
   const int id11 = r["id11"].Int(0);
@@ -843,9 +837,9 @@ void PlayRow(Kind k, State& s, const Json& r) {
     const int id = j["id"].Int(0);
     fs::path pack = fs::u8path(j["folder"].Str().empty() ? j["out"].Str() : j["folder"].Str());
     if (!pack.is_absolute()) pack = out / pack;
-    const auto bank = PackBank(pack, id);
+    const auto bank = anims_page::PackBank(pack, id);
     std::string err;
-    if (!bank || !char_preview::SetMotion(bank, id, 0, &err))
+    if (!bank || !anims_page::PlayMove(bank, id, -1, &err))
       Status("That move can't be shown: " + (bank ? err : std::string("its motions didn't read")) + ".");
     else
       Status("Playing " + j["name"].Str() + ".");
@@ -1517,6 +1511,186 @@ void TestTick(Kind k, State& s) {
   }
 }
 
+// ---- the attire picker (Simple superstar's import, the Port page's superstars, one PS2 character file): a PS2
+// superstar's attires as pictures (superstar_port attires: drawn from the front by ps2_char), up to four ticked in the
+// order they become the mod's attires 1-4 (convert --attires); untouched, the converter takes the first four. Other
+// games keep their attires in the model's own file: the first four, nothing to choose.
+
+struct AttireCard {
+  int attire = 0;  // the source's number (what --attires takes)
+  Picture pic;
+  int meshes = 0;
+  bool see_through = false;
+};
+struct AttireSet {
+  bool open = false, busy = false, asked = false;
+  std::string error;
+  std::vector<AttireCard> all;
+  std::vector<int> chosen;  // (source numbers, in the mod's order; empty: the first four)
+};
+std::map<std::string, AttireSet> g_attires;  // by game|source|item
+int g_attire_test_open = 0;                  // (test aid --attire-pick: 1 open the next picker, 2 also pick)
+std::vector<int> g_attire_test_pick;
+
+std::string AttireKey(const std::string& game, const std::wstring& src, const std::string& item) {
+  return game + "|" + Utf8(src) + "|" + item;
+}
+
+void AskAttires(AttireSet& a, const std::string& key, const std::string& game, const std::wstring& src, const std::string& item) {
+  a.asked = a.busy = true;
+  a.error.clear();
+  const fs::path out = WorkDir() / Wide("attires_" + Safe(game + "_" + item));
+  std::error_code ec;
+  fs::create_directories(out, ec);
+  std::vector<std::wstring> args = {L"attires", L"--src", src, L"--game", Wide(game), L"--item", Wide(item),
+                                    L"--out", out.wstring(), L"--pac11", Pac11()};
+  Status("Drawing the attires (a few seconds each)...");
+  RunToolJson(L"superstar_port.py", args, [key](int code, const std::string& o) {
+    AttireSet& a = g_attires[key];
+    a.busy = false;
+    Json j;
+    if (code != 0 || !ParseJson(o, j) || !j["ok"].Truthy()) {
+      a.error = ToolCancelled() ? "cancelled" : ErrorOf(code, o, "attire pictures");
+      return;
+    }
+    a.all.clear();
+    for (const Json& e : j["attires"].items) {
+      AttireCard c;
+      c.attire = int(e["attire"].Int());
+      if (e["meshes"].type == Json::Type::kObject)  // (parts by kind: skin, hair, eye ...)
+        for (const auto& f : e["meshes"].fields) c.meshes += int(f.second.Int());
+      else c.meshes = int(e["meshes"].Int());
+      c.see_through = e["see_through"].Int() > 0 || e["see_through"].Truthy();
+      Image img;
+      if (LoadPicture(Wide(e["picture"].Str()), img)) c.pic.Set(std::move(img));
+      a.all.push_back(std::move(c));
+    }
+    Status(std::to_string(a.all.size()) + " attires found.");
+    if (g_attire_test_open == 2) {  // (test aid: the picks, in order)
+      a.chosen.clear();
+      for (int n : g_attire_test_pick)
+        for (const auto& c : a.all)
+          if (c.attire == n && a.chosen.size() < 4) a.chosen.push_back(n);
+      g_attire_test_open = 0;
+      Log("attire picker test: picked " + std::to_string(a.chosen.size()));
+    }
+  });
+}
+
+std::string AttireLabel(int n) { return "Attire " + std::to_string(n + 1); }
+
+// The picker for one superstar; nothing for a game whose attires aren't chosen (not PS2).
+void AttirePickerFor(const std::string& game, const std::wstring& src, const std::string& item) {
+  if (game.rfind("ps2_", 0) != 0 || src.empty() || item.empty()) return;
+  const std::string key = AttireKey(game, src, item);
+  AttireSet& a = g_attires[key];
+  ImGui::PushID(key.c_str());
+  if (g_attire_test_open && !a.open) a.open = true;
+  if (!a.open) {
+    ImGui::AlignTextToFramePadding();
+    if (a.chosen.empty()) ImGui::TextDisabled("Attires: the first four");
+    else {
+      std::string t;
+      for (size_t i = 0; i < a.chosen.size(); ++i) t += (i ? ", " : "") + AttireLabel(a.chosen[i]);
+      ImGui::Text("Attires: %s", t.c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Choose attires...")) a.open = true;
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("A mod holds four attires: pick which of theirs, and in which order (the first is attire 1).");
+    ImGui::PopID();
+    return;
+  }
+  if (!a.asked && !Busy()) AskAttires(a, key, game, src, item);
+  ImGui::TextUnformatted("Which attires, and in which order");
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Done")) a.open = false;
+  ImGui::PushTextWrapPos(0);
+  ImGui::TextDisabled("Click up to four: the number on each is the attire it becomes in your mod. Nothing picked: the "
+                      "first four.");
+  ImGui::PopTextWrapPos();
+  if (a.busy) {
+    ImGui::TextDisabled("Drawing their attires ...");
+    ImGui::PopID();
+    return;
+  }
+  if (!a.error.empty()) {
+    ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "Their attires couldn't be drawn: %s", simple::Plain(a.error).c_str());
+    if (ImGui::SmallButton("Try again")) a.asked = false;
+    ImGui::PopID();
+    return;
+  }
+  if (a.all.size() > 4) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "%d attires: a mod holds four.", int(a.all.size()));
+  // the cards: a picture each (192 x 288 drawn at half), the order number on the picked ones
+  const float w = 96 * g_scale, h = 144 * g_scale, gap = 8 * g_scale;
+  const int per_row = std::max(1, int((ImGui::GetContentRegionAvail().x + gap) / (w + gap)));
+  const std::vector<int> shown = a.chosen.empty() ? [&] {
+    std::vector<int> f;
+    for (size_t i = 0; i < a.all.size() && i < 4; ++i) f.push_back(a.all[i].attire);
+    return f;
+  }() : a.chosen;
+  for (size_t i = 0; i < a.all.size(); ++i) {
+    AttireCard& c = a.all[i];
+    if (i % size_t(per_row)) ImGui::SameLine(0, gap);
+    ImGui::PushID(int(i));
+    ImGui::BeginGroup();
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    c.pic.Draw(w, h);
+    ImGui::TextUnformatted(AttireLabel(c.attire).c_str());
+    ImGui::EndGroup();
+    const auto pos = std::find(shown.begin(), shown.end(), c.attire);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (pos != shown.end()) {
+      const int order = int(pos - shown.begin()) + 1;
+      const ImU32 col = a.chosen.empty() ? IM_COL32(120, 120, 130, 255) : IM_COL32(220, 40, 60, 255);
+      dl->AddRect(at, ImVec2(at.x + w, at.y + h), col, 4 * g_scale, 0, 3 * g_scale);
+      const ImVec2 dot(at.x + 14 * g_scale, at.y + 14 * g_scale);
+      dl->AddCircleFilled(dot, 11 * g_scale, col);
+      const std::string n = std::to_string(order);
+      const ImVec2 ts = ImGui::CalcTextSize(n.c_str());
+      dl->AddText(ImVec2(dot.x - ts.x / 2, dot.y - ts.y / 2), IM_COL32(255, 255, 255, 255), n.c_str());
+    }
+    if (ImGui::IsItemClicked()) {
+      if (a.chosen.empty()) a.chosen = {c.attire};  // (the first click starts the player's own pick)
+      else if (const auto it = std::find(a.chosen.begin(), a.chosen.end(), c.attire); it != a.chosen.end()) a.chosen.erase(it);
+      else if (a.chosen.size() < 4) a.chosen.push_back(c.attire);
+      else Status("Four are picked already: click one to take it out first.");
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("%s: %d parts%s", AttireLabel(c.attire).c_str(), c.meshes, c.see_through ? ", see-through parts (lace, mesh)" : "");
+    ImGui::PopID();
+  }
+  // the order, to change
+  if (!a.chosen.empty()) {
+    ImGui::Spacing();
+    for (size_t i = 0; i < a.chosen.size(); ++i) {
+      ImGui::PushID(int(i) + 1000);
+      ImGui::AlignTextToFramePadding();
+      ImGui::Text("Mod attire %d: %s", int(i) + 1, AttireLabel(a.chosen[i]).c_str());
+      ImGui::SameLine();
+      ImGui::BeginDisabled(i == 0);
+      if (ImGui::SmallButton("Earlier")) std::swap(a.chosen[i], a.chosen[i - 1]);
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+      ImGui::BeginDisabled(i + 1 == a.chosen.size());
+      if (ImGui::SmallButton("Later")) std::swap(a.chosen[i], a.chosen[i + 1]);
+      ImGui::EndDisabled();
+      ImGui::PopID();
+    }
+    if (ImGui::SmallButton("The first four")) a.chosen.clear();
+  }
+  ImGui::PopID();
+}
+
+// The --attires value for that superstar ("": the converter's own, the first four).
+std::string AttireArg(const std::string& game, const std::wstring& src, const std::string& item) {
+  const auto it = g_attires.find(AttireKey(game, src, item));
+  if (it == g_attires.end() || it->second.chosen.empty()) return {};
+  std::string t;
+  for (size_t i = 0; i < it->second.chosen.size(); ++i) t += (i ? "," : "") + std::to_string(it->second.chosen[i]);
+  return t;
+}
+
 // ---- Simple superstar's Look step: a superstar from another game, in two stages - the look (superstar_port convert
 // --no-moves --no-taunts: model, pictures, theme, entrance, ratings; a minute or so) handed back at once, then with
 // "Bring everything too" their moves and taunts (superstar_port moveset-pack --rows all: the slow part, ported one
@@ -1552,6 +1726,7 @@ void ImportConvert() {
   std::vector<std::wstring> args = {L"convert", L"--game", Wide(game), L"--src", disc_list::PathFor(s.game), L"--out", out.wstring(),
                                     L"--pac11", Pac11(), L"--item", Wide(s.item), L"--no-moves", L"--no-taunts"};
   AddSvrmod(args, game);
+  if (const std::string at = AttireArg(game, disc_list::PathFor(s.game), s.item); !at.empty()) args.push_back(L"--attires"), args.push_back(Wide(at));
   Status("Bringing " + s.item_name + " over from your disc...");
   RunToolJson(L"superstar_port.py", args, [want, all = g_import_all](int code, const std::string& o) {
     if (g_import_for != want) return;
@@ -1559,6 +1734,7 @@ void ImportConvert() {
     if (code == 0 && ParseJson(o, j) && j["ok"].Truthy() && !j["out"].Str().empty()) {
       g_import_ready = Wide(j["out"].Str());
       g_import_ready_all = all;
+      if (j["gear"].type == Json::Type::kArray) SetGearFlag(want, int(j["gear"].items.size()));
     } else {
       g_import_error = ToolCancelled() ? "cancelled" : ErrorOf(code, o, "superstar converter");
       Status(ToolCancelled() ? "Cancelled." : "That superstar couldn't be brought over: " + simple::Plain(g_import_error));
@@ -1849,6 +2025,8 @@ bool ImportList(std::wstring& mod, bool& everything) {
   ImGui::EndChild();
   if (s.item.empty()) return false;
   ImGui::Spacing();
+  AttirePickerFor(ConverterGame(kMoves, s.game), disc_list::PathFor(s.game), s.item);
+  ImGui::Spacing();
   const bool running = ImportRunning() && g_import_for == ConverterGame(kMoves, s.game) + "|" + s.item;
   ImGui::BeginDisabled(running || MovesRunning() || Busy());
   PushAccent();
@@ -1891,6 +2069,19 @@ bool SuperstarImport(std::wstring& mod, bool& everything, bool offer_everything)
     return false;
   }
   return ImportList(mod, everything);
+}
+
+void AttirePicker(const std::string& game, const std::wstring& src, const std::string& item) { AttirePickerFor(game, src, item); }
+std::string AttireChoice(const std::string& game, const std::wstring& src, const std::string& item) { return AttireArg(game, src, item); }
+void AttireTest(const std::string& spec) {
+  g_attire_test_open = 1;
+  g_attire_test_pick.clear();
+  for (size_t at = 0; at < spec.size();) {
+    size_t e = spec.find(',', at);
+    if (e == std::string::npos) e = spec.size();
+    if (e > at && std::isdigit(uint8_t(spec[at]))) g_attire_test_pick.push_back(std::atoi(spec.c_str() + at)), g_attire_test_open = 2;
+    at = e + 1;
+  }
 }
 
 bool SuperstarImportMoves(std::wstring& pack, std::vector<std::string>& lines) {

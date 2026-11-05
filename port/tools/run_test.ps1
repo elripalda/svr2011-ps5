@@ -6,6 +6,7 @@
 #   .\run_test.ps1 [-Seconds 60] [-Shots 4] [-Name run] [-Extra "--flag=x"] [-Game <folder>]
 #   (-Game: another game folder - a test build next to links to the game data)
 param([int]$Seconds = 60, [int]$Shots = 4, [string]$Name = "run", [string[]]$Extra = @(), [string]$Game = "")
+$env:SVR2011_AUDIO_MUTE = "1"  # (test games stay muted even if their command line is lost)
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -33,7 +34,9 @@ $args_ = @("--log_file=`"$log`"", "--log_level=debug", "--audio_mute=true", "--f
 $env:SDL_WINDOW_ACTIVATE_WHEN_SHOWN = "0"
 $env:SDL_WINDOW_ACTIVATE_WHEN_RAISED = "0"
 Use-TestSaves
+Use-SvrTestServer -GameDir $game -GameArgs $args_ | Out-Null
 $p = Start-Process (Join-Path $game "svr2011.exe") -WorkingDirectory $game -ArgumentList $args_ -PassThru -WindowStyle Minimized
+Set-SvrTestPriority $p
 
 # Park the window off-screen without activating it as soon as it exists.
 $SWP_NOSIZE = 0x1; $SWP_NOZORDER = 0x4; $SWP_NOACTIVATE = 0x10

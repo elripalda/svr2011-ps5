@@ -8,6 +8,10 @@
   (wwe13 also takes --svrmod <svrmod.exe>: its pacs are xcompressed; default: next to the tools or
    the Mod Maker; missing = exit 2)
   python entrance_port.py free-numbers [--game-pac <2011 pac dir>] [--mods <Mods dir>]
+  --kind victory (list / convert / free-numbers): the victory scenes (pac/evt/Winning*.pac) instead of the
+        entrances - SvR 2008, 2009, 2010 and Legends of WrestleMania; --number 6000..7999, written as
+        `pacentry evt\Winning0.pac EVPA|EVTA <n>` (a superstar mod picks it with victory=<n>,
+        docs/VICTORY_SCENES.md); no Create-An-Entrance parts, pyro or titantron
   python entrance_port.py detect --src <one entrance file>
         -> {ok, game, name, platform, entrances, file, detected, limits[]} (list / convert take the same file)
 
@@ -59,6 +63,7 @@ import svrfmt  # noqa: E402
 import ymks  # noqa: E402
 import svr08_entrance as E08  # noqa: E402
 import hctp_entrance as EH  # noqa: E402
+import entrance_props as EPR  # noqa: E402
 import svr10_entrance as E10  # noqa: E402
 import wwe13_entrance as E13  # noqa: E402
 
@@ -310,8 +315,7 @@ def lone_source(path, g=None, entrance=None):
 
 # ============================================================================ containers
 
-def unbpe(b):
-    return svrfmt.bpe_decode(b) if b[:4] == b'BPE ' else b
+unbpe = svrfmt.unbpe
 
 
 def epk8_read(d):
@@ -334,10 +338,15 @@ def epk8_read(d):
     return out
 
 
-def pac_entries(d):
-    """EPAC or EPK8 -> {(group, name): unpacked bytes}"""
+def pac_entries(d, want=None):
+    """EPAC or EPK8 -> {(group, name): unpacked bytes}; want(group, name): 0 leave it out, 1 unpacked, 2 as stored
+    (BPE decoding is most of the time: a convert needs one scene, a list only the scripts)"""
+    def take(k, v):
+        w = want(*k) if want else 1
+        return None if not w else unbpe(v) if w == 1 else v
     if d[:4] == b'EPK8':
-        return {k: unbpe(v) for k, v in epk8_read(d).items()}
+        out = {k: take(k, v) for k, v in epk8_read(d).items()}
+        return {k: v for k, v in out.items() if v is not None}
     if d[:4] == b'EPAC':
         # (svrfmt.epac_read's layout, but the count is the u16 at +4: SvR 2007 keeps other data in
         # the u16 at +6)
@@ -351,7 +360,9 @@ def pac_entries(d):
                 n = d[p:p + 4].replace(bytes(1), b'').decode('latin-1').strip()
                 sec, sz = struct.unpack_from('<II', d, p + 4)
                 o = 0x4000 + sec * 0x800
-                out[(ty, n)] = unbpe(d[o:o + sz * 0x100])
+                v = take((ty, n), d[o:o + sz * 0x100])
+                if v is not None:
+                    out[(ty, n)] = v
                 p += 12
         return out
     if d[:4] in (b'DPAC', b'DPK8'):          # (PS2 SvR 2007-2011: the 360 pacs in little-endian)
@@ -369,6 +380,56 @@ def evp_name(evp):
 
 def norm(s):
     return re.sub(r'[^a-z0-9]', '', s.lower())
+
+
+# ---- victory scenes (--kind victory): the same scripts and track banks as the entrances, in Winning*.pac
+VICTORY = False
+VICTORY_GAMES = ('svr08', 'svr09', 'svr10', 'low')
+VICTORY_PAC, VICTORY_GROUPS = 'evt\\Winning0.pac', ('EVPA', 'EVTA')
+
+
+def scene_rx():
+    """the source's scene pacs: Nyujyo0-3 (entrances) or Winning0-3 (--kind victory)"""
+    return r'(?i)winning\d\.pac$' if VICTORY else r'(?i)nyujyo\d\.pac$'
+
+
+def stock_victories(game_pac):
+    """{number: name} of 2011's own victory scenes (pac/evt/Winning*.pac)"""
+    out = {}
+    if game_pac:
+        for f in sorted(os.listdir(os.path.join(game_pac, 'evt'))):
+            if re.match(r'(?i)winning.\.pac$', f):
+                for (g, n), raw in epk8_read(open(os.path.join(game_pac, 'evt', f), 'rb').read()).items():
+                    if g.startswith('EVP') and n.isdigit():
+                        out[int(n)] = evp_name(unbpe(raw))
+    return out
+
+
+def pack_victories(mods):
+    """victory numbers the installed packs already add"""
+    used = set()
+    if mods and os.path.isdir(mods):
+        for root, dirs, files in os.walk(mods):
+            if 'PacOverlay' in root or os.path.exists(os.path.join(root, 'disabled')):
+                continue
+            if 'pack.txt' in files:
+                for line in open(os.path.join(root, 'pack.txt'), encoding='latin-1'):
+                    m = re.match(r'\s*pacentry\s+\S*winning\S*\s+EV[PT]\S\s+(\d+)', line, re.I)
+                    if m:
+                        used.add(int(m.group(1)))
+    return used
+
+
+def write_victory_pack(out, number, evp, evt, label):
+    d = os.path.join(out, 'pack')
+    os.makedirs(os.path.join(d, 'victory'), exist_ok=True)
+    lines = ['# %s' % label]
+    for g, b, suf in ((VICTORY_GROUPS[0], evp, 'evp'), (VICTORY_GROUPS[1], evt, 'evt')):
+        fn = 'victory/%d_%s.bin' % (number, suf)
+        open(os.path.join(d, fn), 'wb').write(b)
+        lines.append('pacentry %s %s %d %s' % (VICTORY_PAC, g, number, fn))
+    open(os.path.join(d, 'pack.txt'), 'w', newline='\r\n').write('\n'.join(lines) + '\n')
+    return d
 
 
 # ============================================================================ 2011 side
@@ -453,10 +514,10 @@ def in_2011(name, game_pac):
 # ============================================================================ games
 
 GAMES = collections.OrderedDict([
-    ('svr07', dict(name='SmackDown vs. Raw 2007', platform='x360', disc_hint='545107E0', disc_hints=['545107E0', 'SLES_544.89'], status='ready')),
-    ('svr08', dict(name='SmackDown vs. Raw 2008', platform='x360', disc_hint='5451080B', disc_hints=['5451080B', 'SLES_548.79'], status='ready')),
-    ('svr09', dict(name='SmackDown vs. Raw 2009', platform='x360', disc_hint='54510826', disc_hints=['54510826', 'SLES_552.51'], status='ready')),
-    ('svr10', dict(name='SmackDown vs. Raw 2010', platform='x360', disc_hint='54510844', disc_hints=['54510844', 'SLES_555.45'], status='ready')),
+    ('svr07', dict(name='SmackDown vs. Raw 2007', platform='x360', disc_hint='545107E0', disc_hints=['545107E0', 'SLES_544.89', 'SLUS_214.27'], status='ready')),
+    ('svr08', dict(name='SmackDown vs. Raw 2008', platform='x360', disc_hint='5451080B', disc_hints=['5451080B', 'SLES_548.79', 'SLUS_216.45'], status='ready')),
+    ('svr09', dict(name='SmackDown vs. Raw 2009', platform='x360', disc_hint='54510826', disc_hints=['54510826', 'SLES_552.51', 'SLUS_218.10'], status='ready')),
+    ('svr10', dict(name='SmackDown vs. Raw 2010', platform='x360', disc_hint='54510844', disc_hints=['54510844', 'SLES_555.45', 'SLUS_219.01'], status='ready')),
     ('low', dict(name='WWE Legends of WrestleMania', platform='x360', disc_hint='54510838', status='ready')),
     ('wwe12', dict(name="WWE '12", platform='x360', disc_hint='54510890', status='ready')),
     ('wwe13', dict(name="WWE '13", platform='x360', disc_hint='545108B4', status='ready')),
@@ -464,23 +525,33 @@ GAMES = collections.OrderedDict([
     ('wwe2k15', dict(name='WWE 2K15', platform='x360', disc_hint='545408B6', status='ready')),
     ('wwe2k16', dict(name='WWE 2K16', platform='x360', disc_hint='315A07D2', status='ready')),
     ('wwe2k17', dict(name='WWE 2K17', platform='x360', disc_hint='545408BA', status='ready')),
-    ('hctp', dict(name='SmackDown! Here Comes the Pain', platform='ps2', disc_hint='SLES_520.36', status='ready')),
-    ('sym', dict(name='SmackDown! Shut Your Mouth', platform='ps2', disc_hint='SLES_512.83', status='ready')),
-    ('jbi', dict(name='WWF SmackDown! Just Bring It', platform='ps2', disc_hint='SLES_504.77', status='ready')),
-    ('svr04', dict(name='SmackDown! vs. Raw', platform='ps2', disc_hint='SLES_527.81', status='ready')),
-    ('svr06', dict(name='SmackDown! vs. Raw 2006', platform='ps2', disc_hint='SLES_536.76', status='ready')),
+    ('hctp', dict(name='SmackDown! Here Comes the Pain', platform='ps2', disc_hint='SLES_520.36', disc_hints=['SLES_520.36', 'SLUS_207.87'], status='ready')),
+    ('sym', dict(name='SmackDown! Shut Your Mouth', platform='ps2', disc_hint='SLES_512.83', disc_hints=['SLES_512.83', 'SLUS_204.83', 'SLUS_205.12'], status='ready')),
+    ('jbi', dict(name='WWF SmackDown! Just Bring It', platform='ps2', disc_hint='SLES_504.77', disc_hints=['SLES_504.77', 'SLUS_203.16', 'SLUS_202.69', 'SLUS_201.22'], status='ready')),
+    ('svr04', dict(name='SmackDown! vs. Raw', platform='ps2', disc_hint='SLES_527.81', disc_hints=['SLES_527.81', 'SLUS_210.60', 'SLUS_209.36'], status='ready')),
+    ('svr06', dict(name='SmackDown! vs. Raw 2006', platform='ps2', disc_hint='SLES_536.76', disc_hints=['SLES_536.76', 'SLUS_212.86', 'SLUS_211.34'], status='ready')),
 ])
 # (disc_hint: the Xbox 360 title id / PS2 serial discfs.open(iso).info() reports)
 
 
 # ---- SvR 2008 (Xbox 360): pac/evt/Nyujyo0-3.pac, EPAC groups EVP1-4/EVT1-4, numbers 4000+
 
-def svr08_entrances(src):
+def only(number):
+    """want for pac_entries: the one scene's script and tracks"""
+    return lambda g, n: 1 if n.isdigit() and int(n) == number else 0
+
+
+def scripts_only(g, n):
+    """want for a list: the scripts unpacked, the track banks as stored (only their names are needed)"""
+    return 1 if g.startswith('EVP') else 2 if g.startswith('EVT') else 0
+
+
+def svr08_entrances(src, want=None):
     evp, evt = {}, {}
     for f in src.listdir('pac/evt'):
-        if not re.match(r'(?i)nyujyo\d\.pac$', f):
+        if not re.match(scene_rx(), f):
             continue
-        for (g, n), raw in pac_entries(src.read('pac/evt/' + f)).items():
+        for (g, n), raw in pac_entries(src.read('pac/evt/' + f), want).items():
             if not n.isdigit():
                 continue
             (evp if g.startswith('EVP') else evt if g.startswith('EVT') else {})[int(n)] = raw
@@ -488,7 +559,7 @@ def svr08_entrances(src):
 
 
 def svr08_list(src, game_pac):
-    evp, evt = svr08_entrances(src)
+    evp, evt = svr08_entrances(src, scripts_only if VICTORY else None)
     out = []
     for n in sorted(evp):
         if n >= 10000 or n not in evt:
@@ -500,11 +571,13 @@ def svr08_list(src, game_pac):
             continue
         nm = e['name'].split(b'\0')[0].decode('latin-1', 'replace').strip()
         props = [o['model'] for o in e['objs'] if (o['t0'], o['t1']) == E08.TYPE_PROP]
-        b = E08.read_evt(evt[n], '2008')
         frames = {}
-        for x in b.entries:
-            if x['id'] == 0 and x['y'] == 0 and x['x'] in (0, 5, 10, 15, 20):
-                frames[x['x'] // 5] = x['frames']
+        try:
+            for x in E08.read_evt(evt[n], '2008').entries:
+                if x['id'] == 0 and x['y'] == 0 and x['x'] in (0, 5, 10, 15, 20):
+                    frames[x['x'] // 5] = x['frames']
+        except Exception:              # (a victory list keeps the banks as stored: no frames)
+            pass
         out.append(dict(number=n, name=nm, segments=len(frames), frames=[frames.get(k, 0) for k in range(5)],
                         objects=len(e['objs']), props=props, has_pyro=any((o['t0'], o['t1']) == E08.TYPE_GLOBAL for o in e['objs']),
                         has_movie=False, has_theme=False, in_2011=in_2011(nm, game_pac)))
@@ -512,7 +585,7 @@ def svr08_list(src, game_pac):
 
 
 def svr08_convert(src, entrance, number, name, parts, rep):
-    evp, evt = svr08_entrances(src)
+    evp, evt = svr08_entrances(src, only(entrance))
     if entrance not in evp or entrance not in evt:
         raise InputError('SvR 2008 has no entrance %d' % entrance)
     progress(20, 'converting the script')
@@ -593,8 +666,24 @@ def hctp_convert(src, entrance, number, name, parts, rep, game='hctp', game_pac=
     if entrance not in EH.parse_sevp(s['sevp']) or len(s['banks'].get(entrance, b'')) <= 512:
         raise InputError('%s has no entrance %d' % (GAMES[game]['name'], entrance))
     progress(20, 'converting the script and tracks')
+    own = {}
+    if game == 'hctp' and game_pac:   # (the bike's own model: entrance_props / hctp_bike; else 2011's 2540)
+        import hctp_bike
+        uses = {o['model'] for o in EH.parse_sevp(s['sevp'])[entrance]['objs'] if EH.kind_of(o) == 'prop'}
+        for (g, model), pid in EPR.PORTED.items():
+            if g != 'hctp' or model not in uses:
+                continue
+            try:
+                data, bike_notes = hctp_bike.build(src.read('PAC/BG.PAC'), game_pac)
+            except Exception as x:
+                rep['notes'].append('prop %d: its own model not built (%s): 2011\'s 2540 with its nodes mapped' % (model, x))
+                continue
+            own[model] = pid
+            PROPS.append((pid, EH.VEHICLES[model]['model'], data))
+            rep['notes'] += bike_notes + ['prop %d: HCTP\'s own as evtobj %d, added by the pack (2011\'s %d if it can\'t '
+                                          'be: propfallback)' % (model, pid, EH.VEHICLES[model]['model'])]
     evp, evt, r, notes = EH.build(entrance, number, s, name or names.get(entrance, '%s %d' % (game.upper(), entrance)),
-                                  game=game)
+                                  game=game, own_props=own)
     rep['notes'] += notes + ['%s: %d' % kv for kv in sorted(r.items())]
     rep['dropped'] += ['%s: %d' % kv for kv in sorted(r.items()) if 'dropped' in kv[0]]
     return evp, evt
@@ -668,19 +757,19 @@ def svr06_convert(src, entrance, number, name, parts, rep, game_pac=None):
         raise InputError(str(x))
 
 
-def svr10_entrances(src):
+def svr10_entrances(src, want=None):
     evp, evt = {}, {}
     for f in src.listdir('pac/evt'):
-        if not re.match(r'(?i)nyujyo\d\.pac$', f):
+        if not re.match(scene_rx(), f):
             continue
-        for (g, n), raw in pac_entries(src.read('pac/evt/' + f)).items():
+        for (g, n), raw in pac_entries(src.read('pac/evt/' + f), want).items():
             if n.isdigit() and int(n) < 10000:
                 (evp if g.startswith('EVP') else evt if g.startswith('EVT') else {})[int(n)] = raw
     return evp, evt
 
 
 def svr10_list(src, game_pac):
-    evp, evt = svr10_entrances(src)
+    evp, evt = svr10_entrances(src, scripts_only if VICTORY else None)
     out = []
     for n in sorted(evp):
         if n not in evt:
@@ -706,7 +795,7 @@ def svr10_list(src, game_pac):
 
 
 def svr10_convert(src, entrance, number, name, parts, rep, game_pac=None):
-    evp, evt = svr10_entrances(src)
+    evp, evt = svr10_entrances(src, only(entrance))
     if entrance not in evp or entrance not in evt:
         raise InputError('SvR 2010 has no entrance %d' % entrance)
     progress(20, 'converting the script')
@@ -775,6 +864,36 @@ def w13_convert(game):
 wwe13_list = w13_list('wwe13')
 
 
+PROPS = []   # (this conversion's own props: [(id, game prop id, entry bytes)] - entrance_props.write)
+
+
+def own_vehicles(src, game, evp11, game_pac, rep):
+    """the source game's own vehicle in place of 2011's (entrance_props.PORTED: same model, its textures) when
+    the script uses it: a new evtobj id added by the pack, 2011's prop as the fallback"""
+    used = {o['model'] for o in E08.parse_evp(evp11, '2011')['objs'] if E13.kind(o) == 'prop'}
+    for (g, model), pid in EPR.PORTED.items():
+        if g != game or model not in used or not game_pac:
+            continue
+        try:
+            raw = src.read('pac/evt/evtobj.pac')
+            if raw[:4] not in (b'EPAC', b'EPK8'):
+                raw = E13.xdec(raw, E13.find_svrmod(SVRMOD))
+            theirs = E13.epk8_entries(raw).get(('SOBJ', str(model)))
+            ours = EPR.game_prop(game_pac, model)
+            data = EPR.retextured(ours, theirs) if theirs and ours else None
+        except Exception as x:
+            rep['notes'].append('prop %d: the source\'s own not read (%s): 2011\'s kept' % (model, x))
+            continue
+        if data is None:
+            rep['notes'].append('prop %d: the source\'s is 2011\'s own (kept)' % model)
+            continue
+        PROPS.append((pid, model, data))
+        evp11 = EPR.set_prop(evp11, model, pid)
+        rep['notes'].append('prop %d: %s\'s own (its textures) as evtobj %d, added by the pack (2011\'s %d if it '
+                            'can\'t be: propfallback)' % (model, E13.GAMES[game]['name'], pid, model))
+    return evp11
+
+
 def wwe13_convert(src, entrance, number, name, parts, rep, game_pac=None, game='wwe13'):
     evp, evz = wwe13_entrances(src, game)
     if entrance not in evp or entrance not in evz:
@@ -788,6 +907,7 @@ def wwe13_convert(src, entrance, number, name, parts, rep, game_pac=None, game='
     evp11, evt11, r = E13.convert(evp[entrance], evz[entrance], number, game_pac, name, progress=prog, game=game)
     for k in ('notes', 'warnings', 'dropped'):
         rep[k] += r[k]
+    evp11 = own_vehicles(src, game, evp11, game_pac, rep)
     rep['notes'].append('not converted: theme, face / finger tracks; titantron only with --titantron (Bink 2: a decoder the player installs)')
     return evp11, evt11
 
@@ -797,12 +917,14 @@ def wwe13_convert(src, entrance, number, name, parts, rep, game_pac=None, game='
 # ---- SvR 2009 (Xbox 360): pac/evt/Nyujyo0-3.pac (EPAC, EVP1-4/EVT1-4), 4002-4424 (TNyujyo = tests)
 # Both use 2008's script layout (28-byte objects) and its headerless track bank.
 
-def old_entrances(src, files):
+def old_entrances(src, files, want=None):
     evp, evt = {}, {}
+    if VICTORY:
+        files = (scene_rx(),)
     for f in src.listdir('pac/evt'):
         if not any(re.match(rx, f, re.I) for rx in files):
             continue
-        for (g, n), raw in pac_entries(src.read('pac/evt/' + f)).items():
+        for (g, n), raw in pac_entries(src.read('pac/evt/' + f), want).items():
             if n.isdigit() and int(n) < 9999:
                 (evp if g.startswith('EVP') else evt if g.startswith('EVT') else {})[int(n)] = raw
     return evp, evt
@@ -814,7 +936,7 @@ SRC09 = (r'nyujyo\d\.pac$',)
 
 def old_list(files):
     def lister(src, game_pac):
-        evp, evt = old_entrances(src, files)
+        evp, evt = old_entrances(src, files, scripts_only if VICTORY else None)
         out = []
         for n in sorted(evp):
             if n not in evt:
@@ -908,12 +1030,9 @@ def svr07_convert(src, entrance, number, name, parts, rep):
 
 
 def svr09_convert(src, entrance, number, name, parts, rep, game_pac=None, low=False):
-    evp, evt = old_entrances(src, SRC09)
+    evp, evt = old_entrances(src, SRC09, only(entrance))
     if entrance not in evp or entrance not in evt:
         raise InputError('%s has no entrance %d' % ('Legends of WrestleMania' if low else 'SvR 2009', entrance))
-    if low and (4170 <= entrance <= 4186 or 4230 <= entrance <= 4233 or 4350 <= entrance <= 4359):
-        raise InputError('Legends of WrestleMania %d is a "Gondola" (ring cart) entrance: not supported yet '
-                         '(the cart props 2552 / 2565 are not in 2011)' % entrance)
     progress(20, 'converting the script')
     stock = stock_2011_evps(game_pac)
     if not stock:
@@ -953,12 +1072,14 @@ def svr09_convert(src, entrance, number, name, parts, rep, game_pac=None, low=Fa
 # ---- WWE Legends of WrestleMania (Xbox 360, 2009): SvR 2009's entrances (pac/evt/Nyujyo0-3.pac EPAC, 4001-4359,
 #      singles 4000 + id - 100; 4170-4186 / 4230-4233 / 4350-4359 = "Gondola" ring-cart entrances) -> svr09_convert
 #      plus: LoW's own generic extras -> 13902, object 6's positions always from 2011's template, the inert
-#      trailing ring-cart prop dropped. Titantrons are movies/titantron/<superstar id>.bik (--titantron <id>).
+#      trailing ring-cart prop dropped (a Gondola entrance's cart kept: LoW's own model, low_convert).
+#      Titantrons are movies/titantron/<superstar id>.bik (--titantron <id>).
 
 LOW_GENERIC = {10902, 24802, 24902}
 LOW_MAYBE_GENERIC = {11902, 15902}        # (generic, except a tag partner at object 4)
 LOW_CARTS = {2552, 2565}
-LOW_MISSING_PROPS = (2552, 2565, 2554, 2555, 2557, 2562, 2563, 2564, 2568, 2569)
+LOW_CART_FALLBACK = 2526   # (2011's jeep, when the pack can't add the cart)
+LOW_MISSING_PROPS = (2554, 2555, 2557, 2562, 2563, 2564, 2568, 2569)
 
 
 def low_prepare(e, lines):
@@ -979,7 +1100,8 @@ def low_prepare(e, lines):
                 slots[k] = bytes(sl)
             o['slots'] = slots
     gone = None
-    if objs and (objs[-1]['t0'], objs[-1]['t1']) == E08.TYPE_PROP and objs[-1]['model'] in LOW_CARTS:
+    if (objs and (objs[-1]['t0'], objs[-1]['t1']) == E08.TYPE_PROP and objs[-1]['model'] in LOW_CARTS
+            and not any(E08.slot_fields(s)['on'] for s in objs[-1]['slots'])):   # (a Gondola entrance rides it)
         gone = len(objs) - 1
         lines.append('object %d: the unused ring-cart prop %d dropped' % (gone, objs[-1]['model']))
         objs.pop()
@@ -989,6 +1111,25 @@ def low_prepare(e, lines):
 
 def low_convert(src, entrance, number, name, parts, rep, game_pac=None):
     evp11, evt11 = svr09_convert(src, entrance, number, name, parts, rep, game_pac, low=True)
+    # the "Gondola" ring carts (4170-4186, 4230-4233, 4350-4359): LoW's own cart model (pac/evt/_EvtObj.pac SOBJ
+    # 2552 / 2565: PACH {0: JBOY, 10: textures}, as 2011's props) as a new evtobj entry; the cart rides its own
+    # world track, as 2011's vehicles do, the rider his
+    uses = {o['model'] for o in E08.parse_evp(evp11, '2011')['objs'] if (o['t0'], o['t1']) == E08.TYPE_PROP}
+    for model in sorted(uses & LOW_CARTS):
+        pid = EPR.PORTED[('low', model)]
+        try:
+            f = next(n for n in src.listdir('pac/evt') if n.lower() == '_evtobj.pac')
+            _, groups, _ = svrfmt.epac_read(src.read('pac/evt/' + f))
+            data = next(EPR._unpack(b) for ty, es in groups for n, b in es
+                        if ty == b'SOBJ' and n.decode('latin-1').strip(' \0') == str(model))
+            data = svrfmt.pach_write([(k, EPR._unpack(v)) for k, v in svrfmt.pach_read(data)])   # (plain parts)
+        except (OSError, StopIteration, ValueError) as x:
+            rep['warnings'].append('ring cart %d: LoW\'s model not read (%s): it will not show' % (model, x))
+            continue
+        PROPS.append((pid, LOW_CART_FALLBACK, data))
+        evp11 = EPR.set_prop(evp11, model, pid)
+        rep['notes'].append('ring cart %d: LoW\'s own model as evtobj %d, added by the pack (2011\'s %d if it can\'t '
+                            'be: propfallback)' % (model, pid, LOW_CART_FALLBACK))
     rep['notes'].append('titantron: LoW names them by superstar id (movies/titantron/<id>.bik): use --titantron <id>')
     return evp11, evt11
 
@@ -1057,10 +1198,21 @@ def cmd_detect(a):
     return out
 
 
+def kind_of(a, g):
+    global VICTORY
+    VICTORY = opt(a, '--kind', 'entrance') == 'victory'
+    if VICTORY and g not in VICTORY_GAMES:
+        raise InputError('%s victory scenes are not converted (SvR 2008, 2009, 2010 and Legends of WrestleMania are)'
+                         % GAMES[g]['name'])
+
+
 def cmd_list(a):
     src, g, lone = source_of(a)
+    kind_of(a, g)
     progress(5, 'reading entrances')
     out = LISTERS[g](src, find_game_pac(opt(a, '--game-pac')))
+    if VICTORY:                        # (singles: a mod's victory= replaces those; tag, title, match-type stay)
+        out = [r for r in out if r['number'] < 7150]
     for r in out:                      # (the Mod Maker contract's item key: what convert --entrance takes)
         r.setdefault('key', str(r['number']))
     progress(100, '%d entrances' % len(out))
@@ -1077,6 +1229,9 @@ def cmd_free(a):
     if not gp:
         raise InputError('the 2011 pac folder was not found: give --game-pac')
     mods = opt(a, '--mods') or os.path.join(os.path.dirname(gp), 'Mods')
+    if opt(a, '--kind') == 'victory':     # (6300-6999: past the superstars' own 6000 + id)
+        used = set(stock_victories(gp)) | pack_victories(mods)
+        return [n for n in range(6300, 7000) if n not in used]
     return free_numbers(gp, mods)
 
 
@@ -1185,6 +1340,9 @@ def titantron(src, a, entrance, out, rep):
 
 def cmd_convert(a):
     src, g, lone = source_of(a)
+    kind_of(a, g)
+    if VICTORY:
+        return convert_victory(a, src, g, lone)
     try:
         entrance, number = int(opt(a, '--entrance')), int(opt(a, '--number'))
     except (TypeError, ValueError):
@@ -1204,6 +1362,7 @@ def cmd_convert(a):
         rep['notes'] += ['lone file %s: %s' % (lone['file'], x) for x in lone['limits']]
         if 'warning' in lone:
             rep['warnings'].append(lone['warning'])
+    del PROPS[:]
     try:
         progress(5, 'reading the source')
         conv = CONVERTERS[g]
@@ -1229,6 +1388,7 @@ def cmd_convert(a):
         os.makedirs(out, exist_ok=True)
         label = '%s entrance %d as 2011 %d' % (GAMES[g]['name'], entrance, number)
         d = EH.write_pack(out, number, files, label)
+        EPR.write(d, PROPS)
         if '--no-pyro' not in a and not lone:
             pyro(src, g, entrance, number, d, rep)
         rep['files'] = sorted(os.path.relpath(os.path.join(r, f), out) for r, _, fs in os.walk(d) for f in fs)
@@ -1236,6 +1396,71 @@ def cmd_convert(a):
             titantron(src, a, entrance, out, rep)
         rep['out'] = d                 # (the move pack folder; the Mod Maker opens it on the Moves page)
         rep['opens'] = 'moves'
+        rep['ok'] = True
+    except InputError:
+        raise
+    except Exception as x:
+        rep['warnings'].append('conversion failed: %s' % x)
+        os.makedirs(out, exist_ok=True)
+        json.dump(rep, open(os.path.join(out, 'report.json'), 'w'), indent=1)
+        print(json.dumps(rep))
+        sys.exit(3)
+    json.dump(rep, open(os.path.join(out, 'report.json'), 'w'), indent=1)
+    progress(100, 'done')
+    return rep
+
+
+def convert_victory(a, src, g, lone):
+    """--kind victory: one win scene -> a pack with its script and tracks at 2011 number 6000-7999"""
+    try:
+        scene, number = int(opt(a, '--entrance')), int(opt(a, '--number'))
+    except (TypeError, ValueError):
+        raise InputError('--entrance and --number must be numbers')
+    out = opt(a, '--out')
+    if not out:
+        raise InputError('--out is needed')
+    if not 6000 <= number < 8000:
+        raise InputError('--number must be 6000..7999 for a victory scene (free-numbers --kind victory)')
+    gp = find_game_pac(opt(a, '--game-pac'))
+    if gp and number in stock_victories(gp):
+        raise InputError('2011 already has victory scene %d (%s): pick a free number' % (number, stock_victories(gp)[number]))
+    rep = dict(ok=False, game=g, entrance=scene, number=number, kind='victory', name=opt(a, '--name', ''), files=[],
+               warnings=[], dropped=[], notes=[])
+    if lone:
+        rep['lone'] = lone
+    del PROPS[:]
+    try:
+        progress(5, 'reading the source')
+        conv = CONVERTERS[g]
+        kw = {'game_pac': gp} if 'game_pac' in conv.__code__.co_varnames else {}
+        evp, evt = conv(src, scene, number, opt(a, '--name'), False, rep, **kw)
+        progress(60, 'checking')
+        # (2011's own victory scenes give every character object the generic model 13902: the game puts the winner,
+        # the loser and the referee in - an entrance's converted model ids would name other superstars)
+        e = E08.parse_evp(evp, '2011')
+        n_char = 0
+        for o in e['objs']:
+            if (o['t0'], o['t1']) == E08.TYPE_CHAR and o['model'] != 13902:
+                o['model'], n_char = 13902, n_char + 1
+        if n_char:
+            evp = E08.build_evp(e)
+            rep['notes'].append('%d character objects -> the generic model 13902 (as 2011 victory scenes)' % n_char)
+        E08.parse_evp(evp, '2011')
+        b = ymks.read_bank(evt)
+        for e in b.entries:
+            if e['data']:
+                for f, r in ymks.parse_stream(e['data']).records():
+                    ev, _ = ymks.split_record(r)
+                    if ev and not ymks.parse_events(ev, b.T)[1]:
+                        raise RuntimeError('event block does not walk 2011\'s size table in (%d,%d,%d)' % (e['id'], e['x'], e['y']))
+        progress(90, 'writing the pack')
+        os.makedirs(out, exist_ok=True)
+        d = write_victory_pack(out, number, evp, evt, '%s victory scene %d as 2011 %d' % (GAMES[g]['name'], scene, number))
+        EPR.write(d, PROPS)
+        rep['files'] = sorted(os.path.relpath(os.path.join(r, f), out) for r, _, fs in os.walk(d) for f in fs)
+        rep['out'] = d
+        rep['notes'].append('a superstar mod plays it after a singles win with victory=%d (its moves\\ pack or '
+                            'Mods\\Moves)' % number)
         rep['ok'] = True
     except InputError:
         raise

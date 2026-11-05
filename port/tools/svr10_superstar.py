@@ -405,6 +405,17 @@ def model_from_2010(pac10, cid, pac11, out):
     want = b'2' if b'2' in kinds else b'0'
     entries, kept, notes = [], [], []
     for typ, name, blob in allents:
+        if typ == b'EMD ' and want == b'2' and name[7:8] == b'4':   # (entrance gear: the whole wrestler in a coat / hat)
+            if ch_tool.unpack(blob)[:4] == b'PACH':
+                kids = svrfmt.pach_read(ch_tool.unpack(blob))
+                have = {i for i, d in kids}
+                drop = {0x64, 0xc8, 0xc9, 0x7530, 0x7531, 0x7532}   # (as 2011's own gear models: none of these)
+                new = [(i, d) for i, d in kids if i not in drop] + ([(0x50, t50)] if 0x50 not in have else [])
+                blob = svrfmt.pach_write(sorted(new, key=lambda x: x[0]))
+                notes.append('%s: entrance gear' % name.decode())
+            entries.append((typ, name, blob))
+            kept.append(name.decode())
+            continue
         if typ == b'EMD ':
             if name[7:8] != want:
                 continue
@@ -846,6 +857,15 @@ def build(cid, out, o):
              'announcer', 'call', 'height', 'song', 'movie']
     txt = ''.join('%s=%s\n' % (k, man[k]) for k in order if k in man)
     open(os.path.join(mod, 'manifest.txt'), 'w', newline='\n').write(txt)
+    if os.path.exists(os.path.join(mod, 'ch.pac')):   # Superstar Threads parts from the model's masks
+        try:
+            import threads_parts
+            parts = threads_parts.build(mod, os.path.dirname(os.path.normpath(pac11)))
+            if parts:
+                threads_parts.write(mod, parts)
+            p('Superstar Threads: %s' % ('%d part(s)' % sum(len(a['parts']) for a in parts) if parts else 'not listed (no masks)'))
+        except Exception as e:   # noqa: BLE001 - never fails the port
+            p('Superstar Threads parts not made (threads_parts: %s)' % e)
     tmp = out + '.%d.tmp' % os.getpid()
     with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
         for root, dirs, files in os.walk(mod):

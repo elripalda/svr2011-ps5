@@ -3,6 +3,7 @@
 #include "native/textures.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -24,6 +25,10 @@
 
 #include "native/texture_packs.h"
 #include "pad_icons.h"
+
+REXCVAR_DEFINE_BOOL(native_mat_fix, true, "GPU",
+                    "Native renderer: the stock ring mats without their light bands (rows of light patches in "
+                    "the game's mat art; false: the original). Applies from the next arena.");
 
 namespace svr2011::native::textures {
 
@@ -336,6 +341,7 @@ void FreeSrv(uint64_t frame, uint32_t srv) {
 
 bool SrvAvailable() { return !g_srv_free.empty() || !g_srv_retired.empty() || g_srv_next < g_srv_end; }
 std::unordered_map<uint64_t, Entry> g_textures;   // key hash -> texture
+std::atomic<uint64_t> g_generation{1};             // (Generation)
 struct SamplerEntry {
   uint32_t index;
   std::unique_ptr<plume::RenderSampler> sampler;
@@ -362,6 +368,9 @@ struct ResolvedViewEntry {
 std::unordered_map<uint64_t, ResolvedViewEntry> g_resolved_views;  // (generation, swizzle, gamma) ->
 Stats g_stats;
 const bool g_no_cache = std::getenv("SVR2011_NATIVE_NOCACHE") != nullptr;  // (debug)
+bool g_check_every_use = false;  // (SetCheckEveryUse: a Threads bake draw)
+// (test aid: Threads bake draws never re-check their textures - a missed check, as a slow PC got it)
+const bool g_test_bake_stale = std::getenv("SVR2011_TEST_BAKE_STALE") != nullptr;
 
 // 16 slices of 256 bytes spread over the resolve's guest span.
 uint64_t ResolvedFingerprint(uint32_t base_address, uint32_t bytes) {
@@ -748,6 +757,68 @@ std::vector<uint8_t> DumpPixels(const std::vector<uint8_t>& blocks, TF format, u
   return rgba;
 }
 
+// The stock ring mats (native_mat_fix, on by default): the game's three ring mat diffuses (256 x 1024 DXT5:
+// bg00-19 / 22 / 23 / 25 / 26, bg24 + bg29, bg20 - their content hashes; the same on the PS3) have a light
+// patch every few texel rows, drawn as rows of faint rectangles on the mat. Replaced, as a texture pack would,
+// by the same picture with each texel's brightness brought towards its neighbourhood's (+-8 texels, by at most
+// 10%): the patches go, the canvas's grain and its marks (far darker) stay. Made here from the game's own data -
+// no files.
+constexpr uint64_t kStockMats[] = {0xe1ae7cdd82d3cfcbull, 0x25702b2a9c01e0e1ull, 0xcd7c25e82c51c985ull};
+bool StockMat(uint64_t hash) {
+  for (uint64_t m : kStockMats)
+    if (m == hash) return true;
+  return false;
+}
+std::shared_ptr<const texture_packs::Replacement> EvenMat(std::vector<uint8_t> rgba, uint32_t w, uint32_t h) {
+  const size_t n = size_t(w) * h;
+  std::vector<float> lum(n), tmp(n);
+  double mean = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* p = &rgba[i * 4];
+    mean += lum[i] = p[0] * 0.3f + p[1] * 0.59f + p[2] * 0.11f;
+  }
+  mean /= double(n);
+  // (the neighbourhood: a box blur, wrapping as the mat's texture does)
+  constexpr int kNear = 8;
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      float sum = 0;
+      for (int d = -kNear; d <= kNear; ++d) sum += lum[size_t(y) * w + (x + d + w) % w];
+      tmp[size_t(y) * w + x] = sum / (2 * kNear + 1);
+    }
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      float sum = 0;
+      for (int d = -kNear; d <= kNear; ++d) sum += tmp[size_t((y + d + h) % h) * w + x];
+      const double k = std::clamp(mean / std::max(sum / (2 * kNear + 1), 1.0f), 0.9, 1.1);
+      uint8_t* p = &rgba[(size_t(y) * w + x) * 4];
+      for (int c = 0; c < 3; ++c) p[c] = uint8_t(std::clamp(p[c] * k + 0.5, 0.0, 255.0));
+    }
+  auto r = std::make_shared<texture_packs::Replacement>();
+  r->width = w, r->height = h;
+  r->format = texture_packs::Format::kRGBA8;
+  r->levels.push_back(std::move(rgba));
+  // (its mips: 2 x 2 boxes, to 1 x 1)
+  for (uint32_t lw = w, lh = h; lw > 1 || lh > 1;) {
+    const std::vector<uint8_t>& src = r->levels.back();
+    const uint32_t nw = std::max(lw / 2, 1u), nh = std::max(lh / 2, 1u);
+    std::vector<uint8_t> dst(size_t(nw) * nh * 4);
+    for (uint32_t y = 0; y < nh; ++y)
+      for (uint32_t x = 0; x < nw; ++x)
+        for (int c = 0; c < 4; ++c) {
+          const uint32_t x0 = std::min(x * 2, lw - 1), x1 = std::min(x * 2 + 1, lw - 1);
+          const uint32_t y0 = std::min(y * 2, lh - 1), y1 = std::min(y * 2 + 1, lh - 1);
+          dst[(size_t(y) * nw + x) * 4 + c] =
+              uint8_t((src[(size_t(y0) * lw + x0) * 4 + c] + src[(size_t(y0) * lw + x1) * 4 + c] +
+                       src[(size_t(y1) * lw + x0) * 4 + c] + src[(size_t(y1) * lw + x1) * 4 + c] + 2) / 4);
+        }
+    r->levels.push_back(std::move(dst));
+    lw = nw, lh = nh;
+  }
+  return r;
+}
+
+
 // One subresource's place in the staging buffer (rows 256-byte aligned,
 // subresources 512-byte aligned: valid copy sources for D3D12 and Vulkan).
 struct Footprint {
@@ -828,6 +899,30 @@ bool Upload(const Context& ctx, const xenos::xe_gpu_texture_fetch_t& fetch, uint
                                                  &mip_min, &mip_max);
   const uint32_t width = w1 + 1, height = h1 + 1, depth_or_array = d1 + 1;
   if (!base_page && !mip_page) return false;
+  // Debugging: SVR2011_NATIVE_DUMP_BASE=<hex physical address> writes the guest bytes of the texture based
+  // there (endian-swapped as the GPU reads them; its pitch x height in blocks) to tex_<base>.raw beside the log,
+  // each time it is uploaded - the game's own data, for telling it from a conversion.
+  static const uint32_t dump_base = [] {
+    const char* v = std::getenv("SVR2011_NATIVE_DUMP_BASE");
+    return v ? uint32_t(std::strtoul(v, nullptr, 16)) : 0u;
+  }();
+  if (dump_base && (base_page << 12) == dump_base) {
+    const FormatInfo* fi = FormatInfo::Get(format);
+    const uint32_t bw = fi ? fi->block_width : 1, bh = fi ? fi->block_height : 1, bytes_pb = fi ? fi->bytes_per_block() : 4;
+    const uint32_t pitch_blocks = (fetch.pitch * 32 + bw - 1) / bw, rows = (height + bh - 1) / bh;
+    std::vector<uint8_t> raw(size_t(pitch_blocks) * bytes_pb * rows);
+    const uint32_t mask = fetch.endianness == xenos::Endian::k8in16 ? 1 : fetch.endianness == xenos::Endian::k8in32 ? 3
+                          : fetch.endianness == xenos::Endian::k16in32 ? 2 : 0;
+    ReadGuest(raw.data(), base_page << 12, uint32_t(raw.size()), mask);
+    const std::string path = fmt::format("tex_{:08X}.raw", base_page << 12);
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+      std::fwrite(raw.data(), 1, raw.size(), f);
+      std::fclose(f);
+    }
+    REXLOG_INFO("native texture dump: {:08X} format {} {}x{} pitch {} blocks, tiled {}, endian {} -> {} ({} bytes)",
+                base_page << 12, uint32_t(format), width, height, pitch_blocks, uint32_t(fetch.tiled),
+                uint32_t(fetch.endianness), path, raw.size());
+  }
   const texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
       dim, fetch.pitch, width, height, depth_or_array, fetch.tiled, format, fetch.packed_mips,
       base_page != 0, mip_max);
@@ -927,8 +1022,9 @@ bool Upload(const Context& ctx, const xenos::xe_gpu_texture_fetch_t& fetch, uint
   // hash, dumped once and replaced when a pack has it (Texture() swaps it in
   // once the file is read). (SVR2011_TEXTURE_HASH_LOG: each new texture's hash)
   static const bool hash_log = std::getenv("SVR2011_TEXTURE_HASH_LOG") != nullptr;
+  const bool mat_shape = width == 256 && height == 1024 && format == TF::k_DXT4_5 && REXCVAR_GET(native_mat_fix);
   if ((!reuse || e.changes <= kPackChanges) && dimension == 0 && array_size == 1 && !is_3d && !is_cube &&
-      !pad_candidate && base_page && (hash_log || texture_packs::Active())) {
+      !pad_candidate && base_page && (hash_log || texture_packs::Active() || mat_shape)) {
     const char* tag = PackFormat(format);
     if (tag || hash_log) {
       thread_local std::vector<uint8_t> blocks;
@@ -942,7 +1038,14 @@ bool Upload(const Context& ctx, const xenos::xe_gpu_texture_fetch_t& fetch, uint
         texture_packs::Dump(h, width, height, DumpPixels(blocks, format, width, height, fetch.swizzle), tag);
       if (tag && h && e.changes <= kPackChanges) {
         e.ready = nullptr;
-        e.pending = texture_packs::Find(h, &e.ready) == texture_packs::Lookup::kNone ? 0 : h;
+        e.pending = texture_packs::Active() && texture_packs::Find(h, &e.ready) != texture_packs::Lookup::kNone ? h : 0;
+        // (a stock ring mat, no pack of its own for it: the evened-out one)
+        if (mat_shape && StockMat(h) && !e.pending) {
+          e.ready = EvenMat(DumpPixels(blocks, format, width, height, fetch.swizzle), width, height);
+          e.pending = h;
+          static int logged = 0;
+          if (logged++ < 8) REXLOG_INFO("native renderer: stock ring mat {:016x} - evened out (native_mat_fix)", h);
+        }
       }
     }
   }
@@ -1288,7 +1391,8 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
   // reused that memory (the GPU can't resolve to DXT), so the copy is stale -
   // after Superstar Threads, Tyson Kidd's roster picture showed its editor
   // preview (a white square).
-  if (IsBlockCompressed(uint32_t(fetch.format))) g_resolved.erase(fetch.base_address);
+  if (IsBlockCompressed(uint32_t(fetch.format)) && g_resolved.erase(fetch.base_address)) ++g_generation;
+  if (g_no_cache || g_check_every_use) ++g_generation;  // (every use checked: no answer kept)
   // Any texture the game loaded where a resolve went: a resolve leaves guest
   // memory alone, so changed memory is the game's new texture (after a match,
   // Superstar Threads' paint layers landed on the match's resolves and a
@@ -1303,6 +1407,7 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
                     fetch.base_address << 12);
       }
       g_resolved.erase(it);
+      ++g_generation;
     }
   }
   if (auto it = g_resolved.find(fetch.base_address); it != g_resolved.end()) {
@@ -1319,6 +1424,7 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
     return UINT32_MAX;
   }
   if (!e.resource) {
+    ++g_generation;
     e.created_frame = ctx.frame;
     if (!Upload(ctx, fetch, dimension, e)) {
       e.failed = true;
@@ -1331,14 +1437,26 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
       ++g_stats.unsupported;
       return UINT32_MAX;
     }
-  } else if (g_no_cache || e.written || ctx.frame > e.used_frame + kUnusedRecheckFrames ||
+  } else if (g_check_every_use && g_test_bake_stale) {
+  } else if (g_no_cache || g_check_every_use || e.written || ctx.frame > e.used_frame + kUnusedRecheckFrames ||
              ctx.frame >= e.checked_frame +
                               (e.dynamic ? e.interval
                                : ctx.frame < e.created_frame + kNewFrames ? kNewRecheckFrames
                                                                           : kRecheckFrames)) {
+    // (a Threads bake draw: same frame as its last check - before, a layer drawn then was the previous one)
+    const bool same_frame = e.checked_frame == ctx.frame;
     e.checked_frame = ctx.frame;
     e.written = false;
-    if (GuestHash(e) != e.hash) {
+    const bool changed = GuestHash(e) != e.hash;
+    if (g_check_every_use) {
+      static uint32_t logged = 0;
+      if (logged++ < 64) {
+        REXLOG_INFO("native renderer: threads bake: texture {:08X} format {} {}x{} {} (frame {}{})", e.base_address,
+                    uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
+                    changed ? "changed" : "same", ctx.frame, same_frame ? ", checked again in it" : "");
+      }
+    }
+    if (changed) {
       static const bool log_changes = std::getenv("SVR2011_LOG_TEXTURE_CHANGES") != nullptr;  // (debug)
       if (log_changes) {
         REXLOG_INFO("native renderer: texture {:08X} changed (frame {})", e.base_address, ctx.frame);
@@ -1367,6 +1485,7 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
       e.dynamic = true;
       e.interval = 1;
       ++e.changes;
+      ++g_generation;
       Upload(ctx, fetch, dimension, e);
     } else if (e.dynamic) {
       e.interval = uint32_t(std::min<uint64_t>(uint64_t(e.interval) * 2, kRecheckFrames));
@@ -1376,10 +1495,13 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
   if (e.pending && e.changes <= kPackChanges) {
     if (!e.ready && texture_packs::Find(e.pending, &e.ready) == texture_packs::Lookup::kNone) e.pending = 0;
     if (e.ready && !Replace(ctx, e, fetch)) e.pending = 0;
+    ++g_generation;
   }
   e.used_frame = ctx.frame;
   return e.srv;
 }
+
+uint64_t Generation() { return g_generation.load(std::memory_order_relaxed); }
 
 uint32_t Sampler(const Context& ctx, const uint32_t fetch[6]) {
   const uint64_t base_key = uint64_t((fetch[0] >> 10) & 0x1FF) | (uint64_t((fetch[3] >> 19) & 0x7FF) << 9) |
@@ -1452,6 +1574,7 @@ void SetQuality(uint32_t skip) {
   skip = std::min(skip, 2u);
   if (skip == g_quality_skip) return;
   g_quality_skip = skip;
+  ++g_generation;
   // Uploaded again as they're used, into their own descriptor slots.
   uint32_t dropped = 0;
   for (auto& [key, e] : g_textures) {
@@ -1478,11 +1601,18 @@ void SetBlockCompressionSupported(bool supported) {
   g_bc_supported = supported && std::getenv("SVR2011_NATIVE_NO_BC") == nullptr;
 }
 
-void ForgetResolved() { g_resolved.clear(); }
+void ForgetResolved() {
+  g_resolved.clear();
+  ++g_generation;
+}
 
-void ForgetResolved(uint32_t base_address) { g_resolved.erase(base_address >> 12); }
+void ForgetResolved(uint32_t base_address) {
+  g_resolved.erase(base_address >> 12);
+  ++g_generation;
+}
 
 void GuestWritten(uint32_t address, uint32_t size) {
+  ++g_generation;
   const uint64_t end = uint64_t(address) + size;
   for (auto& [key, e] : g_textures) {
     const bool base = e.base_size && e.base_address < end && address < uint64_t(e.base_address) + e.base_size;
@@ -1491,8 +1621,15 @@ void GuestWritten(uint32_t address, uint32_t size) {
   }
 }
 
+void SetCheckEveryUse(bool on) {  // (set around every draw: only a change moves the generation)
+  if (g_check_every_use == on) return;
+  g_check_every_use = on;
+  ++g_generation;
+}
+
 void RegisterResolved(uint32_t base_address, plume::RenderTexture* resource, RenderFormat format,
                       RenderFormat gamma_format, uint32_t components, bool swap_rb, uint32_t bytes) {
+  ++g_generation;
   Resolved& r = g_resolved[base_address >> 12];
   r.bytes = bytes;
   r.fingerprint = ResolvedFingerprint(base_address, bytes);
@@ -1505,6 +1642,7 @@ void RegisterResolved(uint32_t base_address, plume::RenderTexture* resource, Ren
 }
 
 void ReleaseResolved(const Context& ctx, plume::RenderTexture* texture) {
+  ++g_generation;
   for (auto it = g_resolved_views.begin(); it != g_resolved_views.end();) {
     if (it->second.texture == texture) {
       ctx.retire(std::move(it->second.view));
@@ -1553,6 +1691,13 @@ plume::RenderComponentMapping ComponentMapping(uint32_t swizzle, uint32_t compon
     out[i] = Swizzle(c);
   }
   return plume::RenderComponentMapping(out[0], out[1], out[2], out[3]);
+}
+
+uint64_t ResidentBytes() { return g_resident_bytes; }
+uint32_t ResidentCount() {
+  uint32_t n = 0;
+  for (const auto& [key, e] : g_textures) n += e.resource != nullptr;
+  return n;
 }
 
 Stats TakePerf() {
