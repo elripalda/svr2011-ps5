@@ -17,9 +17,6 @@ namespace svr2011::hub {
 
 namespace fs = std::filesystem;
 
-// (hub_ui.h's tab ids: the pages in hub_pages.cpp and hub_setup.cpp use them)
-static const char* const kTabNames[kTabCount] = {"HOME",  "SETTINGS", "MODS",   "ROSTER", "TEXTURES", "MUSIC",  "MOVIES",
-                                                 "PAINT", "SAVES",    "ONLINE", "DLC",    "ABOUT"};
 
 namespace {
 
@@ -70,6 +67,17 @@ std::string TypeHeading(const std::string& type) {
     out += char(std::toupper(static_cast<unsigned char>(c)));
   }
   return out;
+}
+
+// A mod folder type as one of it: "MatchTypes" -> "Match type".
+std::string TypeName(const std::string& type) {
+  if (type == "Superstars") return "Superstar";
+  if (type == "Arenas") return "Arena";
+  if (type == "MatchTypes") return "Match type";
+  if (type == "Backgrounds") return "Background";
+  if (type == "Signs") return "Sign pack";
+  if (type == "Media") return "Media pack";
+  return type;
 }
 
 std::string Unquote(std::string v) {
@@ -223,8 +231,16 @@ void Hub::LoadMods() {
       mods_.push_back(std::move(m));
     }
   }
-  std::sort(mods_.begin(), mods_.end(), [](const Mod& a, const Mod& b) {
-    return a.type != b.type ? a.type < b.type : Upper(a.name) < Upper(b.name);
+  // (superstars first, then arenas and match types: My Mods' tabs in that order)
+  auto rank = [](const std::string& t) {
+    const char* order[] = {"Superstars", "Arenas", "MatchTypes", "Backgrounds", "Media", "Signs"};
+    for (int i = 0; i < 6; ++i)
+      if (t == order[i]) return i;
+    return 9;
+  };
+  std::sort(mods_.begin(), mods_.end(), [&](const Mod& a, const Mod& b) {
+    if (a.type != b.type) return rank(a.type) != rank(b.type) ? rank(a.type) < rank(b.type) : a.type < b.type;
+    return Upper(a.name) < Upper(b.name);
   });
 }
 
@@ -496,34 +512,41 @@ float Hub::Hint(float right, uint32_t button, const char* label) {
 
 // A switch; `on` slides from 0 (off) to 1 (on).
 void Hub::Switch(float x, float y, float on, bool focused) {
-  const float w = 58, h = 32;
-  const ImU32 off = focused ? Black(0.16f) : White(0.18f);
-  Rect(x, y, w, h, Mix(off, kAccent, on), h * 0.5f);
-  const float t = Smooth(on);
+  const float w = 56, h = 32, t = Smooth(on);
+  if (focused) {  // (on the red focus: a white track when on)
+    GradRect(x, y, w, h, Mix(Black(0.22f), White(0.98f), t), Mix(Black(0.18f), White(0.9f), t), h * 0.5f);
+  } else {
+    if (t > 0.02f) Glow(x, y, w, h, h * 0.5f, WithAlpha(kAccent, 0.6f * t), 12);
+    GradRect(x, y, w, h, Mix(White(0.16f), kAccentHi, t), Mix(White(0.12f), kAccentLo, t), h * 0.5f);
+  }
   const float kx = x + h * 0.5f + (w - h) * t;
   const float stretch = 4 * std::sin(t * 3.14159f);  // (the knob stretches a little while it moves)
-  dl_->AddRectFilled(P(kx - 12.5f - stretch * 0.5f, y + 3.5f), P(kx + 12.5f + stretch * 0.5f, y + h - 3.5f), White(1),
-                     12.5f * s_);
+  const ImU32 knob = focused ? Mix(White(0.9f), kAccent, t) : Mix(White(0.78f), White(1), t);
+  dl_->AddRectFilled(P(kx - 12.5f - stretch * 0.5f, y + 3.5f + 1.5f), P(kx + 12.5f + stretch * 0.5f, y + h - 3.5f + 1.5f),
+                     Black(0.25f), 12.5f * s_);
+  dl_->AddRectFilled(P(kx - 12.5f - stretch * 0.5f, y + 3.5f), P(kx + 12.5f + stretch * 0.5f, y + h - 3.5f), knob, 12.5f * s_);
 }
 
 void Hub::PageTitle(const char* title, const std::string& subtitle) {
-  Text(a_.display, 60, 112, 132, kText, title, 0, 1);
-  Text(a_.body, 22, 114, 214, White(0.6f), subtitle);
+  list_y_ = kListY;  // (a page with tabs moves it down: PageTabs)
+  Text(a_.display, 56, kPageX, 44, kText, title, 0, 1.5f);
+  Text(a_.body, 20, kPageX + 2, 118, White(0.6f), subtitle);
 }
 
 void Hub::Empty(const char* title, const std::string& text) {
-  Text(a_.display, 40, kListX, kListY + 40, kText, title);
-  Wrapped(a_.body, 23, kListX, kListY + 110, 820, White(0.65f), text);
+  Glass(kListX, list_y_ + 10, kListW, 230, 18, 0.9f);
+  Text(a_.display, 36, kListX + 40, list_y_ + 44, kText, title);
+  Wrapped(a_.body, 21, kListX + 40, list_y_ + 104, kListW - 80, White(0.65f), text);
 }
 
 void Hub::List(std::vector<Row>& rows, int sel, float rh, const std::function<void(int, float, float)>& draw) {
-  const float hh = 50, view = kListView, x = kListX, w = kListW, y0 = kListY;
+  const float hh = 44, x = kListX, w = kListW, y0 = list_y_, view = kListBottom - list_y_;
   float yy = 0;
   int sel_row = -1;
   for (size_t k = 0; k < rows.size(); ++k) {
     Row& r = rows[k];
     if (r.item < 0) {
-      yy += k ? 14 : 0;
+      yy += k ? 12 : 0;
       r.y = yy;
       yy += hh;
     } else {
@@ -553,106 +576,96 @@ void Hub::List(std::vector<Row>& rows, int sel, float rh, const std::function<vo
   }
   Ease(scroll_f_, scroll_px_, 18);
   Ease(focus_y_, rows[size_t(sel_row)].y, 20);
+  // the rows' panes, then the focus over them (red and glowing; on the rail: quiet glass)
   dl_->PushClipRect(P(0, y0 - 2), P(kW, y0 + view), true);
-  const float push = press_ * 4;
-  Rect(x + push, y0 + focus_y_ - scroll_f_ + push * 0.5f, w - push * 2, rh - 6 - push, kText, 10);
+  for (const Row& row : rows) {
+    const float ry = y0 + row.y - scroll_f_;
+    if (row.item < 0 || ry < y0 - rh - 20 || ry > y0 + view + 20) continue;
+    GradRect(x, ry, w, rh - 6, White(0.045f), White(0.02f), 12);
+  }
+  dl_->PopClipRect();
+  const float push = press_ * 4, fy = y0 + focus_y_ - scroll_f_ + push * 0.5f;
+  dl_->PushClipRect(P(0, y0 - 40), P(kW, y0 + view + 40), true);
+  if (rail_focus_) {
+    GradRect(x, fy, w, rh - 6, White(0.12f), White(0.05f), 12);
+  } else {
+    FocusFill(x + push, fy, w - push * 2, rh - 6 - push, 12);
+    Ring(x + push, fy, w - push * 2, rh - 6 - push, 12);
+  }
+  dl_->PopClipRect();
+  dl_->PushClipRect(P(0, y0 - 2), P(kW, y0 + view), true);
   for (size_t k = 0; k < rows.size(); ++k) {
     const Row& row = rows[k];
     const float ry = y0 + row.y - scroll_f_;
     if (ry < y0 - rh - 20 || ry > y0 + view + 20) continue;
     if (row.item < 0) {
-      Text(a_.body_bold, 15, x + 24, ry + 20, White(0.45f), row.heading, 0, 3);
+      Rect(x + 6, ry + 25, 14, 2, kAccent, 1);
+      Text(a_.body_bold, 13, x + 32, ry + 18, White(0.45f), row.heading, 0, 3.2f);
       continue;
     }
     const float over = std::clamp(1 - std::fabs(focus_y_ - row.y) / (rh * 0.7f), 0.0f, 1.0f);
-    // (a thin line between rows that sit together)
-    if (k + 1 < rows.size() && rows[k + 1].item >= 0)
-      Rect(x + 24, ry + rh - 3, w - 48, 1, White(0.06f * (1 - over)));
     draw(row.item, ry, over);
   }
   dl_->PopClipRect();
   if (total > view) {  // where the list is
-    const float bh = view * view / total;
+    const float bh = std::max(40.0f, view * view / total);
     const float by = y0 + (view - bh) * scroll_f_ / (total - view);
-    Rect(x + w + 16, y0, 3, view - 6, White(0.08f), 1.5f);
-    Rect(x + w + 16, by, 3, bh - 6, White(0.5f), 1.5f);
+    Rect(x + w + 14, y0, 4, view - 6, White(0.07f), 2);
+    Rect(x + w + 14, by, 4, bh - 6, White(0.5f), 2);
   }
 }
 
 void Hub::Panel(const std::function<void(float, float, float)>& draw) {
   const int v0 = dl_->VtxBuffer.Size;
-  draw(kPanelX + (1 - Smooth(panel_in_)) * 16, kPanelY, kPanelW);
+  draw(kPanelX + (1 - Smooth(panel_in_)) * 16, list_y_, kPanelW);
   Fade(v0, Smooth(panel_in_));
 }
 
 float Hub::Facts(float x, float y, float w, const std::vector<std::pair<std::string, std::string>>& facts) {
   for (const auto& [k, v] : facts) {
-    Text(a_.body_bold, 15, x, y + 5, White(0.45f), k, 0, 2.5f);
-    y += std::max(44.0f, Wrapped(a_.body_bold, 22, x + 160, y, w - 160, White(0.82f), v) + 14);
+    Text(a_.body_bold, 13, x, y + 6, White(0.45f), k, 0, 2.6f);
+    y += std::max(40.0f, Wrapped(a_.body_bold, 20, x + 136, y, w - 136, White(0.85f), v) + 12);
   }
   return y;
 }
 
 void Hub::DrawBackdrop() {
   const ImVec2 size = ImGui::GetIO().DisplaySize;
-  dl_->AddRectFilled(ImVec2(0, 0), size, Rgba(8, 9, 11));
+  dl_->AddRectFilled(ImVec2(0, 0), size, kGround);
   if (a_.hero) {
-    // The picture covers the screen, slowly zooming in and out (a 50 s
-    // breath) and drifting sideways with the pages.
+    // The game's picture, its middle right of the page, slowly zooming in and out (a 50 s breath)
+    // and drifting a little with the pages.
     const float breath = 0.5f - 0.5f * std::cos(time_ * 6.2832f / 50.0f);
-    const float zoom = 1.04f + 0.06f * breath;
-    Ease(hero_x_, (float(tab_) / float(kTabCount - 1) - 0.5f) * 0.024f, 3);
-    const float sa = size.x / size.y, ia = a_.hero.width / a_.hero.height;
-    float uw = 1, vh = 1;
-    if (ia > sa) uw = sa / ia;
-    else vh = ia / sa;
-    uw /= zoom, vh /= zoom;
-    const float room = (1 - uw) * 0.5f;
-    const float cx = 0.5f + std::clamp(hero_x_ + 0.004f * std::sin(time_ * 0.07f), -room, room);
-    const ImVec2 uv0(cx - uw * 0.5f, 0.42f - vh * 0.42f), uv1(cx + uw * 0.5f, 0.42f + vh * 0.58f);
-    dl_->AddImage(a_.hero.id, ImVec2(0, 0), size, uv0, uv1);
+    const float zoom = 1.05f + 0.06f * breath;
+    Ease(hero_x_, (float(tab_) / float(kTabCount - 1) - 0.5f) * 40.0f, 3);
+    const float h = kH * zoom, w = h * a_.hero.width / a_.hero.height;
+    const float cx = hero_center_ + hero_x_ + 8 * std::sin(time_ * 0.07f), cy = kH * 0.47f;
+    dl_->AddImage(a_.hero.id, P(cx - w * 0.5f, cy - h * 0.47f), P(cx + w * 0.5f, cy + h * 0.53f));
   }
   // The pages over it: the picture steps back
-  Ease(shade_, tab_ == kHome ? 0.0f : 0.84f, 7);
+  Ease(shade_, tab_ == kHome ? 0.0f : 0.82f, 7);
   if (shade_ > 0.003f) dl_->AddRectFilled(ImVec2(0, 0), size, Black(shade_));
-  // (on the home page, the lower left darkens a little under the logo)
-  if (shade_ < 0.6f) {
-    const float k = 1 - shade_ / 0.6f;
-    dl_->AddRectFilledMultiColor(ImVec2(0, P(0, 330).y), ImVec2(P(1200, 0).x, size.y), Black(0), Black(0), Black(0),
-                                 Black(0.7f * k));
+  const float home = 1 - std::clamp(shade_ / 0.82f, 0.0f, 1.0f);
+  // Home: the page's side darkens so the logo and buttons read over the picture
+  if (home > 0.01f) {
+    dl_->AddRectFilledMultiColor(P(0, 0), P(1380, kH), Black(0.86f * home), Black(0), Black(0), Black(0.86f * home));
+    dl_->AddRectFilledMultiColor(P(0, 560), P(kW, kH), Black(0), Black(0), Black(0.94f * home), Black(0.94f * home));
   }
-  // the top bar and the bottom stay readable over a bright picture
-  dl_->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(size.x, P(0, 230).y), Black(0.72f), Black(0.72f), Black(0), Black(0));
-  const float fade_from = 430 + 330 * std::clamp(shade_ / 0.84f, 0.0f, 1.0f);
-  dl_->AddRectFilledMultiColor(ImVec2(0, P(0, fade_from).y), ImVec2(size.x, size.y), Black(0), Black(0), Black(0.94f),
-                               Black(0.94f));
+  // stage light: a red bloom from above, and the edges falling off
+  const float bloom = 0.2f + 0.8f * (1 - home);  // (Home has the picture's own light)
+  for (int i = 0; i < 6; ++i) {
+    const float k = float(i) / 6;
+    dl_->AddEllipseFilled(P(1250, -60), ImVec2((900 - 120 * i) * s_, (360 - 48 * i) * s_),
+                          WithAlpha(kAccent, (0.035f + 0.015f * k) * bloom), 0, 48);
+  }
+  dl_->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(size.x, P(0, 180).y), Black(0.45f), Black(0.45f), Black(0), Black(0));
+  dl_->AddRectFilledMultiColor(P(0, kH - 140), ImVec2(size.x, size.y), Black(0), Black(0), Black(0.7f), Black(0.7f));
 }
 
-void Hub::DrawTopBar() {
-  // the pages, between L1 and R1
-  constexpr float kSize = 26, kSpacing = 2.2f, kGap = 40;
-  float x = 112;
-  Glyph(kL1, x + 20, 70, White(0.55f));
-  x += 70;
-  float sel_x = 0, sel_w = 0;
-  for (int i = 0; i < kTabCount; ++i) {
-    const bool sel = i == tab_;
-    const float w = TextWidth(a_.nav, kSize, kTabNames[i], kSpacing);
-    Text(a_.nav, kSize, x, 52, sel ? kText : White(0.5f), kTabNames[i], 0, kSpacing);
-    if (sel) sel_x = x, sel_w = w;
-    x += w + kGap;
-  }
-  Glyph(kR1, x - kGap + 34, 70, White(0.55f));
-  // the underline glides to the page, stretching on the way
-  const float before = tab_x_;
-  Ease(tab_x_, sel_x, 16);
-  Ease(tab_w_, sel_w, 22);
-  const float travel = std::min(60.0f, std::fabs(sel_x - before) * 0.25f);
-  Rect(tab_x_ - travel * 0.5f, 89, tab_w_ + travel, 4, kAccent, 2);
-}
+
 
 void Hub::DrawHints() {
-  float r = 1808;
+  float r = kPageR;
   if (kb_.open) {
     r = Hint(r, kCircle, "Cancel");
     r = Hint(r, kOptions, "Done");
@@ -660,82 +673,94 @@ void Hub::DrawHints() {
     r = Hint(r, kTriangle, "Space");
     r = Hint(r, kSquare, "Delete");
     r = Hint(r, kCross, "Type");
-    return;
-  }
-  if (confirm_) {
+  } else if (confirm_) {
     if (confirm_yes_ != "OK") r = Hint(r, kCircle, "Cancel");
     r = Hint(r, kCross, confirm_yes_.c_str());
-    return;
-  }
-  if (choice_) {
+  } else if (choice_) {
     r = Hint(r, kCircle, "Cancel");
     r = Hint(r, kCross, "Choose");
-    return;
-  }
-  if (qr_open_) {
+  } else if (qr_open_) {
     r = Hint(r, kCircle, "Close");
-    return;
-  }
-  if (DiscoverOpen()) {
-    DiscoverHints(r);
-    return;
-  }
-  if (br_.open) r = BrowserHints(r);
-  if (!br_.open) {
-  if (tab_ != kHome && state_.Installed()) r = Hint(r, kOptions, "Start Game");
-  if (tab_ != kHome) r = Hint(r, kCircle, "Home");
-  switch (tab_) {
-    case kHome: r = Hint(r, kCross, "Start Game"); break;
-    case kSettingsTab: r = Hint(r, kLeft | kRight, "Change"); break;
-    case kModsTab:
-      r = Hint(r, kTriangle, "Discover");
-      r = Hint(r, kSquare, "Find Mods");
-      if (item_[tab_] < int(drops_.size())) r = Hint(r, kCross, "Install");
-      else if (!mods_.empty()) r = Hint(r, kCross, "Turn On / Off");
-      break;
-    case kPaintTab:
-      if (paint_ok_) {
-        r = Hint(r, kTriangle, "Save All as PNG");
-        r = Hint(r, kCross, "Choose");
+  } else if (dl_open_) {
+    DownloadsHints(r);
+  } else if (menu_open_) {
+    r = Hint(r, kCircle, "Close");
+    r = Hint(r, kCross, "Choose");
+  } else if (br_.open) {
+    BrowserHints(r);
+  } else if (rail_focus_) {
+    if (state_.Installed()) r = Hint(r, kOptions, "Start Game");
+    if (tab_ != kHome) r = Hint(r, kCircle, "Home");
+    r = Hint(r, kCross, "Open");
+  } else {
+    if (tab_ != kHome && state_.Installed()) r = Hint(r, kOptions, "Start Game");
+    if (tab_ != kHome && !(tab_ == kDiscoverTab && DiscoverOpen())) r = Hint(r, kCircle, "Back");
+    switch (tab_) {
+      case kHome: r = Hint(r, kCross, home_sel_ == 0 ? "Start Game" : "Open"); break;
+      case kSettingsTab: r = Hint(r, kLeft | kRight, "Change"); break;
+      case kModsTab: {
+        r = Hint(r, kSquare, "Find Mods");
+        const std::vector<int> shown = ModsShown();
+        if (!shown.empty()) {
+          const int k = shown[size_t(std::clamp(item_[tab_], 0, int(shown.size()) - 1))];
+          r = Hint(r, kTriangle, "Options");
+          r = Hint(r, kCross, k < int(drops_.size()) ? "Install" : "Turn On / Off");
+        }
+        break;
       }
-      break;
-    case kRosterTab: r = Hint(r, kLeft | kRight, "Category"); break;
-    case kPacksTab:
-      if (!packs_.empty()) {
-        r = Hint(r, kTriangle, "Higher Priority");
-        r = Hint(r, kCross, "Turn On / Off");
+      case kDiscoverTab: DiscoverHints(r); break;
+      case kDownloadsTab: DownloadsHints(r); break;
+      case kPaintTab:
+        if (paint_ok_) {
+          r = Hint(r, kTriangle, "Save All as PNG");
+          r = Hint(r, kCross, "Choose");
+        }
+        break;
+      case kRosterTab: r = Hint(r, kLeft | kRight, "Category"); break;
+      case kPacksTab:
+        if (!packs_.empty()) {
+          r = Hint(r, kTriangle, "Higher Priority");
+          r = Hint(r, kCross, "Turn On / Off");
+        }
+        break;
+      case kMusicTab: {
+        const std::vector<int> shown = MusicShown();
+        if (!shown.empty()) {
+          const int k = shown[size_t(std::clamp(item_[tab_], 0, int(shown.size()) - 1))];
+          r = Hint(r, kCross, k < 0 ? "Play" : previewing_ == k ? "Stop" : "Listen");
+        }
+        break;
       }
-      break;
-    case kMusicTab:
-      if (!songs_.empty()) r = Hint(r, kCross, previewing_ >= 0 ? "Stop" : "Listen");
-      break;
-    case kSavesTab: r = Hint(r, kCross, item_[tab_] == 0 ? "Back Up" : "Restore"); break;
-    case kOnlineTab: r = Hint(r, kCross, item_[tab_] == 2 ? "Turn On / Off" : item_[tab_] == 3 ? "Change" : "Select"); break;
-    case kDlcTab:
-      if (task_ && task_kind_ == 6) break;
-      if (DlcToInstall().size() > 1 && dlc_install_) r = Hint(r, kTriangle, "Install All");
-      if (!dlc_.empty() && dlc_install_) {
-        const Dlc& d = dlc_[size_t(std::clamp(item_[tab_], 0, int(dlc_.size()) - 1))];
-        if (!d.other) r = Hint(r, kCross, d.installed ? "Options" : "Install");
-      }
-      break;
+      case kSavesTab: r = Hint(r, kCross, item_[tab_] == 0 ? "Back Up" : "Restore"); break;
+      case kOnlineTab: r = Hint(r, kCross, item_[tab_] == 2 ? "Turn On / Off" : item_[tab_] == 3 ? "Change" : "Select"); break;
+      case kDlcTab:
+        if (task_ && task_kind_ == 6) break;
+        if (DlcToInstall().size() > 1 && dlc_install_) r = Hint(r, kTriangle, "Install All");
+        if (!dlc_.empty() && dlc_install_) {
+          const Dlc& d = dlc_[size_t(std::clamp(item_[tab_], 0, int(dlc_.size()) - 1))];
+          if (!d.other) r = Hint(r, kCross, d.installed ? "Options" : "Install");
+        }
+        break;
+    }
   }
-  }
-  // a message (bottom left, rising in), or the version
+  // a message (bottom left of the page, rising in), or what's being set up
   if (toast_time_ > 0) {
     const float a = Smooth(std::min(toast_time_ * 3, (3.0f - toast_time_) * 6));
-    const float w = TextWidth(a_.body_bold, 20, toast_) + 44;
-    const float y = 1002 + (1 - a) * 14;
-    Rect(112, y, w, 42, White(0.14f * a), 21);
-    dl_->AddCircleFilled(P(132, y + 21), 4.5f * s_, WithAlpha(kAccent, a), 16);
-    Text(a_.body_bold, 20, 146, y + 8, White(0.92f * a), toast_);
+    const int v0 = dl_->VtxBuffer.Size;
+    const float w = std::min(880.0f, TextWidth(a_.body_bold, 19, toast_) + 82), y = 996 + (1 - a) * 16, h = 50;
+    Glow(kPageX, y + 6, w, h, h * 0.5f, Black(0.6f), 24);
+    GradRect(kPageX, y, w, h, Rgba(248, 249, 251), Rgba(226, 228, 233), h * 0.5f);
+    Glow(kPageX + 12, y + 11, 28, 28, 14, WithAlpha(kAccent, 0.7f), 10);
+    dl_->AddCircleFilled(P(kPageX + 26, y + 25), 14 * s_, kAccent, 24);
+    Icon(kIconCheck, kPageX + 26, y + 25, 16, White(1), 2.6f);
+    TextMid(a_.body_bold, 19, kPageX + 52, y + 25, kDark, Fit(a_.body_bold, 19, toast_, w - 70));
+    Fade(v0, a);
   } else if (const std::string status = !DlcStatus().empty() && tab_ != kDlcTab ? DlcStatus() : BundledStatus();
              !status.empty()) {
     // (the first start: a pulsing dot while the bundled mods are set up)
-    dl_->AddCircleFilled(P(118, 1023), 4.5f * s_, WithAlpha(kAccent, 0.5f + 0.5f * std::sin(time_ * 6)), 16);
-    Text(a_.body_bold, 18, 134, 1012, White(0.7f), status);
-  } else {
-    Text(a_.body, 18, 112, 1012, White(0.32f), "SmackDown vs. Raw Recomp " + version_ + "  \xC2\xB7  PlayStation 5");
+    Glow(kPageX + 2, 1017, 9, 9, 4.5f, WithAlpha(kAccent, 0.5f + 0.5f * std::sin(time_ * 6)), 8);
+    dl_->AddCircleFilled(P(kPageX + 6, 1021), 4.5f * s_, WithAlpha(kAccent, 0.5f + 0.5f * std::sin(time_ * 6)), 16);
+    TextMid(a_.body_bold, 18, kPageX + 22, 1021, White(0.75f), status);
   }
 }
 
@@ -745,10 +770,9 @@ void Hub::DrawConfirm() {
   if (confirm_in_ < 0.01f) return;
   const float a = Smooth(confirm_in_);
   const ImVec2 size = ImGui::GetIO().DisplaySize;
-  dl_->AddRectFilled(ImVec2(0, 0), size, Black(0.6f * a));
-  const float w = 760, x = (kW - w) * 0.5f;
+  dl_->AddRectFilled(ImVec2(0, 0), size, Black(0.62f * a));
+  const float w = 780, x = (kW - w) * 0.5f;
   const int v0 = dl_->VtxBuffer.Size;
-  const float y = 360 + (1 - a) * 30;
   // (its height: the text's lines, wrapped as Wrapped does)
   int lines = 0;
   {
@@ -756,56 +780,110 @@ void Hub::DrawConfirm() {
     std::string word, cur;
     while (words >> word) {
       const std::string next = cur.empty() ? word : cur + " " + word;
-      if (!cur.empty() && TextWidth(a_.body, 22, next) > w - 96) ++lines, cur = word;
+      if (!cur.empty() && TextWidth(a_.body, 22, next) > w - 112) ++lines, cur = word;
       else cur = next;
     }
     if (!cur.empty()) ++lines;
   }
-  const float h = 120 + lines * 22 * 1.4f + 48;
-  Rect(x, y, w, h, Rgba(24, 25, 29), 16);
-  dl_->AddRectFilled(P(x, y), P(x + 6, y + h), kAccent, 16 * s_, ImDrawFlags_RoundCornersLeft);
-  Text(a_.display, 40, x + 48, y + 44, kText, confirm_title_);
-  Wrapped(a_.body, 22, x + 48, y + 120, w - 96, White(0.72f), confirm_text_);
+  const float h = 124 + lines * 22 * 1.4f + 52;
+  const float y = (kH - h) * 0.5f - 20 + (1 - a) * 30;
+  GlassPanel(x, y, w, h, 24);
+  Glow(x + 48, y + 48, 40, 3, 1.5f, WithAlpha(kAccent, 0.8f), 8);
+  Rect(x + 48, y + 48, 40, 3, kAccent, 1.5f);
+  Text(a_.display, 40, x + 56, y + 62, kText, confirm_title_);
+  Wrapped(a_.body, 22, x + 56, y + 126, w - 112, White(0.72f), confirm_text_);
   Fade(v0, a);
 }
 
 // ------------------------------------------------------------------- pages
 
 void Hub::DrawHome() {
-  // first open: the logo rises in, then the button
-  const float in_logo = Smooth((time_ - 0.15f) / 0.8f), in_btn = Smooth((time_ - 0.45f) / 0.6f);
-  // (a wider logo - 2.6:1 - is drawn wider: the same area on the screen)
-  const float lx = 104, lw = a_.logo && a_.logo.width > a_.logo.height * 2.4f ? 700.0f : 640.0f;
+  // first open: the logo rises in, then the buttons, then the new mods
+  const float in_logo = Smooth((time_ - 0.15f) / 0.8f), in_btn = Smooth((time_ - 0.4f) / 0.6f),
+              in_row = Smooth((time_ - 0.6f) / 0.6f);
   int v0 = dl_->VtxBuffer.Size;
+  const float lx = kPageX - 8;
+  float lw = 760, lh = 290;
   if (a_.logo) {
-    const float lh = lw * a_.logo.height / a_.logo.width;
-    const float ly = 862 - 36 - lh + (1 - in_logo) * 40;
+    lh = lw * a_.logo.height / a_.logo.width;
+    if (lh > 300) lh = 300, lw = lh * a_.logo.width / a_.logo.height;
+    const float ly = 150 + (300 - lh) * 0.5f + (1 - in_logo) * 40;
     for (int i = 0; i < 8; ++i) {  // a soft shadow under it
-      const float a = float(i) * 0.785f, d = 10;
-      const float dx = std::cos(a) * d, dy = std::sin(a) * d + 8;
-      dl_->AddImage(a_.logo.id, P(lx + dx, ly + dy), P(lx + lw + dx, ly + lh + dy), ImVec2(0, 0), ImVec2(1, 1), Black(0.1f));
+      const float a = float(i) * 0.785f, d = 12;
+      const float dx = std::cos(a) * d, dy = std::sin(a) * d + 10;
+      dl_->AddImage(a_.logo.id, P(lx + dx, ly + dy), P(lx + lw + dx, ly + lh + dy), ImVec2(0, 0), ImVec2(1, 1), Black(0.11f));
     }
     dl_->AddImage(a_.logo.id, P(lx, ly), P(lx + lw, ly + lh));
   } else {
-    Text(a_.display, 96, lx, 640, kText, "SMACKDOWN VS RAW");
+    Text(a_.display, 120, kPageX, 200, kText, "SMACKDOWN");
+    Text(a_.display, 120, kPageX, 320, kAccent, "VS RAW 2011");
   }
   Fade(v0, in_logo);
 
-  // START GAME: breathes softly; pressed, it gives a little and flashes
+  // what's going on: mods on, online, a download
   v0 = dl_->VtxBuffer.Size;
-  const float push = press_ * 6;
-  const float bx = 112 + push, by = 862 + push + (1 - in_btn) * 24, bw = 420 - push * 2, bh = 84 - push * 2;
-  const float pulse = 0.5f + 0.5f * std::sin(time_ * 2.4f);
-  const float ring = 5 + 3 * pulse;
-  dl_->AddRect(P(bx - ring, by - ring), P(bx + bw + ring, by + bh + ring), White(0.14f + 0.2f * pulse), (12 + ring) * s_, 0,
-               2 * s_);
-  Rect(bx, by, bw, bh, Mix(kText, kAccent, press_ * 0.9f), 12);
-  const ImU32 ink = Mix(kInk, kText, press_);
-  const float tx = bx + 40;
-  dl_->AddTriangleFilled(P(tx, by + bh * 0.5f - 15), P(tx + 26, by + bh * 0.5f), P(tx, by + bh * 0.5f + 15), ink);
-  Text(a_.display, 40, tx + 48, by + bh * 0.5f - 23, ink, "START GAME", 0, 2);
+  {
+    int on = 0;
+    for (const Mod& m : mods_) on += m.enabled;
+    const bool online = Value("online_enabled", "false") == "true" && !Unquote(Value("online_token", "")).empty();
+    float frac = 0;
+    int waiting = 0, ready = 0;
+    const bool going = DownloadStatus(&frac, &waiting, &ready);
+    const float cy = 478, cw = 270, ch = 46;
+    for (int c = 0; c < 3; ++c) {
+      const float cx = kPageX + c * (cw + 14);
+      Glass(cx, cy, cw, ch, ch * 0.5f, 0.95f);
+      std::string label;
+      if (c == 0) {
+        label = std::to_string(on) + (on == 1 ? " mod on" : " mods on");
+        Glow(cx + 22, cy + 19, 8, 8, 4, WithAlpha(kAccent, 0.8f), 7);
+        dl_->AddCircleFilled(P(cx + 26, cy + 23), 4 * s_, kAccent, 12);
+      } else if (c == 1) {
+        label = online ? "Online with PC players" : "Online is off";
+        Icon(kIconOnline, cx + 26, cy + 23, 18, White(0.85f), 2);
+      } else if (going) {
+        label = "Downloading  \xC2\xB7  " + std::to_string(int(frac * 100 + 0.5f)) + "%";
+        Progress(cx + 26, cy + 23, 8, frac, 3, White(0.18f), false);
+      } else {
+        label = ready ? std::to_string(ready) + (ready == 1 ? " new mod ready" : " new mods ready") : "Built on PC " + (version_.size() > 1 && (version_[0] == 'v' || version_[0] == 'V') ? version_.substr(1) : version_);
+        Icon(ready ? kIconDownload : kIconAbout, cx + 26, cy + 23, 18, White(0.85f), 2);
+      }
+      TextMid(a_.body_bold, 17, cx + 46, cy + ch * 0.5f, White(0.88f), Fit(a_.body_bold, 17, label, cw - 60));
+    }
+  }
+
+  // START GAME and DISCOVER MODS: the focused one glows (START GAME breathes)
+  const bool on_page = !rail_focus_;
+  const float by = 556 + (1 - in_btn) * 24, bw = 400, bh = 92;
+  for (int b = 0; b < 2; ++b) {
+    const bool focus = on_page && home_sel_ == b;
+    const float push = focus ? press_ * 6 : 0;
+    const float bx = kPageX + b * (bw + 20) + push, y = by + push, w = bw - push * 2, h = bh - push * 2;
+    if (b == 0 || focus) {
+      const float pulse = focus ? 0.5f + 0.5f * std::sin(time_ * 2.4f) : 0;
+      FocusFill(bx, y, w, h, 16, focus ? 0.75f + 0.35f * pulse : 0.35f);
+      if (focus) {
+        Ring(bx, y, w, h, 16);
+        const float ring = 5 + 3 * pulse;
+        dl_->AddRect(P(bx - ring, y - ring), P(bx + w + ring, y + h + ring), WithAlpha(kAccent, 0.35f + 0.25f * pulse),
+                     (16 + ring) * s_, 0, 2 * s_);
+      }
+    } else {
+      Glass(bx, y, w, h, 16, 1.1f);
+    }
+    const char* label = b == 0 ? "START GAME" : "DISCOVER MODS";
+    const float tw = TextWidth(a_.display, b == 0 ? 38 : 32, label, 2) + 44;
+    const float tx = bx + (w - tw) * 0.5f;
+    if (b == 0) Icon(kIconPlay, tx + 13, y + h * 0.5f, 28, kText);
+    else Icon(kIconDiscover, tx + 13, y + h * 0.5f, 28, kText, 2.2f);
+    TextMid(a_.display, b == 0 ? 38 : 32, tx + 44, y + h * 0.5f, kText, label, 0, 2);
+  }
   Fade(v0, in_btn);
 
+  // NEW IN DISCOVER: the newest mods on the server (when the console is online)
+  v0 = dl_->VtxBuffer.Size;
+  DrawHomeFresh(716, on_page, in_row);
+  Fade(v0, in_row);
 }
 
 void Hub::DrawStartup(const std::string& step, const std::string& detail, float fraction, float dt, float alpha) {
@@ -818,6 +896,7 @@ void Hub::DrawStartup(const std::string& step, const std::string& detail, float 
   dl_ = ImGui::GetForegroundDrawList();
   const int v0 = dl_->VtxBuffer.Size;
   tab_ = kHome;
+  hero_center_ = kW * 0.5f;  // (no rail here: the picture in the middle, covering the screen)
   DrawBackdrop();
   // the logo, where the home page has it
   const float lx = 104, lw = a_.logo && a_.logo.width > a_.logo.height * 2.4f ? 700.0f : 640.0f;
@@ -878,72 +957,89 @@ void Hub::DrawSettings() {
     if (i == 0 || std::strcmp(set[size_t(i)].section, set[size_t(i) - 1].section)) rows.push_back({-1, set[size_t(i)].section});
     rows.push_back({i});
   }
+  auto is_switch = [](const Setting& r) {
+    return r.labels.size() == 2 && std::strcmp(r.labels[0], "On") == 0 && std::strcmp(r.labels[1], "Off") == 0;
+  };
   const float x = kListX, w = kListW;
-  List(rows, sel, 54, [&](int i, float yy, float over) {
+  List(rows, sel, 62, [&](int i, float yy, float over) {
     const auto& r = set[size_t(i)];
-    Text(a_.body_bold, 23, x + 24, yy + 11, Mix(White(0.92f), kInk, over), r.label);
+    const float cy = yy + 28;
+    TextMid(a_.body_bold, 21, x + 24, cy, Mix(White(0.9f), kInk, over), r.label);
     const std::string v = r.labels[size_t(SettingIndex(r))];
+    const bool focused = i == sel && !rail_focus_;
+    if (is_switch(r)) {
+      Switch(x + w - 22 - 56, cy - 16, Knob(i, SettingIndex(r) == 0), focused);
+      return;
+    }
     if (std::strcmp(r.key, "hub_music_volume") == 0) {
       // a slider: the bar fills to the volume, the value beside it
       const float frac = float(SettingIndex(r)) / float(r.values.size() - 1);
       auto& shown = knobs_[kSettingsTab << 16 | (0x8000 + i)];
       Ease(shown, frac, 16);
-      const float bw = 260, br = x + w - 24 - 74, bx = br - bw, cy = yy + 24;
-      const ImU32 track = Mix(White(0.16f), Black(0.14f), over), fill = kAccent;
-      Rect(bx, cy - 3, bw, 6, track, 3);
-      Rect(bx, cy - 3, std::max(6.0f, bw * shown), 6, fill, 3);
+      const float bw = 260, br = x + w - 24 - 74, bx = br - bw;
+      Rect(bx, cy - 3, bw, 6, Mix(White(0.16f), White(0.3f), over), 3);
+      if (focused) Rect(bx, cy - 3, std::max(6.0f, bw * shown), 6, White(1), 3);
+      else {
+        Glow(bx, cy - 3, std::max(6.0f, bw * shown), 6, 3, WithAlpha(kAccent, 0.6f), 8);
+        Rect(bx, cy - 3, std::max(6.0f, bw * shown), 6, kAccent, 3);
+      }
       const float kx = bx + bw * shown;
-      dl_->AddCircleFilled(P(kx, cy), (i == sel ? 11 : 8) * s_, i == sel ? Mix(White(1), kInk, over) : White(0.9f), 24);
-      if (i == sel) dl_->AddCircle(P(kx, cy), 11 * s_, kAccent, 24, 2.5f * s_);
-      Text(i == sel ? a_.body_bold : a_.body, 23, x + w - 24, yy + 11, Mix(White(i == sel ? 1.0f : 0.6f), kInk, over), v, 1);
+      dl_->AddCircleFilled(P(kx, cy), (focused ? 11 : 8) * s_, White(1), 24);
+      TextMid(focused ? a_.body_bold : a_.body, 20, x + w - 24, cy, Mix(White(focused ? 1.0f : 0.6f), kInk, over), v, 1);
       return;
     }
-    if (i == sel) {
+    if (focused) {
       // the value slides in from the side it was changed toward
-      const float vr = x + w - 46, cy = yy + 24;
+      const float vr = x + w - 46;
       const float slide = (1 - Smooth(value_in_)) * 18 * value_dir_;
       const int v0 = dl_->VtxBuffer.Size;
-      Text(a_.body_bold, 23, vr + slide, yy + 11, kInk, v, 1);
+      TextMid(a_.body_bold, 20, vr + slide, cy, kInk, v, 1);
       Fade(v0, 0.25f + 0.75f * Smooth(value_in_));
-      const float vl = vr - TextWidth(a_.body_bold, 23, v) - 18;
+      const float vl = vr - TextWidth(a_.body_bold, 20, v) - 18;
       const float nudge_l = value_dir_ < 0 ? (1 - Smooth(value_in_)) * 6 : 0;
       const float nudge_r = value_dir_ > 0 ? (1 - Smooth(value_in_)) * 6 : 0;
-      dl_->AddTriangleFilled(P(vl - nudge_l, cy - 7), P(vl - nudge_l, cy + 7), P(vl - 9 - nudge_l, cy), Black(0.75f * over));
-      dl_->AddTriangleFilled(P(vr + 14 + nudge_r, cy - 7), P(vr + 14 + nudge_r, cy + 7), P(vr + 23 + nudge_r, cy),
-                             Black(0.75f * over));
+      dl_->AddTriangleFilled(P(vl - nudge_l, cy - 7), P(vl - nudge_l, cy + 7), P(vl - 9 - nudge_l, cy), White(0.95f));
+      dl_->AddTriangleFilled(P(vr + 14 + nudge_r, cy - 7), P(vr + 14 + nudge_r, cy + 7), P(vr + 23 + nudge_r, cy), White(0.95f));
     } else {
-      Text(a_.body, 23, x + w - 24, yy + 11, Mix(White(0.6f), kInk, over), v, 1);
+      TextMid(a_.body_bold, 19, x + w - 24, cy, Mix(White(0.6f), kInk, over), v, 1);
     }
   });
   // the focused setting, explained
   const auto& r = set[size_t(sel)];
   Panel([&](float px, float py, float pw) {
-    Text(a_.display, 44, px, py, kText, r.label);
-    py += 72;
-    py += Wrapped(a_.body, 23, px, py, pw, White(0.68f), r.help);
-    py += 34;
+    Text(a_.display, 42, px, py, kText, r.label);
+    py += 66;
+    py += Wrapped(a_.body, 21, px, py, pw, White(0.68f), r.help, 1.45f);
+    py += 26;
     const int cur = SettingIndex(r);
     if (std::strcmp(r.key, "hub_music_volume") == 0) {
-      const float frac = float(cur) / float(r.values.size() - 1);
       const float shown = knobs_[kSettingsTab << 16 | (0x8000 + sel)];
       Text(a_.display, 64, px, py, kText, r.labels[size_t(cur)]);
-      py += 110;
+      py += 100;
       Rect(px, py, pw, 10, White(0.14f), 5);
+      Glow(px, py, std::max(10.0f, pw * shown), 10, 5, WithAlpha(kAccent, 0.7f), 12);
       Rect(px, py, std::max(10.0f, pw * shown), 10, kAccent, 5);
       const float pop = 1 + 0.4f * (1 - Smooth(value_in_));
       dl_->AddCircleFilled(P(px + pw * shown, py + 5), 15 * pop * s_, White(1), 28);
-      Text(a_.body, 19, px, py + 30, White(0.45f), "Off");
-      Text(a_.body, 19, px + pw, py + 30, White(0.45f), "100%", 1);
-      (void)frac;
+      Text(a_.body, 18, px, py + 30, White(0.45f), "Off");
+      Text(a_.body, 18, px + pw, py + 30, White(0.45f), "100%", 1);
       return;
     }
+    // the choices: each a glass row, the current one lit
     for (int k = 0; k < int(r.labels.size()); ++k) {
       const bool c = k == cur;
+      const float rh = 50;
+      if (c) GradRect(px, py, pw, rh, White(0.11f), White(0.05f), 12), dl_->AddRect(P(px, py), P(px + pw, py + rh), White(0.12f), 12 * s_);
+      else GradRect(px, py, pw, rh, White(0.035f), White(0.02f), 12);
       const float pop = c ? 1 + 0.6f * (1 - Smooth(value_in_)) : 1;
-      if (c) dl_->AddCircleFilled(P(px + 8, py + 14), 6 * pop * s_, kAccent, 20);
-      else dl_->AddCircle(P(px + 8, py + 14), 5.5f * s_, White(0.3f), 20, 1.5f * s_);
-      Text(c ? a_.body_bold : a_.body, 22, px + 30, py, c ? kText : White(0.45f), r.labels[size_t(k)]);
-      py += 42;
+      if (c) {
+        Glow(px + 18, py + rh * 0.5f - 6, 12, 12, 6, WithAlpha(kAccent, 0.9f), 9);
+        dl_->AddCircleFilled(P(px + 24, py + rh * 0.5f), 6 * pop * s_, kAccent, 20);
+      } else {
+        dl_->AddCircle(P(px + 24, py + rh * 0.5f), 5.5f * s_, White(0.35f), 20, 1.5f * s_);
+      }
+      TextMid(c ? a_.body_bold : a_.body, 19, px + 44, py + rh * 0.5f, c ? kText : White(0.55f), r.labels[size_t(k)]);
+      py += rh + 8;
     }
   });
 }
@@ -980,8 +1076,7 @@ void Hub::DrawQrBig() {
   const int v0 = dl_->VtxBuffer.Size;
   dl_->AddRectFilled(ImVec2(0, 0), size, Black(0.82f));
   const float q = 560, w = 1240, h = q + 120, x = (kW - w) * 0.5f, y = (kH - h) * 0.5f + (1 - a) * 30;
-  Rect(x, y, w, h, Rgba(24, 25, 29), 18);
-  dl_->AddRectFilled(P(x, y), P(x + 6, y + h), kAccent, 18 * s_, ImDrawFlags_RoundCornersLeft);
+  GlassPanel(x, y, w, h, 24);
   DrawQr(x + 60, y + 60, q);
   const float tx = x + q + 120, tw = w - q - 180;
   Text(a_.body_bold, 16, tx, y + 76, White(0.5f), "GET MODS", 0, 3);
@@ -996,83 +1091,254 @@ void Hub::DrawQrBig() {
   Fade(v0, a);
 }
 
+// The mod types there are (their folders: Superstars, Arenas, MatchTypes...), in mods_' order.
+std::vector<std::string> Hub::ModTypes() const {
+  std::vector<std::string> out;
+  for (const Mod& m : mods_)
+    if (out.empty() || out.back() != m.type) out.push_back(m.type);
+  return out;
+}
+
+// The rows of My Mods' tab shown: ALL has the files ready to install first (0..drops-1), then
+// every mod (drops + i); a type's tab, its mods.
+std::vector<int> Hub::ModsShown() const {
+  std::vector<int> out;
+  const int nd = int(drops_.size()), tab = sub_[kModsTab];
+  const std::vector<std::string> types = ModTypes();
+  if (tab <= 0 || tab > int(types.size())) {
+    for (int i = 0; i < nd; ++i) out.push_back(i);
+    for (int i = 0; i < int(mods_.size()); ++i) out.push_back(nd + i);
+  } else {
+    for (int i = 0; i < int(mods_.size()); ++i)
+      if (mods_[size_t(i)].type == types[size_t(tab - 1)]) out.push_back(nd + i);
+  }
+  return out;
+}
+
+namespace {
+// A mod type's look: its colours and icon.
+struct TypeLook {
+  ImU32 hi, lo;
+  int icon;
+};
+TypeLook LookOf(const std::string& type) {
+  if (type == "Superstars") return {Rgba(209, 58, 67), Rgba(62, 11, 16), kIconStar};
+  if (type == "Arenas") return {Rgba(60, 100, 214), Rgba(18, 31, 74), kIconArena};
+  if (type == "MatchTypes") return {Rgba(138, 63, 192), Rgba(36, 16, 59), kIconBolt};
+  if (type == "Backgrounds") return {Rgba(37, 165, 179), Rgba(11, 52, 56), kIconImage};
+  if (type == "Signs") return {Rgba(47, 154, 102), Rgba(14, 51, 34), kIconImage};
+  if (type == "Media") return {Rgba(226, 116, 46), Rgba(74, 26, 8), kIconMovies};
+  return {Rgba(106, 109, 121), Rgba(20, 21, 25), kIconMods};
+}
+}  // namespace
+
+void Hub::ToggleMod(Mod& m) {
+  std::error_code ec;
+  if (m.enabled) std::ofstream(m.folder / "disabled") << "";
+  else fs::remove(m.folder / "disabled", ec);
+  m.enabled = !fs::exists(m.folder / "disabled", ec);
+  Play(m.enabled ? Sound::kOn : Sound::kOff);
+  Toast(m.name + (m.enabled ? " is on" : " is off"));
+}
+
 void Hub::DrawMods() {
   int on = 0;
   for (const Mod& m : mods_) on += m.enabled;
-  PageTitle("MODS", mods_.empty() ? std::string("Mods you add show up here.")
-                                  : std::to_string(mods_.size()) + " installed, " + std::to_string(on) +
-                                        " on. Changes take effect when the game starts.");
-  DrawGetMods();
+  PageTitle("MY MODS", mods_.empty() ? std::string("Mods you install show up here.")
+                                     : "What's on loads when the game starts. " + std::to_string(on) + " of " +
+                                           std::to_string(mods_.size()) + " are on.");
+  DownloadsWidget(kPageR, 52);
+  const std::vector<std::string> types = ModTypes();
+  {
+    std::vector<std::pair<std::string, int>> tabs = {{"ALL", int(mods_.size() + drops_.size())}};
+    for (const std::string& t : types) {
+      int count = 0;
+      for (const Mod& m : mods_) count += m.type == t;
+      tabs.push_back({TypeHeading(t), count});
+    }
+    sub_[kModsTab] = std::clamp(sub_[kModsTab], 0, int(tabs.size()) - 1);
+    PageTabs(tabs, sub_[kModsTab]);
+  }
+  list_y_ = kTabsListY;
   if (mods_.empty() && drops_.empty()) {
     Empty("No mods yet",
-          "Press Square to find .svrmod files on a USB drive or in any folder, and install them from there. You "
-          "can also copy .svrmod files over FTP into /data/homebrew/PPSA92011/Mods/: they show up here.");
+          "Get them on Discover, the community's mods, with one press. Or press Square to find .svrmod files on a USB "
+          "drive or in any folder, and install them from there.");
     return;
   }
+  const std::vector<int> shown = ModsShown();
   const int nd = int(drops_.size());
-  const int n = nd + int(mods_.size());
+  const int n = int(shown.size());
+  if (!n) return;
   const int sel = item_[tab_] = std::clamp(item_[tab_], 0, n - 1);
   std::vector<Row> rows;
-  for (int i = 0; i < nd; ++i) {
-    if (i == 0) rows.push_back({-1, "READY TO INSTALL  " + std::to_string(nd)});
+  for (int i = 0; i < n; ++i) {
+    const int k = shown[size_t(i)];
+    if (sub_[kModsTab] == 0) {  // ALL: headings over the files to install and each type
+      if (k < nd && i == 0) rows.push_back({-1, "READY TO INSTALL  " + std::to_string(nd)});
+      if (k >= nd && (i == 0 || shown[size_t(i) - 1] < nd || mods_[size_t(k - nd)].type != mods_[size_t(shown[size_t(i) - 1] - nd)].type))
+        rows.push_back({-1, TypeHeading(mods_[size_t(k - nd)].type)});
+    }
     rows.push_back({i});
   }
-  for (int i = 0; i < int(mods_.size()); ++i) {
-    if (i == 0 || mods_[size_t(i)].type != mods_[size_t(i) - 1].type) {
-      int count = 0;
-      for (const Mod& m : mods_) count += m.type == mods_[size_t(i)].type;
-      rows.push_back({-1, TypeHeading(mods_[size_t(i)].type) + "  " + std::to_string(count)});
-    }
-    rows.push_back({nd + i});
-  }
   const float x = kListX, w = kListW;
-  List(rows, sel, 76, [&](int item, float ry, float over) {
-    if (item < nd) {
-      const Drop& d = drops_[size_t(item)];
+  List(rows, sel, 86, [&](int i, float ry, float over) {
+    const int k = shown[size_t(i)];
+    const bool focused = i == sel && !rail_focus_;
+    const float cy = ry + 40;
+    if (k < nd) {
+      const Drop& d = drops_[size_t(k)];
       const std::string name = d.info.name.empty() ? d.file.stem().string() : d.info.name;
-      Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(0.94f), kInk, over), Fit(a_.body_bold, 24, name, w - 220));
+      GradRect(x + 16, cy - 29, 104, 58, Rgba(80, 82, 94), Rgba(24, 25, 31), 9);
+      Icon(kIconDownload, x + 68, cy, 26, White(0.9f), 2.2f);
+      TextMid(a_.body_bold, 21, x + 140, cy - 12, Mix(White(0.94f), kInk, over), Fit(a_.body_bold, 21, name, w - 360));
       std::string sub = d.info.version.empty() ? std::string() : "v" + d.info.version + "  \xC2\xB7  ";
       sub += Size(d.bytes) + "  \xC2\xB7  " + d.file.filename().string();
-      Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), Fit(a_.body, 18, sub, w - 260));
+      TextMid(a_.body, 16, x + 140, cy + 14, Mix(White(0.5f), White(0.82f), over), Fit(a_.body, 16, sub, w - 360));
       const bool working = task_ && task_kind_ == 3 && task_file_ == d.file;
-      const char* st = working ? "Installing..." : "Not installed";
-      const float sx = x + w - 24 - TextWidth(a_.body_bold, 18, st);
-      dl_->AddCircleFilled(P(sx - 14, ry + 35), 4.5f * s_, WithAlpha(kAccent, 0.6f + 0.4f * std::sin(time_ * (working ? 9 : 3))), 16);
-      Text(a_.body_bold, 18, sx, ry + 24, Mix(White(0.9f), Black(0.7f), over), st);
+      const char* st = working ? "Installing..." : "Ready to install";
+      TextMid(a_.body_bold, 16, x + w - 24, cy, Mix(White(0.8f), White(1), over), st, 1);
       return;
     }
-    const int i = item - nd;
-    const Mod& m = mods_[size_t(i)];
-    Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(m.enabled ? 0.94f : 0.5f), kInk, over), Fit(a_.body_bold, 24, m.name, w - 140));
-    std::string sub = m.version.empty() ? std::string() : "v" + m.version + "  \xC2\xB7  ";
-    sub += Size(m.bytes);
+    const Mod& m = mods_[size_t(k - nd)];
+    const TypeLook look = LookOf(m.type);
+    GradRect(x + 16, cy - 29, 104, 58, look.hi, look.lo, 9);
+    dl_->AddRect(P(x + 16, cy - 29), P(x + 120, cy + 29), White(0.12f), 9 * s_);
+    Icon(look.icon, x + 68, cy, 26, White(0.92f), 2.2f);
+    const float nx = x + 140;
+    const std::string name = Fit(a_.body_bold, 21, m.name, w - 330);
+    TextMid(a_.body_bold, 21, nx, cy - 12, Mix(White(m.enabled ? 0.95f : 0.62f), kInk, over), name);
+    if (fresh_mods_.count(m.folder.string())) {  // downloaded this time: NEW
+      const float bx = nx + TextWidth(a_.body_bold, 21, name) + 12;
+      if (!focused) Glow(bx, cy - 23, 46, 22, 11, WithAlpha(kAccent, 0.6f), 8);
+      Rect(bx, cy - 23, 46, 22, focused ? White(1) : kAccent, 11);
+      TextMid(a_.body_bold, 11, bx + 23, cy - 12, focused ? kAccent : kText, "NEW", 0.5f, 1.5f);
+    }
+    std::string sub = TypeName(m.type);
+    if (!m.version.empty()) sub += "  \xC2\xB7  v" + m.version;
     if (!m.author.empty()) sub += "  \xC2\xB7  " + m.author;
-    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), Fit(a_.body, 18, sub, w - 140));
-    Switch(x + w - 24 - 58, ry + 19, Knob(i, m.enabled), over > 0.5f);
+    sub += "  \xC2\xB7  " + Size(m.bytes);
+    TextMid(a_.body, 16, nx, cy + 14, Mix(White(0.5f), White(0.82f), over), Fit(a_.body, 16, sub, w - 330));
+    Switch(x + w - 24 - 56, cy - 16, Knob(k, m.enabled), focused);
   });
-  if (sel < nd) {
-    const Drop& d = drops_[size_t(sel)];
+  const int k = shown[size_t(sel)];
+  if (k < nd) {
+    const Drop& d = drops_[size_t(k)];
     Panel([&](float px, float py, float pw) {
-      py += Wrapped(a_.display, 44, px, py, pw, kText, d.info.name.empty() ? d.file.stem().string() : d.info.name, 1.15f) + 22;
+      GradRect(px, py, pw, 190, Rgba(80, 82, 94), Rgba(24, 25, 31), 18);
+      Icon(kIconDownload, px + pw * 0.5f, py + 95, 64, White(0.85f), 2.4f);
+      py += 214;
+      py += Wrapped(a_.display, 38, px, py, pw, kText, d.info.name.empty() ? d.file.stem().string() : d.info.name, 1.1f) + 16;
       py = Facts(px, py, pw,
-                 {{"STATUS", d.info.type.empty() ? "Can't be read" : "Not installed yet"},
-                  {"TYPE", d.info.type.empty() ? "-" : d.info.type},
+                 {{"TYPE", d.info.type.empty() ? "Can't be read" : d.info.type},
                   {"VERSION", d.info.version.empty() ? "-" : d.info.version},
-                  {"AUTHOR", d.info.author.empty() ? "-" : d.info.author},
-                  {"FILE", d.file.filename().string()}});
-      Wrapped(a_.body, 21, px, py + 10, pw, White(0.55f),
-              "Press Cross to install it. The file is removed once it is installed: the mod is then in its folder in "
-              "Mods.");
+                  {"BY", d.info.author.empty() ? "-" : d.info.author},
+                  {"SIZE", Size(d.bytes)}});
+      Wrapped(a_.body, 18, px, py + 8, pw, White(0.55f),
+              "Cross installs it. The file is removed once it's in, and the mod shows up in this list.");
     });
     return;
   }
-  const Mod& m = mods_[size_t(sel - nd)];
+  const Mod& m = mods_[size_t(k - nd)];
   Panel([&](float px, float py, float pw) {
-    py += Wrapped(a_.display, 44, px, py, pw, kText, m.name, 1.15f) + 22;
-    Facts(px, py, pw,
-          {{"STATUS", m.enabled ? "On" : "Off"}, {"TYPE", m.type}, {"VERSION", m.version.empty() ? "-" : m.version},
-           {"AUTHOR", m.author.empty() ? "-" : m.author}, {"SIZE", Size(m.bytes)}});
+    const TypeLook look = LookOf(m.type);
+    GradRect(px, py, pw, 190, look.hi, look.lo, 18);
+    GradRect(px, py, pw, 190, Black(0), Black(0.45f), 18);
+    dl_->AddRect(P(px, py), P(px + pw, py + 190), White(0.12f), 18 * s_);
+    Icon(look.icon, px + pw * 0.5f, py + 80, 72, White(0.9f), 2.4f);
+    TextMid(a_.body_bold, 13, px + 20, py + 168, White(0.8f), Upper(TypeHeading(m.type)), 0, 2.6f);
+    py += 214;
+    py += Wrapped(a_.display, 38, px, py, pw, kText, m.name, 1.1f) + 16;
+    py = Facts(px, py, pw,
+               {{"VERSION", m.version.empty() ? "-" : m.version},
+                {"BY", m.author.empty() ? "-" : m.author},
+                {"SIZE", Size(m.bytes)}});
+    Wrapped(a_.body, 18, px, py + 8, pw, White(0.6f),
+            m.enabled ? "On: the game loads it when it starts. Triangle for its options."
+                      : "Off. Cross turns it on; the game loads it when it starts.");
   });
+}
+
+// A mod's options (Triangle), beside its row.
+void Hub::DrawModsMenu() {
+  Ease(menu_in_, menu_open_ ? 1.0f : 0.0f, 16);
+  if (menu_in_ < 0.01f) return;
+  const std::vector<int> shown = ModsShown();
+  if (shown.empty()) return;
+  const int k = shown[size_t(std::clamp(item_[kModsTab], 0, int(shown.size()) - 1))];
+  const int nd = int(drops_.size());
+  std::vector<std::pair<int, std::string>> items;  // (icon, label)
+  if (k < nd) items = {{kIconDownload, "Install"}, {kIconTrash, "Delete the File"}};
+  else items = {{kIconPower, mods_[size_t(k - nd)].enabled ? "Turn Off" : "Turn On"}, {kIconTrash, "Delete"}};
+  menu_sel_ = std::clamp(menu_sel_, 0, int(items.size()) - 1);
+  const float a = Smooth(menu_in_);
+  const int v0 = dl_->VtxBuffer.Size;
+  const float rh = 56, w = 330, h = 20 + rh * items.size() + 12;
+  const float row_y = list_y_ + focus_y_ - scroll_f_;
+  const float x = kListX + kListW - w + 30, y = std::clamp(row_y + 70 + (1 - a) * 14, 200.0f, 960.0f - h);
+  GlassPanel(x, y, w, h, 20);
+  float yy = y + 10;
+  for (int i = 0; i < int(items.size()); ++i) {
+    const bool f = i == menu_sel_;
+    const bool del = items[size_t(i)].first == kIconTrash;
+    if (f) FocusFill(x + 10, yy, w - 20, rh, 12, 0.8f), Ring(x + 10, yy, w - 20, rh, 12);
+    const ImU32 col = f ? kText : del ? Rgba(255, 122, 128) : White(0.86f);
+    Icon(items[size_t(i)].first, x + 40, yy + rh * 0.5f, 22, col, 2.1f);
+    TextMid(a_.body_bold, 19, x + 66, yy + rh * 0.5f, col, items[size_t(i)].second);
+    yy += rh + (i + 2 == int(items.size()) ? 6 : 0);
+  }
+  Fade(v0, a);
+}
+
+void Hub::ModsMenuInput(uint32_t p) {
+  const std::vector<int> shown = ModsShown();
+  if (shown.empty() || (p & (kCircle | kTriangle))) {
+    menu_open_ = false;
+    Play(Sound::kBack);
+    return;
+  }
+  if (p & (kUp | kDown)) {
+    menu_sel_ = menu_sel_ ? 0 : 1;
+    Play(Sound::kMove);
+  }
+  if (!(p & kCross)) return;
+  menu_open_ = false;
+  const int k = shown[size_t(std::clamp(item_[kModsTab], 0, int(shown.size()) - 1))];
+  const int nd = int(drops_.size());
+  if (k < nd) {
+    const Drop d = drops_[size_t(k)];
+    if (menu_sel_ == 0) {
+      if (!Busy()) Play(Sound::kSelect), StartModInstall(d.file);
+    } else {
+      Play(Sound::kSelect);
+      Confirm("Delete this file?", d.file.filename().string() + " is removed from the console.", "Delete", [this, d] {
+        std::error_code ec;
+        fs::remove(d.file, ec);
+        LoadDrops();
+        Play(Sound::kOff);
+        Toast(ec ? "The file couldn't be deleted" : "Deleted " + d.file.filename().string());
+      });
+    }
+    return;
+  }
+  Mod& m = mods_[size_t(k - nd)];
+  if (menu_sel_ == 0) {
+    press_ = 1;
+    ToggleMod(m);
+    return;
+  }
+  Play(Sound::kSelect);
+  const Mod copy = m;
+  Confirm("Delete " + m.name + "?",
+          "It's removed from the console. You can install it again later, from Discover or its .svrmod file.", "Delete",
+          [this, copy] {
+            std::error_code ec;
+            fs::remove_all(copy.folder, ec);
+            fresh_mods_.erase(copy.folder.string());
+            LoadMods();
+            Play(Sound::kOff);
+            Toast(ec ? "It couldn't be deleted" : copy.name + " is deleted");
+          });
 }
 
 void Hub::DrawDlc() {
@@ -1101,13 +1367,13 @@ void Hub::DrawDlc() {
   List(rows, sel, 76, [&](int i, float ry, float over) {
     const Dlc& d = dlc_[size_t(i)];
     Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(0.94f), kInk, over), Fit(a_.body_bold, 24, d.title, w - 260));
-    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), Size(d.bytes));
+    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), White(0.82f), over), Size(d.bytes));
     const char* st = d.other ? "Not for this game" : d.installed ? "Installed" : "Not installed";
     const bool lit = !d.installed && !d.other;
     const float sx = x + w - 24 - TextWidth(a_.body_bold, 18, st);
     if (lit)
       dl_->AddCircleFilled(P(sx - 14, ry + 35), 4.5f * s_, WithAlpha(kAccent, 0.6f + 0.4f * std::sin(time_ * 3)), 16);
-    Text(a_.body_bold, 18, sx, ry + 24, Mix(White(lit ? 0.9f : 0.55f), Black(0.7f), over), st);
+    Text(a_.body_bold, 18, sx, ry + 24, Mix(White(lit ? 0.9f : 0.55f), White(0.95f), over), st);
   });
   const Dlc& d = dlc_[size_t(sel)];
   Panel([&](float px, float py, float pw) {
@@ -1138,26 +1404,24 @@ void Hub::DrawAbout() {
       {"ReXGlue", "The static recompiler and runtime that turn the Xbox 360 game into a native program."},
       {"Xenia", "The Xbox 360 emulator the runtime's code comes from."},
   };
-  float y = 276;
+  float y = kListY;
   for (const Credit& c : people) {
-    Text(a_.display, 32, 112, y, kText, c.who);
-    Wrapped(a_.body, 21, 112, y + 46, 860, White(0.62f), c.what);
-    y += 112;
+    GradRect(kPageX, y, kListW, 112, White(0.045f), White(0.02f), 14);
+    Text(a_.display, 30, kPageX + 28, y + 18, kText, c.who);
+    Wrapped(a_.body, 19, kPageX + 28, y + 62, kListW - 56, White(0.62f), c.what);
+    y += 124;
   }
   const float px = kPanelX;
-  float py = 286;
-  Text(a_.body_bold, 15, px, py, White(0.45f), "BUILT WITH", 0, 3);
-  py += 40;
+  float py = kListY + 6;
+  Text(a_.body_bold, 13, px, py, White(0.45f), "BUILT WITH", 0, 3.2f);
+  py += 34;
   const char* parts[] = {"PS5 Payload SDK", "Mesa RADV (Vulkan)", "plume and XenosRecomp", "Dear ImGui",
                          "stb_image, stb_vorbis, dr_mp3, dr_flac and miniz", "Oswald and Inter fonts (SIL Open Font License)"};
-  for (const char* part : parts) {
-    Text(a_.body, 21, px, py, White(0.78f), part);
-    py += 36;
-  }
-  py += 30;
-  Text(a_.body_bold, 15, px, py, White(0.45f), "PLEASE NOTE", 0, 3);
-  py += 40;
-  Wrapped(a_.body, 19, px, py, 680, White(0.55f),
+  for (const char* part : parts) py += Wrapped(a_.body, 19, px, py, kPanelW, White(0.78f), part) + 6;
+  py += 26;
+  Text(a_.body_bold, 13, px, py, White(0.45f), "PLEASE NOTE", 0, 3.2f);
+  py += 34;
+  Wrapped(a_.body, 17, px, py, kPanelW, White(0.55f),
           "An unofficial fan project, not affiliated with or endorsed by WWE, THQ, Yuke's, Microsoft or Sony. WWE "
           "SmackDown vs. Raw 2011 and all related names belong to their owners. No game files are included: you need "
           "your own copy of the game.");
@@ -1168,11 +1432,11 @@ void Hub::DrawAbout() {
 int Hub::Items() const {
   switch (tab_) {
     case kSettingsTab: return int(Settings().size());
-    case kModsTab: return int(drops_.size() + mods_.size());
+    case kModsTab: return int(ModsShown().size());
     case kPaintTab: return paint_ok_ ? paint::kSlots : 0;
     case kRosterTab: return int(roster_.size());
     case kPacksTab: return packs_.empty() ? 0 : int(packs_.size()) + 1;  // (+ Dump Textures)
-    case kMusicTab: return int(songs_.size());
+    case kMusicTab: return int(MusicShown().size());
     case kMoviesTab: return int(movies_.size());
     case kSavesTab: return 1 + int(backups_.size()) + int(save_files_.size());
     case kOnlineTab: return 4;
@@ -1180,6 +1444,8 @@ int Hub::Items() const {
     default: return 0;
   }
 }
+
+bool Hub::PageHasTabs() const { return tab_ == kDiscoverTab || tab_ == kModsTab || tab_ == kMusicTab; }
 
 void Hub::Activate(int dir) {
   const int item = item_[tab_];
@@ -1204,18 +1470,15 @@ void Hub::Activate(int dir) {
       break;
     }
     case kModsTab: {
-      if (item < int(drops_.size())) {
-        if (!Busy()) Play(Sound::kSelect), StartModInstall(drops_[size_t(item)].file);
+      const std::vector<int> shown = ModsShown();
+      if (item < 0 || item >= int(shown.size())) break;
+      const int k = shown[size_t(item)];
+      if (k < int(drops_.size())) {
+        if (!Busy()) Play(Sound::kSelect), StartModInstall(drops_[size_t(k)].file);
         break;
       }
-      if (item - int(drops_.size()) >= int(mods_.size())) break;
-      Mod& m = mods_[size_t(item - int(drops_.size()))];
-      std::error_code ec;
-      if (m.enabled) std::ofstream(m.folder / "disabled") << "";
-      else fs::remove(m.folder / "disabled", ec);
-      m.enabled = !fs::exists(m.folder / "disabled", ec);
-      Play(m.enabled ? Sound::kOn : Sound::kOff);
-      Toast(m.name + (m.enabled ? " is on" : " is off"));
+      if (k - int(drops_.size()) >= int(mods_.size())) break;
+      ToggleMod(mods_[size_t(k - int(drops_.size()))]);
       break;
     }
     case kRosterTab: {
@@ -1262,9 +1525,18 @@ void Hub::Activate(int dir) {
       break;
     }
     case kMusicTab: {
-      if (item >= int(songs_.size())) break;
-      const Song& s = songs_[size_t(item)];
-      if (previewing_ == item) {
+      const std::vector<int> shown = MusicShown();
+      if (item < 0 || item >= int(shown.size())) break;
+      const int k = shown[size_t(item)];
+      if (k < 0) {  // a menu song: it plays now (the preview stops)
+        if (previewing_ >= 0 && audio_.stop_preview) audio_.stop_preview();
+        previewing_ = -1;
+        if (audio_.play_menu_song) audio_.play_menu_song(-1 - k);
+        Play(Sound::kSelect);
+        break;
+      }
+      const Song& s = songs_[size_t(k)];
+      if (previewing_ == k) {
         if (audio_.stop_preview) audio_.stop_preview();
         previewing_ = -1;
         Play(Sound::kBack);
@@ -1272,7 +1544,7 @@ void Hub::Activate(int dir) {
         Play(Sound::kError);
         Toast("The PS5 can't play this file: use MP3, WAV, FLAC or OGG");
       } else if (audio_.preview && audio_.preview(s.file)) {
-        previewing_ = item;
+        previewing_ = k;
         Play(Sound::kSelect);
       } else {
         Play(Sound::kError);
@@ -1364,16 +1636,20 @@ void Hub::Navigate(const Pad& pad) {
     }
     return;
   }
-  if (DiscoverOpen()) {  // Discovery
-    DiscoverInput(p);
-    return;
-  }
   if (br_.open) {  // Find Mods
     BrowserInput(p);
     return;
   }
   if (qr_open_) {  // GET MODS, big: any of these closes it
     if (p & (kCircle | kCross | kTriangle)) qr_open_ = false, Play(Sound::kBack);
+    return;
+  }
+  if (dl_open_) {  // the downloads widget, opened
+    PopoverInput(p);
+    return;
+  }
+  if (menu_open_) {  // a mod's options
+    ModsMenuInput(p);
     return;
   }
   // START GAME: once the game is installed (and nothing is being installed)
@@ -1391,8 +1667,20 @@ void Hub::Navigate(const Pad& pad) {
       // game's black screen - then the game starts)
       Play(Sound::kSelect);
       GoTo(kDlcTab, 1);
+      rail_focus_ = false;
       Toast(dlc.size() == 1 ? "Installing your DLC first" : "Installing your " + std::to_string(dlc.size()) + " DLC packs first");
       StartDlcInstalls(std::move(dlc), true);
+    } else if (float frac = 0; [&] {
+                 int waiting = 0, ready = 0;
+                 return DownloadStatus(&frac, &waiting, &ready);
+               }()) {
+      // (a mod still downloading: the game sets its mods up as it starts, so it stops first)
+      Play(Sound::kSelect);
+      Confirm("A mod is still downloading", "Stop it and start the game? You can download it again any time.",
+              "Start Game", [this] {
+                StopDownloads();
+                press_ = 1, launch_ = true;
+              });
     } else {
       press_ = 1, launch_ = true;
     }
@@ -1401,9 +1689,29 @@ void Hub::Navigate(const Pad& pad) {
     start();
     return;
   }
+  // L1 / R1: a page's tabs (Discover, My Mods, Music); elsewhere the pages, in the rail's order
   if (p & (kL1 | kR1)) {
-    GoTo((tab_ + ((p & kR1) ? 1 : kTabCount - 1)) % kTabCount, (p & kR1) ? 1.0f : -1.0f);
+    const int dir = (p & kR1) ? 1 : -1;
+    if (PageHasTabs() && !(tab_ == kDiscoverTab && DiscoverOpen())) {
+      int n = 3;
+      if (tab_ == kDiscoverTab) n = 5;
+      if (tab_ == kModsTab) n = 1 + int(ModTypes().size());
+      if (n > 1) {
+        sub_[tab_] = (sub_[tab_] + dir + n) % n;
+        item_[tab_] = 0;
+        scroll_f_ = -1, scroll_px_ = 0, focus_y_ = -1;
+        panel_in_ = 0;
+        if (tab_ == kDiscoverTab) DiscoverEnsure(), DiscoverLoad(0);  // (the new kind's list)
+        Play(Sound::kPage);
+      }
+      return;
+    }
+    GoTo((tab_ + dir + kTabCount) % kTabCount, float(dir));
     Play(Sound::kPage);
+    return;
+  }
+  if (rail_focus_) {
+    RailInput(p);
     return;
   }
   if ((p & kCircle) && tab_ == kDlcTab && task_ && task_kind_ == 6) {
@@ -1413,17 +1721,55 @@ void Hub::Navigate(const Pad& pad) {
     Toast("Stopping the DLC install");
     return;
   }
-  if ((p & kCircle) && tab_ != kHome) {
-    GoTo(kHome, -1);
+  if (tab_ == kDiscoverTab) {
+    DiscoverInput(p);
+    return;
+  }
+  if (tab_ == kDownloadsTab) {
+    DownloadsInput(p);
+    return;
+  }
+  // Circle: back to the rail
+  if (p & kCircle) {
+    rail_focus_ = true;
     Play(Sound::kBack);
     return;
   }
   if (tab_ == kHome) {
-    if (p & kCross) start();
+    const int fresh = HomeFreshCount();
+    const int before = home_sel_;
+    if (p & kLeft) {
+      if (home_sel_ == 0 || home_sel_ == 2) {
+        rail_focus_ = true;
+        Play(Sound::kBack);
+        return;
+      }
+      --home_sel_;
+    }
+    if ((p & kRight) && home_sel_ < 1 + fresh && home_sel_ != 1) ++home_sel_;
+    if ((p & kDown) && home_sel_ < 2 && fresh) home_sel_ = 2 + std::min(home_sel_, fresh - 1);
+    if ((p & kUp) && home_sel_ >= 2) home_sel_ = home_sel_ == 2 ? 0 : 1;
+    if (home_sel_ != before) Play(Sound::kMove);
+    if (p & kCross) {
+      if (home_sel_ == 0) {
+        start();
+      } else if (home_sel_ == 1) {
+        press_ = 1;
+        Play(Sound::kSelect);
+        GoTo(kDiscoverTab, 1);
+      } else {
+        press_ = 1;
+        Play(Sound::kSelect);
+        OpenFresh(home_sel_ - 2);
+      }
+    }
     return;
   }
   if (tab_ == kPaintTab) {  // the logos: a grid of 5 x 4, Left / Right past its sides turn the page
-    if (!paint_ok_) return;
+    if (!paint_ok_) {
+      if (p & kLeft) rail_focus_ = true, Play(Sound::kBack);
+      return;
+    }
     int& sel = item_[tab_];
     const int col = sel % 5, row = sel / 5, before = sel;
     if ((p & kLeft) && col == 0) {
@@ -1449,8 +1795,17 @@ void Hub::Navigate(const Pad& pad) {
     OpenBrowser();
     return;
   }
-  if (tab_ == kModsTab && (p & kTriangle)) {  // Discovery
-    OpenDiscover();
+  if (tab_ == kModsTab && (p & kTriangle) && Items() > 0) {  // a mod's options
+    menu_open_ = true;
+    menu_sel_ = 0;
+    menu_in_ = 0;
+    Play(Sound::kSelect);
+    return;
+  }
+  // Left: back to the rail (pages where Left / Right change a value keep them: Circle goes back)
+  if ((p & kLeft) && tab_ != kSettingsTab && tab_ != kRosterTab) {
+    rail_focus_ = true;
+    Play(Sound::kBack);
     return;
   }
   const int n = Items();
@@ -1502,10 +1857,15 @@ void Hub::GoTo(int tab, float dir) {
   page_dir_ = dir;
   panel_in_ = 1;
   panel_item_ = item_[tab_];
+  sub_x_ = -1;
+  dl_open_ = false;
+  menu_open_ = false;
+  list_y_ = kListY;
   // (what these pages show can change while the hub is open: looked at again)
   if (tab == kPaintTab) LoadPaint();
   if (tab == kModsTab) LoadDrops();
   if (tab == kDlcTab && !(task_ && task_kind_ == 6)) LoadDlc();
+  if (tab == kDiscoverTab) DiscoverEnsure();
 }
 
 bool Hub::Draw(const Pad& pad, float dt) {
@@ -1515,6 +1875,8 @@ bool Hub::Draw(const Pad& pad, float dt) {
   PollJob();
   PollTask();
   PollDiscover();
+  PollDownloads();
+  if (!fresh_asked_) fresh_asked_ = true, DiscoverFresh();  // (Home's NEW IN DISCOVER, once)
   Navigate(pad);
   if (launch_ && !leaving_) {
     leaving_ = true, press_ = 1;
@@ -1532,7 +1894,6 @@ bool Hub::Draw(const Pad& pad, float dt) {
   oy_ = (size.y - kH * s_) * 0.5f;
   dl_ = ImGui::GetForegroundDrawList();
   DrawBackdrop();
-  DrawTopBar();
   // the page slides in from the side it came from, fading up
   Ease(page_in_, 1, 11);
   const int first = dl_->VtxBuffer.Size;
@@ -1542,6 +1903,8 @@ bool Hub::Draw(const Pad& pad, float dt) {
     case kHome: DrawHome(); break;
     case kSettingsTab: DrawSettings(); break;
     case kModsTab: DrawMods(); break;
+    case kDiscoverTab: DrawDiscover(); break;
+    case kDownloadsTab: DrawDownloads(); break;
     case kRosterTab: DrawRoster(); break;
     case kPacksTab: DrawPacks(); break;
     case kMusicTab: DrawMusic(); break;
@@ -1554,8 +1917,10 @@ bool Hub::Draw(const Pad& pad, float dt) {
   }
   ox_ -= shift * s_;
   Fade(first, Smooth(page_in_));
+  DrawRail();
+  DrawModsMenu();
+  DrawPopover();
   DrawBrowser();
-  DrawDiscover();
   DrawHints();
   DrawQrBig();
   DrawConfirm();

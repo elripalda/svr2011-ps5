@@ -204,7 +204,7 @@ void Hub::DrawOnline() {  const bool signed_in = !Unquoted(Value("online_token",
         break;
     }
     Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(0.94f), kInk, over), label);
-    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), sub);
+    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), White(0.82f), over), sub);
   });
   Panel([&](float px, float py, float pw) {
     const char* title = sel == 0 ? (signed_in ? "Your Account" : "Sign In") : sel == 1 ? "Create Account"
@@ -328,9 +328,7 @@ void Hub::DrawKeyboard() {
   const float kw = 76, kh = 64, gap = 8, unit = kw + gap;
   const float w = unit * 10 - gap, x = (kW - w) * 0.5f, y = 330 + (1 - a) * 40;
   // a card under it all, then the title and the text so far
-  Rect(x - 44, y - 190, w + 88, 5 * (kh + gap) + 230, Rgba(19, 20, 24), 20);
-  dl_->AddRectFilled(P(x - 44, y - 190), P(x - 38, y - 190 + 5 * (kh + gap) + 230), kAccent, 20 * s_,
-                     ImDrawFlags_RoundCornersLeft);
+  GlassPanel(x - 44, y - 190, w + 88, 5 * (kh + gap) + 230, 24);
   Text(a_.display, 40, x, y - 160, kText, kb_.title);
   Rect(x, y - 86, w, 64, White(0.1f), 12);
   std::string shown = kb_.secret ? std::string(kb_.text.size(), '*') : kb_.text;
@@ -366,7 +364,8 @@ void Hub::DrawKeyboard() {
     Rect(kx, ky, bw, kh, lit ? WithAlpha(kAccent, 0.85f) : White(0.08f), 10);
   }
   const float push = kb_.press * 3;
-  Rect(kb_.fx + push, kb_.fy + push, s_fw - push * 2, kh - push * 2, kText, 10);
+  FocusFill(kb_.fx + push, kb_.fy + push, s_fw - push * 2, kh - push * 2, 10, 0.7f);
+  Ring(kb_.fx + push, kb_.fy + push, s_fw - push * 2, kh - push * 2, 10);
   for (int r = 0; r < 4; ++r)
     for (int c = 0; c < 10; ++c) {
       const float kx = x + c * unit, ky = y + r * (kh + gap);

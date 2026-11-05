@@ -612,6 +612,107 @@ std::optional<Response> SocketRequest(const std::string& method, const Url& url,
   return std::nullopt;
 }
 
+#if !defined(__ANDROID__)
+// [ps5 port] A GET from byte `from` on, streamed: the PS5 hub's Discover downloads (a .svrmod of
+// a few hundred MB never sits in memory, and the hub shows every piece as it arrives). Its own
+// connection (Connection: close), so a long download doesn't hold one the game's requests share.
+int StreamGetImpl(const std::string& url, uint64_t from,
+                  const std::function<bool(int status, uint64_t total, const char* data, size_t size)>& sink,
+                  std::string* why) {
+  t_error.clear();
+  Url u;
+  if (!ParseUrl(url, &u)) {
+    if (why) *why = "not a web address: " + url;
+    return 0;
+  }
+  Link link;
+  if (!link.Open(u)) {
+    if (why) *why = t_error;
+    return 0;
+  }
+  std::string request = "GET " + u.path + " HTTP/1.1\r\nHost: " + HostHeader(u) + "\r\nConnection: close\r\n";
+  if (from) request += "Range: bytes=" + std::to_string(from) + "-\r\n";
+  request += "\r\n";
+  if (!link.Send(request)) {
+    if (why) *why = "the request couldn't be sent";
+    return 0;
+  }
+  std::vector<char> buf(256 * 1024);
+  std::string head;
+  size_t head_end;
+  while ((head_end = head.find("\r\n\r\n")) == std::string::npos) {
+    const int n = link.Recv(buf.data(), buf.size());
+    if (n <= 0 || head.size() > 65536) {
+      if (why) *why = "no answer from the server";
+      return 0;
+    }
+    head.append(buf.data(), size_t(n));
+  }
+  Response h;
+  ParseHeaders(head.substr(0, head_end), &h);
+  const int status = std::atoi(head.c_str() + head.find(' ') + 1);
+  uint64_t total = 0, length = 0;
+  bool has_length = false;
+  if (auto it = h.headers.find("content-length"); it != h.headers.end())
+    length = std::strtoull(it->second.c_str(), nullptr, 10), has_length = true;
+  if (auto it = h.headers.find("content-range"); it != h.headers.end()) {
+    const size_t slash = it->second.rfind('/');
+    if (slash != std::string::npos) total = std::strtoull(it->second.c_str() + slash + 1, nullptr, 10);
+  } else if (status == 200 && has_length) {
+    total = length;
+  }
+  if (status / 100 != 2) return status;  // (an error's body isn't the file)
+  const bool chunked = Lower(h.headers["transfer-encoding"]).find("chunked") != std::string::npos;
+  std::string rest = head.substr(head_end + 4);
+  uint64_t got = 0;
+  if (!chunked) {
+    if (!rest.empty()) {
+      if (!sink(status, total, rest.data(), rest.size())) return status;
+      got += rest.size();
+    }
+    while (!has_length || got < length) {
+      const int n = link.Recv(buf.data(), buf.size());
+      if (n <= 0) {
+        if (why) *why = "the connection dropped";
+        break;
+      }
+      if (!sink(status, total, buf.data(), size_t(n))) break;
+      got += uint64_t(n);
+    }
+    return status;
+  }
+  // (chunked: each chunk's bytes as they come)
+  std::string data = std::move(rest);
+  size_t at = 0;
+  auto more = [&] {
+    if (at > 0 && at == data.size()) data.clear(), at = 0;
+    const int n = link.Recv(buf.data(), buf.size());
+    if (n <= 0) return false;
+    data.append(buf.data(), size_t(n));
+    return true;
+  };
+  for (;;) {
+    size_t line;
+    while ((line = data.find("\r\n", at)) == std::string::npos)
+      if (!more()) return status;
+    const uint64_t size = std::strtoull(data.c_str() + at, nullptr, 16);
+    at = line + 2;
+    if (size == 0) return status;
+    uint64_t left = size;
+    while (left) {
+      if (at >= data.size() && !more()) return status;
+      const size_t take = size_t(std::min<uint64_t>(left, data.size() - at));
+      if (take && !sink(status, total, data.data() + at, take)) return status;
+      at += take, left -= take;
+    }
+    while (data.size() < at + 2)
+      if (!more()) return status;
+    at += 2;
+    data.erase(0, at), at = 0;
+  }
+}
+#endif
+
 #if defined(__ANDROID__)
 
 // https through Android's own TLS: NetBridge.request (android/java/.../NetBridge.java).
@@ -1214,6 +1315,15 @@ bool ResolveIPv4(const std::string& host, uint32_t* ip) {
   return *ip = v, true;
 #endif
 }
+
+#if !defined(_WIN32) && !defined(__ANDROID__)
+// [ps5 port] (StreamGetImpl, above)
+int StreamGet(const std::string& url, uint64_t from,
+              const std::function<bool(int status, uint64_t total, const char* data, size_t size)>& sink,
+              std::string* why) {
+  return StreamGetImpl(url, from, sink, why);
+}
+#endif
 
 std::optional<Response> Request(const std::string& method, const std::string& url, const Headers& headers,
                                 const std::string& body) {

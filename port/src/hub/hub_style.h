@@ -14,9 +14,11 @@
 namespace svr2011::hub {
 
 constexpr float kW = 1920, kH = 1080;
-// the page's list on the left, the details panel on the right
-constexpr float kListX = 112, kListW = 900, kListY = 262, kListView = 76 * 8;
-constexpr float kPanelX = 1120, kPanelW = 640, kPanelY = 276;
+// the side rail (every page, the logo at its top), then the page: its list on the left, the details panel on
+// the right. A page with tabs (L1 / R1) starts its list lower (kTabsListY).
+constexpr float kRailW = 360, kPageX = 448, kPageR = 1808;
+constexpr float kListX = kPageX, kListW = 860, kListY = 196, kTabsListY = 252, kListBottom = 972;
+constexpr float kPanelX = 1380, kPanelW = kPageR - kPanelX, kPanelY = kListY;
 
 inline ImU32 Rgba(int r, int g, int b, int a = 255) { return IM_COL32(r, g, b, a); }
 inline ImU32 White(float a) { return IM_COL32(255, 255, 255, int(std::clamp(a, 0.0f, 1.0f) * 255)); }
@@ -39,9 +41,19 @@ inline ImU32 Mix(ImU32 a, ImU32 b, float t) {
   return out;
 }
 
-const ImU32 kInk = Rgba(12, 13, 16);      // text on a focused (white) row
+const ImU32 kInk = Rgba(255, 255, 255);   // text on the focus (the red glow bar)
+const ImU32 kDark = Rgba(12, 13, 16);     // text on a white chip or button
 const ImU32 kAccent = Rgba(226, 36, 46);  // the one colour: SmackDown vs. Raw red
+const ImU32 kAccentHi = Rgba(244, 58, 68), kAccentLo = Rgba(181, 18, 27);  // its gloss, top and bottom
 const ImU32 kText = Rgba(244, 245, 247);
+const ImU32 kGround = Rgba(7, 8, 11);
+
+// The hub's line icons (Hub::Icon), drawn on a 24 x 24 grid.
+enum IconId {
+  kIconHome, kIconOnline, kIconMods, kIconDiscover, kIconDownload, kIconRoster, kIconTextures, kIconMusic,
+  kIconMovies, kIconPaint, kIconSettings, kIconSaves, kIconDlc, kIconAbout, kIconSearch, kIconCheck, kIconPlay,
+  kIconTrash, kIconPower, kIconStar, kIconArena, kIconBolt, kIconImage, kIconFolder, kIconDown
+};
 
 inline std::string Upper(std::string s) {
   for (char& c : s) c = char(std::toupper(static_cast<unsigned char>(c)));

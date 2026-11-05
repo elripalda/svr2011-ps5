@@ -204,8 +204,7 @@ void Hub::DrawBrowser() {
   const float h = ly0 + shown * rh + 84;
   const float y = (kH - h) * 0.5f - 20 + (1 - a) * 30;
   const int v0 = dl_->VtxBuffer.Size;
-  Rect(x, y, w, h, Rgba(22, 23, 27), 18);
-  dl_->AddRectFilled(P(x, y), P(x + 6, y + h), kAccent, 18 * s_, ImDrawFlags_RoundCornersLeft);
+  GlassPanel(x, y, w, h, 24);
   Text(a_.display, 46, x + 52, y + 38, kText, "FIND MODS");
   // where we are
   std::string where = "Choose where your .svrmod files are";
@@ -240,7 +239,8 @@ void Hub::DrawBrowser() {
     br_.focus += (float(br_.sel) - br_.focus) * (1 - std::exp(-dt_ * 20));
     if (br_.in < 0.05f) br_.focus = float(br_.sel), br_.scroll = target;
     dl_->PushClipRect(P(x, ly - 2), P(x + w, ly + shown * rh), true);
-    Rect(x + 36, ly + (br_.focus - br_.scroll) * rh, w - 72, rh - 6, kText, 10);
+    FocusFill(x + 36, ly + (br_.focus - br_.scroll) * rh, w - 72, rh - 6, 12, 0.7f);
+    Ring(x + 36, ly + (br_.focus - br_.scroll) * rh, w - 72, rh - 6, 12);
     for (int i = 0; i < n; ++i) {
       const float ry = ly + (float(i) - br_.scroll) * rh;
       if (ry < ly - rh || ry > ly + shown * rh) continue;
@@ -252,7 +252,7 @@ void Hub::DrawBrowser() {
         Rect(ix, iy - 15, 30, 30, WithAlpha(kAccent, e.info.type.empty() ? 0.35f : 1.0f), 6);
         Text(a_.display, 18, ix + 15, iy - 13, White(0.95f), "M", 0.5f);
       } else {
-        const ImU32 c = Mix(White(0.55f), Black(0.55f), over);
+        const ImU32 c = Mix(White(0.55f), White(0.82f), over);
         if (e.kind == Browser::Entry::kPlace) {
           Rect(ix, iy - 10, 32, 20, c, 4);
           dl_->AddCircleFilled(P(ix + 25, iy), 2.5f * s_, Mix(Rgba(22, 23, 27), kText, over), 10);
@@ -267,7 +267,7 @@ void Hub::DrawBrowser() {
         std::string sub = e.info.type.empty() ? std::string("Can't be read") : TypeName(e.info.type);
         if (!e.info.version.empty()) sub += "  \xC2\xB7  v" + e.info.version;
         sub += "  \xC2\xB7  " + Size(e.bytes) + "  \xC2\xB7  " + e.path.filename().string();
-        Text(a_.body, 17, tx, ry + 39, Mix(White(0.42f), Black(0.55f), over), Fit(a_.body, 17, sub, tw));
+        Text(a_.body, 17, tx, ry + 39, Mix(White(0.42f), White(0.82f), over), Fit(a_.body, 17, sub, tw));
         // its state
         const bool working = task_ && task_kind_ == 5 && (task_file_ == e.path || task_file_.empty());
         const int st = ModStatus(e.info);
@@ -277,15 +277,15 @@ void Hub::DrawBrowser() {
           if (working || st != 1)
             dl_->AddCircleFilled(P(sx - 14, ry + 33), 4.5f * s_,
                                  WithAlpha(kAccent, 0.6f + 0.4f * std::sin(time_ * (working ? 9 : 3))), 16);
-          Text(a_.body_bold, 18, sx, ry + 22, Mix(White(st == 1 && !working ? 0.5f : 0.9f), Black(0.7f), over), label);
+          Text(a_.body_bold, 18, sx, ry + 22, Mix(White(st == 1 && !working ? 0.5f : 0.9f), White(0.95f), over), label);
         }
       } else {
         Text(a_.body_bold, 23, tx, ry + (e.sub.empty() ? 21 : 9), Mix(White(0.94f), kInk, over),
              Fit(a_.body_bold, 23, e.label, tw));
         if (!e.sub.empty())
-          Text(a_.body, 17, tx, ry + 39, Mix(White(0.42f), Black(0.55f), over), Fit(a_.body, 17, e.sub, tw));
+          Text(a_.body, 17, tx, ry + 39, Mix(White(0.42f), White(0.82f), over), Fit(a_.body, 17, e.sub, tw));
         // (a chevron: it opens)
-        const ImU32 cc = Mix(White(0.35f), Black(0.5f), over);
+        const ImU32 cc = Mix(White(0.35f), White(0.78f), over);
         const ImVec2 chev[3] = {P(x + w - 74, ry + rh * 0.5f - 13), P(x + w - 64, ry + rh * 0.5f - 3), P(x + w - 74, ry + rh * 0.5f + 7)};
         dl_->AddPolyline(chev, 3, cc, ImDrawFlags_None, 2.5f * s_);
       }

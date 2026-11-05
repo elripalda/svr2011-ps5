@@ -262,6 +262,16 @@ class HubAudio {
     volume_ = std::min(1.0f, kMusicVolume * float(std::clamp(percent, 0, 100)) / 80.0f);
     if (!previewing_) music_->SetVolume(volume_);
   }
+  // The Music page's MENU MUSIC: the songs, the one playing, and one picked (it fades in as R3's does).
+  const std::vector<std::filesystem::path>& Songs() const { return songs_; }
+  int Current() const { return songs_.empty() ? -1 : int(song_); }
+  void PlaySong(int k) {
+    if (k < 0 || k >= int(songs_.size()) || leaving_) return;
+    if (previewing_) StopPreview();
+    song_ = size_t(k);
+    if (switch_in_ <= 0) music_->FadeOut(kSwitchFade);
+    switch_in_ = kSwitchFade + 0.05f;
+  }
   // R3: the song fades down quickly, then the next one plays.
   void Next() {
     if (songs_.size() < 2 || leaving_) return;
@@ -414,6 +424,9 @@ class HubDialog final : public rex::ui::ImGuiDialog {
     hooks.previewing = [this] { return audio_->Previewing(); };
     hooks.next_song = [this] { audio_->Next(); };
     hooks.music_volume = [this](int v) { audio_->SetVolume(v); };
+    hooks.menu_songs = [this] { return audio_->Songs(); };
+    hooks.menu_song = [this] { return audio_->Current(); };
+    hooks.play_menu_song = [this](int k) { audio_->PlaySong(k); };
     hub_.SetAudio(std::move(hooks));
     // the server (online_net.h: https through Mbed TLS on the PS5)
     // DLC installed from its page, with progress (not on the game's black screen)
@@ -421,24 +434,9 @@ class HubDialog final : public rex::ui::ImGuiDialog {
                                                              install::Progress& p, std::string& error) {
       return svr2011::ps5::InstallDlcPackage(package, user_data, name, p, error);
     });
-    // Discovery's downloads: a range of the file at a time (the server answers 206 with
-    // Content-Range: bytes a-b/total), or the whole file (200).
-    hub_.SetDownload([](const std::string& url, uint64_t from, uint64_t to, std::string* bytes, uint64_t* total) {
-      svr2011::net::Headers headers = {{"Range", "bytes=" + std::to_string(from) + "-" + std::to_string(to)}};
-      auto r = svr2011::net::Request("GET", url, headers);
-      if (!r) {
-        *bytes = svr2011::net::LastError();
-        return 0;
-      }
-      *total = 0;
-      if (auto it = r->headers.find("content-range"); it != r->headers.end()) {
-        const size_t slash = it->second.rfind('/');
-        if (slash != std::string::npos) *total = std::strtoull(it->second.c_str() + slash + 1, nullptr, 10);
-      } else if (r->status == 200) {
-        *total = r->body.size();
-      }
-      *bytes = std::move(r->body);
-      return r->status;
+    // Discover's downloads: the file streamed from where it got to (online_net.h StreamGet).
+    hub_.SetDownload([](const std::string& url, uint64_t from, const DownloadSink& sink, std::string* why) {
+      return svr2011::net::StreamGet(url, from, sink, why);
     });
     hub_.SetRequest([](const std::string& method, const std::string& url, const std::string& body,
                        const std::string& token, std::string* answer) {

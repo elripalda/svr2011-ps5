@@ -166,12 +166,29 @@ int main(int argc, char** argv) {
         return read(dir + "/img_" + id + "_" + rest.substr(img + 5, 1) + ".jpg", answer) ? 200 : 404;
       return read(dir + "/mod_" + id + ".json", answer) ? 200 : 404;
     });
-    hub.SetDownload([](const std::string&, uint64_t from, uint64_t to, std::string* bytes, uint64_t* total) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      *total = 3u << 20;
-      *bytes = std::string(size_t(std::min<uint64_t>(to, *total - 1) - from + 1), '\0');
-      return 206;
+    // (a fake file: 120 MB at about 30 MB/s, streamed in 1 MB pieces)
+    // (HUB_FAKE_FILE=<.svrmod>: that file is what downloads, so it installs)
+    static std::string file;
+    if (const char* f = std::getenv("HUB_FAKE_FILE")) read(f, &file);
+    hub.SetDownload([](const std::string&, uint64_t from, const svr2011::hub::DownloadSink& sink, std::string*) {
+      const uint64_t total = file.empty() ? 120ull << 20 : file.size();
+      std::string zeros(1u << 20, '\0');
+      for (uint64_t at = from; at < total; at += 1u << 20) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        const size_t n = size_t(std::min<uint64_t>(1u << 20, total - at));
+        if (!sink(from ? 206 : 200, total, file.empty() ? zeros.data() : file.data() + at, n)) break;
+      }
+      return from ? 206 : 200;
     });
+  }
+  if (const char* songs = std::getenv("HUB_MENU_SONGS")) {
+    static std::vector<std::filesystem::path> list;
+    for (const auto& e : std::filesystem::directory_iterator(songs)) list.push_back(e.path());
+    std::sort(list.begin(), list.end());
+    svr2011::hub::Audio audio;
+    audio.menu_songs = [] { return list; };
+    audio.menu_song = [] { return 1; };
+    hub.SetAudio(audio);
   }
   std::vector<uint32_t> script;
   for (int i = 8; i < argc; ++i) {

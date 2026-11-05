@@ -38,6 +38,13 @@ std::optional<Response> Request(const std::string& method, const std::string& ur
 
 std::string LastError();
 
+// [ps5 port] A GET from byte `from` on, given to `sink` piece by piece as it arrives (status, the
+// file's whole size - 0: not said - and the bytes; false stops it). Returns the HTTP status (0: no
+// answer; *why says why). Not on Windows or Android (the PS5 hub's downloads).
+int StreamGet(const std::string& url, uint64_t from,
+              const std::function<bool(int status, uint64_t total, const char* data, size_t size)>& sink,
+              std::string* why);
+
 // A host name's (or dotted address's) IPv4 address, network byte order:
 // the system's DNS, then a public DNS server. false if none answers.
 bool ResolveIPv4(const std::string& host, uint32_t* ip);

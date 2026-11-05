@@ -9,7 +9,9 @@
 #
 #   e.g. port/tools/ps5_update_upstream.sh v2.1.4 ../rexglue-ps5
 #
-# With the last two it also builds and packages (ps5_package.sh).
+# With the last two it also builds and packages (ps5_package.sh). With REXGLUE=<the rexglue tool>
+# it also generates the game's code again when the release needs it (else it says so and stops
+# before building). docs/PS5_UPDATING.md has the whole round.
 # Both checkouts must be clean. When a merge needs a hand it stops and lists
 # the files: fix them, commit, and run it again - it carries on from there.
 set -euo pipefail
@@ -43,8 +45,17 @@ fi
 echo "==> fetching the PC port"
 g fetch -q upstream
 new=$(g rev-parse --verify -q "upstream/tags/$tag^{commit}") || stop "the PC port has no release $tag"
-old_version=$(head -1 "$repo/port/VERSION.txt" | tr -d '[:space:]')
-old=$(g rev-parse --verify -q "upstream/tags/v$old_version^{commit}" || true)
+# The release the PS5 port was on before: the newest of the PC port's tags already in this
+# branch that's older than $tag (found again on a second run, after a merge that needed a hand).
+old= old_version=
+for t in $(g for-each-ref --format='%(refname:strip=4)' 'refs/remotes/upstream/tags/v*' | sort -rV); do
+    [[ $t == "$tag" ]] && continue
+    c=$(g rev-parse "upstream/tags/$t^{commit}")
+    if g merge-base --is-ancestor "$c" HEAD && ! g merge-base --is-ancestor "$new" "$c"; then
+        old=$c old_version=${t#v}
+        break
+    fi
+done
 
 # README.md is the PS5 one: a merge keeps it, and README-PC.md gets theirs.
 g config merge.ours.driver true
@@ -54,7 +65,7 @@ grep -qx 'README.md merge=ours' "$attrs" 2>/dev/null || echo 'README.md merge=ou
 if g merge-base --is-ancestor "$new" HEAD; then
     echo "==> the game code already has $tag"
 else
-    echo "==> merging the PC port's $tag (was v$old_version)"
+    echo "==> merging the PC port's $tag (was v${old_version:-?})"
     if ! g merge --no-edit -m "Merge KaikoClanworth1/wwe-svr2011-pc $tag" "$new"; then
         echo
         echo "Both sides changed these files - they need a hand:"
@@ -123,15 +134,26 @@ fi
 
 # -- what else the release needs ----------------------------------------------
 
-if [[ -n $old ]] && ! g diff --quiet "$old" "$new" -- port/svr2011_config.toml port/svr2011_manifest.toml; then
+codegen=0
+if [[ -z $old ]] || ! g diff --quiet "$old" "$new" -- port/svr2011_config.toml port/svr2011_manifest.toml; then
+    codegen=1
     echo
-    echo "!! The PC port changed svr2011_config.toml / svr2011_manifest.toml: generate the game's code again"
-    echo "   (rexglue codegen, then port/tools/ps5_patch_generated.py generated/rexglue.cmake) before building."
+    echo "!! The PC port changed svr2011_config.toml / svr2011_manifest.toml (or the old release isn't known):"
+    echo "   the game's code is generated again (rexglue codegen, then port/tools/ps5_patch_generated.py)."
 fi
 if (( sdk_moved )); then
+    codegen=1
     echo
-    echo "!! The PC port moved to ReXGlue SDK ${base:0:7}: generate the game's code again with that"
+    echo "!! The PC port moved to ReXGlue SDK ${base:0:7}: the game's code is generated again with that"
     echo "   release's rexglue tool, then port/tools/ps5_patch_generated.py."
+fi
+if (( codegen )); then
+    if [[ -n ${REXGLUE:-} ]]; then
+        echo "==> generating the game's code"
+        (cd "$repo/port" && "$REXGLUE" codegen svr2011_manifest.toml && python3 tools/ps5_patch_generated.py generated/rexglue.cmake)
+    elif [[ -n $build && -z ${CODEGEN_DONE:-} ]]; then
+        stop "set REXGLUE=<the rexglue tool> to generate the game's code, or do it by hand and run this again with CODEGEN_DONE=1"
+    fi
 fi
 if [[ -n $old ]] && ! g diff --quiet "$old" "$new" -- port/patches/plume-svr2011.patch; then
     echo

@@ -77,6 +77,10 @@ struct Audio {
   // The menu music: R3 plays the next song; its volume (0..100, Settings).
   std::function<void()> next_song;
   std::function<void(int)> music_volume;
+  // The menu music's songs (hub/music), the one playing, and one picked on the Music page.
+  std::function<std::vector<std::filesystem::path>()> menu_songs;
+  std::function<int()> menu_song;
+  std::function<void(int)> play_menu_song;
 };
 
 // The server: (method, url, JSON body, session token, answer out) -> HTTP
@@ -90,15 +94,17 @@ using Request = std::function<int(const std::string&, const std::string&, const 
 using DlcInstall = std::function<bool(const std::filesystem::path&, const std::string&, install::Progress&,
                                       std::string&)>;
 
-// A piece of a file (Discovery's downloads): (url, first byte, last byte, the bytes out, the
-// file's whole size out when the server says) -> HTTP status (0: no answer; then the bytes
-// out say why). Runs on a thread of the hub's (it blocks).
-using Download = std::function<int(const std::string&, uint64_t, uint64_t, std::string*, uint64_t*)>;
+// A file from its byte `from` on (Discovery's downloads), streamed: `sink` gets the answer's
+// status, the file's whole size (0: not said) and each piece as it arrives, and stops it by
+// returning false. Returns the HTTP status (0: no answer; then *why says why). Runs on a thread
+// of the hub's (it blocks).
+using DownloadSink = std::function<bool(int status, uint64_t total, const char* data, size_t size)>;
+using Download = std::function<int(const std::string& url, uint64_t from, const DownloadSink& sink, std::string* why)>;
 
-// The pages, in the order of the top bar.
+// The pages, in the side rail's order (its groups: PLAY, MODS, CUSTOMIZE, SYSTEM).
 enum Tab {
-  kHome, kSettingsTab, kModsTab, kRosterTab, kPacksTab, kMusicTab, kMoviesTab, kPaintTab, kSavesTab, kOnlineTab,
-  kDlcTab, kAboutTab, kTabCount
+  kHome, kOnlineTab, kModsTab, kDiscoverTab, kDownloadsTab, kRosterTab, kPacksTab, kMusicTab, kMoviesTab, kPaintTab,
+  kSettingsTab, kSavesTab, kDlcTab, kAboutTab, kTabCount
 };
 
 // Pictures the hub makes while it runs (the Paint Tool's logos): RGBA to a
@@ -210,7 +216,8 @@ class Hub {
 
   // pages
   void DrawBackdrop();
-  void DrawTopBar();
+  void DrawRail();
+  void RailInput(uint32_t pressed);
   void DrawHints();
   void DrawConfirm();
   void DrawHome();
@@ -267,10 +274,31 @@ class Hub {
   // A list to pick from (Cross picks, Circle cancels).
   void Choose(std::string title, std::vector<std::string> items, std::function<void(int)> done);
   void GoTo(int tab, float dir);
+  bool PageHasTabs() const;  // (L1 / R1 change its tabs, not the page)
+  void PageTabs(const std::vector<std::pair<std::string, int>>& tabs, int sel);  // names, counts (-1: none)
+  bool HomeInput(uint32_t pressed);
+  std::vector<int> ModsShown() const;  // My Mods: the rows of the tab shown (drops first, then mods_)
+  std::vector<std::string> ModTypes() const;
+  void ModsMenuInput(uint32_t pressed);
+  void DrawModsMenu();
+  void ToggleMod(Mod& m);
+  std::vector<int> MusicShown() const;  // Music: songs_ of the tab shown (-1 - k: menu song k)
   void SignIn(bool create);
   void SignOut();
   std::string ServerUrl() const;
   void PageTitle(const char* title, const std::string& subtitle);
+  // the look (hub_look.cpp)
+  void GradRect(float x, float y, float w, float h, ImU32 top, ImU32 bottom, float r = 0, bool across = false);
+  void Glow(float x, float y, float w, float h, float r, ImU32 col, float spread);
+  void Glass(float x, float y, float w, float h, float r, float strength = 1);
+  void FocusFill(float x, float y, float w, float h, float r, float glow = 1);  // the red, glowing focus
+  void Ring(float x, float y, float w, float h, float r, float a = 1);         // the white focus ring
+  void Icon(int icon, float cx, float cy, float size, ImU32 col, float thick = 2);
+  void TextMid(ImFont* f, float size, float x, float cy, ImU32 col, const std::string& t, float align = 0,
+               float spacing = 0);
+  void Progress(float cx, float cy, float radius, float frac, float thick, ImU32 track, bool glow);  // a ring
+  void Equalizer(float x, float bottom, float h, ImU32 col);
+  float DownloadsWidget(float right, float y);  // the downloads pill (top right); returns its left edge
   // An empty page's message.
   void Empty(const char* title, const std::string& text);
   // A scrolled list with headings at the page's left: rows' items are
@@ -313,6 +341,18 @@ class Hub {
 
   int tab_ = 0;
   int item_[16] = {};  // the focused row on each page
+  int sub_[16] = {};   // a page's tab (Discover: the kind of mod; My Mods: the type; Music: songs...)
+  bool rail_focus_ = false;  // the controller is on the side rail
+  float rail_fy_ = -1, rail_in_ = 0, sub_x_ = -1, sub_w_ = 0;
+  int home_sel_ = 0;  // Home: 0 START GAME, 1 DISCOVER MODS, 2.. the new mods
+  float home_fx_ = -1, home_fy_ = -1, home_fw_ = 0, home_fh_ = 0;
+  float list_y_ = 196;  // where this page's list starts (kListY; a page with tabs: kTabsListY)
+  bool menu_open_ = false;  // My Mods: a mod's options (Triangle)
+  int menu_sel_ = 0;
+  float menu_in_ = 0;
+  bool fresh_asked_ = false;
+  float hero_center_ = 1190;  // the picture's middle (right of the rail; the loading screen: the screen's)
+  std::set<std::string> fresh_mods_;  // mod folders installed by a download this time (a NEW badge)
   bool launch_ = false;
   std::string toast_;
   float toast_time_ = 0;
@@ -381,23 +421,45 @@ class Hub {
   void BrowserInput(uint32_t pressed);
   void DrawBrowser();
   float BrowserHints(float right);
-  // Discovery (hub_discover.cpp): the community's mods on the online server, from the Mods
-  // page (Triangle); a download installs the mod (task kind 7).
+  // Discover (hub_discover.cpp): the community's mods on the online server, a page of the rail;
+  // downloads go in a queue (one at a time, on their own thread) and install themselves into My Mods.
+ public:  // (named by hub_discover.cpp's helpers)
   struct Discover;
+  struct DownloadItem;
+
+ private:
   std::shared_ptr<Discover> dv_;
   Download download_;
-  int discover_task_id_ = 0;  // (the mod being downloaded)
-  void OpenDiscover();
-  bool DiscoverOpen() const;
-  void DiscoverLoad(int page);
+  std::vector<std::shared_ptr<DownloadItem>> downloads_;
+  bool dl_open_ = false;  // the downloads widget, opened (Triangle)
+  int dl_sel_ = 0;
+  float dl_in_ = 0;
+  void DiscoverEnsure();  // (the list asked for once)
+  bool DiscoverOpen() const;  // (a mod's page: over the grid)
+  void DiscoverLoad(int page, bool append = false);
+  void DiscoverFresh();  // Home's NEW IN DISCOVER
   void DiscoverPicture(int id, int64_t version, int n, bool thumb);
-  void DiscoverOpenMod();
-  void DiscoverDownload();
-  void DiscoverDownloaded(bool ok, const std::string& message);
+  void DiscoverOpenMod(int index);
   void PollDiscover();
   void DiscoverInput(uint32_t pressed);
   float DiscoverHints(float right);
   void DrawDiscover();
+  bool DiscoverInstalled(const std::string& name) const;
+  void QueueDownload(int index);
+  void PollDownloads();
+  std::shared_ptr<DownloadItem> DownloadOf(int id) const;
+  void DownloadsInput(uint32_t pressed);  // the Downloads page
+  void DrawDownloads();
+  void PopoverInput(uint32_t pressed);  // the widget, opened
+  void DrawPopover();
+  void DownloadAction(DownloadItem& d, bool stop);  // Cross: turn on / off, again; Square: stop / remove
+  float DownloadsHints(float right);
+  void DrawHomeFresh(float y, bool on_page, float in);  // Home's NEW IN DISCOVER row
+  int HomeFreshCount() const;
+  void OpenFresh(int k);  // its mod k's page, on Discover
+  // A download going (its fraction), how many wait, and finished ones not looked at yet.
+  bool DownloadStatus(float* frac, int* waiting, int* ready) const;
+  void StopDownloads();  // (START GAME while one goes: stopped, the line cleared)
   // 0 not installed, 1 installed (this version), 2 installed (another version)
   int ModStatus(const install::ModInfo& info) const;
   // Installs .svrmod files where they are, one after another (task kind 5).
@@ -461,6 +523,7 @@ class Hub {
   void Glyph(uint32_t button, float cx, float cy, ImU32 col);  // a PlayStation button
   float Hint(float right, uint32_t button, const char* label);  // returns its left edge
   void Switch(float x, float y, float on, bool focused);  // on: 0 off .. 1 on (animated)
+  void GlassPanel(float x, float y, float w, float h, float r = 22);  // an overlay's panel
   void Fade(int first_vertex, float alpha);               // fades what was drawn since
 };
 

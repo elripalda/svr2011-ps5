@@ -297,10 +297,6 @@ void Hub::PollTask() {
     }
     return;
   }
-  if (kind == 7) {  // a Discovery download (hub_discover.cpp)
-    DiscoverDownloaded(t->ok, t->message);
-    return;
-  }
   if (kind == 5) {  // mods found with Find Mods (their files kept)
     LoadMods();
     Play(t->ok ? Sound::kOn : Sound::kError);
@@ -501,7 +497,7 @@ void Hub::DrawInstall() {
   auto status = [&](float ry, float over, const std::string& st, bool lit) {
     const float sx = x + w - 24 - TextWidth(a_.body_bold, 18, st);
     if (lit) dl_->AddCircleFilled(P(sx - 14, ry + 35), 4.5f * s_, kAccent, 16);
-    Text(a_.body_bold, 18, sx, ry + 24, Mix(White(lit ? 0.9f : 0.5f), Black(0.7f), over), st);
+    Text(a_.body_bold, 18, sx, ry + 24, Mix(White(lit ? 0.9f : 0.5f), White(0.95f), over), st);
   };
   List(list, sel, 76, [&](int i, float ry, float over) {
     const InstallRow r = rows[size_t(i)];
@@ -526,7 +522,7 @@ void Hub::DrawInstall() {
       line = verify_result_.empty() ? std::string("Compares every file with the disc's") : verify_result_;
     }
     Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(0.94f), kInk, over), Fit(a_.body_bold, 24, title, w - 260));
-    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), Fit(a_.body, 18, line, w - 260));
+    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), White(0.82f), over), Fit(a_.body, 18, line, w - 260));
     if (!st.empty()) status(ry, over, st, lit);
   });
   const InstallRow r = rows[size_t(sel)];
@@ -897,8 +893,7 @@ void Hub::DrawChoice() {
   const float h = 124 + shown * rh + 36;
   const float y = (kH - h) * 0.5f + (1 - a) * 30;
   const int v0 = dl_->VtxBuffer.Size;
-  Rect(x, y, w, h, Rgba(24, 25, 29), 16);
-  dl_->AddRectFilled(P(x, y), P(x + 6, y + h), kAccent, 16 * s_, ImDrawFlags_RoundCornersLeft);
+  GlassPanel(x, y, w, h, 24);
   Text(a_.display, 40, x + 48, y + 40, kText, choice_title_);
   // (the list scrolls to keep the focused item in view)
   const float target = float(std::clamp(choice_sel_ - shown / 2, 0, n - shown));
@@ -908,7 +903,8 @@ void Hub::DrawChoice() {
   static float focus = 0;
   focus += (float(choice_sel_) - focus) * (1 - std::exp(-dt_ * 20));
   if (choice_in_ < 0.05f) focus = float(choice_sel_);
-  Rect(x + 32, ly + (focus - choice_scroll_) * rh, w - 64, rh - 6, kText, 10);
+  FocusFill(x + 32, ly + (focus - choice_scroll_) * rh, w - 64, rh - 6, 12, 0.7f);
+  Ring(x + 32, ly + (focus - choice_scroll_) * rh, w - 64, rh - 6, 12);
   for (int i = 0; i < n; ++i) {
     const float ry = ly + (float(i) - choice_scroll_) * rh;
     if (ry < ly - rh || ry > ly + shown * rh) continue;

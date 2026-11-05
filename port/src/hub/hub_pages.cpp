@@ -375,9 +375,9 @@ void Hub::DrawRoster() {
   List(rows, sel, 64, [&](int i, float ry, float over) {
     const Character& c = roster_[size_t(i)];
     Text(a_.body_bold, 23, x + 24, ry + 8, Mix(White(0.92f), kInk, over), Fit(a_.body_bold, 23, c.name, w - 300));
-    Text(a_.body, 16, x + 24, ry + 37, Mix(White(0.4f), Black(0.5f), over), "ID " + std::to_string(c.id));
+    Text(a_.body, 16, x + 24, ry + 37, Mix(White(0.4f), White(0.78f), over), "ID " + std::to_string(c.id));
     const std::string v = kCategoryLabels[c.category];
-    const ImU32 col = c.category ? kAccent : Mix(White(0.55f), Black(0.55f), over);
+    const ImU32 col = c.category ? kAccent : Mix(White(0.55f), White(0.82f), over);
     if (i == sel) {
       const float vr = x + w - 46, cy = ry + 29;
       const float slide = (1 - Smooth(value_in_)) * 18 * value_dir_;
@@ -385,8 +385,8 @@ void Hub::DrawRoster() {
       Text(a_.body_bold, 22, vr + slide, ry + 16, c.category ? kAccent : kInk, v, 1);
       Fade(v0, 0.25f + 0.75f * Smooth(value_in_));
       const float vl = vr - TextWidth(a_.body_bold, 22, v) - 18;
-      dl_->AddTriangleFilled(P(vl, cy - 7), P(vl, cy + 7), P(vl - 9, cy), Black(0.75f * over));
-      dl_->AddTriangleFilled(P(vr + 14, cy - 7), P(vr + 14, cy + 7), P(vr + 23, cy), Black(0.75f * over));
+      dl_->AddTriangleFilled(P(vl, cy - 7), P(vl, cy + 7), P(vl - 9, cy), White(0.95f * over));
+      dl_->AddTriangleFilled(P(vr + 14, cy - 7), P(vr + 14, cy + 7), P(vr + 23, cy), White(0.95f * over));
     } else {
       Text(c.category ? a_.body_bold : a_.body, 22, x + w - 24, ry + 16, col, v, 1);
     }
@@ -430,17 +430,17 @@ void Hub::DrawPacks() {
   List(rows, sel, 76, [&](int i, float ry, float over) {
     if (i == n) {
       Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(0.94f), kInk, over), "Dump Textures");
-      Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), "Saves the game's textures to Texture Dumps");
+      Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), White(0.82f), over), "Saves the game's textures to Texture Dumps");
       Switch(x + w - 24 - 58, ry + 19, Knob(i, dump), over > 0.5f);
       return;
     }
     const Pack& p = packs_[size_t(i)];
     Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(p.order >= 0 ? 0.94f : 0.5f), kInk, over),
          Fit(a_.body_bold, 24, p.name, w - 300));
-    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over),
+    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), White(0.82f), over),
          std::to_string(p.files) + (p.files == 1 ? " file" : " files") + "  \xC2\xB7  " + Size(p.bytes));
     if (p.order >= 0)
-      Text(a_.body_bold, 17, x + w - 24 - 58 - 20, ry + 25, Mix(White(0.55f), Black(0.6f), over),
+      Text(a_.body_bold, 17, x + w - 24 - 58 - 20, ry + 25, Mix(White(0.55f), White(0.85f), over),
            "PRIORITY " + std::to_string(p.order + 1), 1, 1.5f);
     Switch(x + w - 24 - 58, ry + 19, Knob(i, p.order >= 0), over > 0.5f);
   });
@@ -467,46 +467,121 @@ void Hub::DrawPacks() {
   });
 }
 
+// The Music page's rows: its tab's songs (songs_ indices), or the menu music (-1 - k).
+std::vector<int> Hub::MusicShown() const {
+  std::vector<int> out;
+  const int tab = sub_[kMusicTab];
+  if (tab == 2) {
+    const size_t n = audio_.menu_songs ? audio_.menu_songs().size() : 0;
+    for (size_t k = 0; k < n; ++k) out.push_back(-1 - int(k));
+    return out;
+  }
+  for (int i = 0; i < int(songs_.size()); ++i)
+    if (songs_[size_t(i)].folder == (tab == 1)) out.push_back(i);
+  return out;
+}
+
 void Hub::DrawMusic() {
-  PageTitle("MUSIC", songs_.empty() ? std::string("Songs you add show up here.")
-                                    : std::to_string(songs_.size()) + " songs for USER PLAYLIST and the jukebox.");
-  if (songs_.empty()) {
-    Empty("No music yet",
-          "Copy MP3, WAV, FLAC or OGG songs over FTP into /data/homebrew/PPSA92011/Music/. Each song becomes a "
-          "playlist named after it (a folder works too: its first song). Pick them in Create An Entrance > Music > "
-          "USER PLAYLIST.");
+  int files = 0, folders = 0;
+  for (const Song& s : songs_) (s.folder ? folders : files) += 1;
+  const std::vector<std::filesystem::path> menu = audio_.menu_songs ? audio_.menu_songs() : std::vector<std::filesystem::path>{};
+  const int playing_menu = audio_.menu_song ? audio_.menu_song() : -1;
+  PageTitle("MUSIC", "Your songs for entrances and the jukebox, and the hub's own music.");
+  sub_[kMusicTab] = std::clamp(sub_[kMusicTab], 0, 2);
+  PageTabs({{"SONGS", files}, {"PLAYLISTS", folders}, {"MENU MUSIC", int(menu.size())}}, sub_[kMusicTab]);
+  list_y_ = kTabsListY;
+  const std::vector<int> shown = MusicShown();
+  if (shown.empty()) {
+    if (sub_[kMusicTab] == 2) Empty("No menu music", "Songs in the app's hub/music folder play behind the hub, one after another.");
+    else
+      Empty(sub_[kMusicTab] == 0 ? "No songs yet" : "No playlists yet",
+            "Copy MP3, WAV, FLAC or OGG songs over FTP into /data/homebrew/PPSA92011/Music/. Each song becomes a "
+            "playlist named after it (a folder works too: its first song). Pick them in Create An Entrance > Music > "
+            "USER PLAYLIST.");
     return;
   }
-  const int n = int(songs_.size());
+  const int n = int(shown.size());
   const int sel = item_[tab_] = std::clamp(item_[tab_], 0, n - 1);
   std::vector<Row> rows;
   for (int i = 0; i < n; ++i) rows.push_back({i});
+  auto colours = [](const std::string& name) {
+    static const ImU32 hi[] = {Rgba(209, 58, 67), Rgba(60, 100, 214), Rgba(226, 116, 46), Rgba(47, 154, 102),
+                               Rgba(123, 79, 192), Rgba(37, 165, 179), Rgba(201, 154, 46), Rgba(106, 109, 121)};
+    static const ImU32 lo[] = {Rgba(62, 11, 16), Rgba(18, 31, 74), Rgba(74, 26, 8), Rgba(14, 51, 34),
+                               Rgba(43, 23, 71), Rgba(11, 52, 56), Rgba(61, 42, 8), Rgba(20, 21, 25)};
+    unsigned h = 2166136261u;
+    for (char c : name) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
+    return std::make_pair(hi[h & 7], lo[h & 7]);
+  };
   const float x = kListX, w = kListW;
-  List(rows, sel, 76, [&](int i, float ry, float over) {
-    const Song& s = songs_[size_t(i)];
-    Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(s.playable ? 0.94f : 0.5f), kInk, over),
-         Fit(a_.body_bold, 24, s.playlist, w - 200));
-    std::string sub = Upper(s.file.extension().string().substr(1)) + "  \xC2\xB7  " + Size(s.bytes);
-    if (s.folder) sub += "  \xC2\xB7  " + s.file.filename().string();
-    if (!s.playable) sub += "  \xC2\xB7  won't play on PS5";
-    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), Fit(a_.body, 18, sub, w - 200));
-    if (i == previewing_) {  // playing: a little equalizer
-      for (int b = 0; b < 4; ++b) {
-        const float hgt = 8 + 14 * (0.5f + 0.5f * std::sin(time_ * (7.0f + b * 2.3f) + b * 1.7f));
-        Rect(x + w - 60 + b * 9, ry + 46 - hgt, 5, hgt, over > 0.5f ? kAccent : kAccent, 1.5f);
-      }
+  List(rows, sel, 86, [&](int i, float ry, float over) {
+    const int k = shown[size_t(i)];
+    const float cy = ry + 40;
+    std::string name, sub;
+    bool playing = false, playable = true;
+    if (k < 0) {
+      const std::filesystem::path& f = menu[size_t(-1 - k)];
+      name = f.stem().string();
+      sub = "Menu music  \xC2\xB7  " + Upper(f.extension().string().substr(1));
+      playing = -1 - k == playing_menu && previewing_ < 0;
+    } else {
+      const Song& s = songs_[size_t(k)];
+      name = s.playlist;
+      sub = Upper(s.file.extension().string().substr(1)) + "  \xC2\xB7  " + Size(s.bytes);
+      if (s.folder) sub += "  \xC2\xB7  " + s.file.filename().string();
+      if (!s.playable) sub += "  \xC2\xB7  the PS5 can't play it: make it an MP3";
+      playing = previewing_ == k;
+      playable = s.playable;
     }
+    const auto [hi, lo] = colours(name);
+    GradRect(x + 16, cy - 29, 58, 58, hi, lo, 10);
+    dl_->AddRect(P(x + 16, cy - 29), P(x + 74, cy + 29), White(0.12f), 10 * s_);
+    Icon(kIconMusic, x + 45, cy, 24, White(0.9f), 2);
+    TextMid(a_.body_bold, 21, x + 94, cy - 12, Mix(White(playable ? 0.94f : 0.5f), kInk, over), Fit(a_.body_bold, 21, name, w - 220));
+    TextMid(a_.body, 16, x + 94, cy + 14, Mix(White(0.5f), White(0.82f), over), Fit(a_.body, 16, sub, w - 220));
+    if (playing) Equalizer(x + w - 60, cy + 12, 24, i == sel && !rail_focus_ ? White(1) : kAccent);
   });
-  const Song& s = songs_[size_t(sel)];
+  const int k = shown[size_t(sel)];
   Panel([&](float px, float py, float pw) {
-    py += Wrapped(a_.display, 44, px, py, pw, kText, s.playlist, 1.15f) + 22;
-    py = Facts(px, py, pw,
-               {{"FILE", s.file.filename().string()},
-                {"FORMAT", Upper(s.file.extension().string().substr(1)) + (s.playable ? "" : " (convert to MP3)")},
-                {"SIZE", Size(s.bytes)}});
-    py += 20;
-    Wrapped(a_.body, 21, px, py, pw, White(0.6f),
-            "In the game: Create An Entrance > Music > USER PLAYLIST, and My WWE > Jukebox > My Music.");
+    std::string name, kind, file;
+    bool playing = false;
+    if (k < 0) {
+      const std::filesystem::path& f = menu[size_t(-1 - k)];
+      name = f.stem().string(), kind = "MENU MUSIC", file = f.filename().string();
+      playing = -1 - k == playing_menu && previewing_ < 0;
+    } else {
+      const Song& s = songs_[size_t(k)];
+      name = s.playlist, kind = s.folder ? "PLAYLIST" : "SONG", file = s.file.filename().string();
+      playing = previewing_ == k;
+    }
+    // a record, turning while it plays
+    const auto [hi, lo] = colours(name);
+    const float ah = 300, cx = px + pw * 0.5f, cy = py + ah * 0.5f;
+    GradRect(px, py, pw, ah, hi, lo, 22);
+    GradRect(px, py, pw, ah, Black(0.1f), Black(0.5f), 22);
+    dl_->AddRect(P(px, py), P(px + pw, py + ah), White(0.12f), 22 * s_);
+    const float R = 118;
+    dl_->AddCircleFilled(P(cx, cy + 8), R * s_, Black(0.4f), 64);
+    dl_->AddCircleFilled(P(cx, cy), R * s_, Rgba(16, 17, 21), 64);
+    for (int g = 0; g < 7; ++g) dl_->AddCircle(P(cx, cy), (R - 10 - g * 10) * s_, White(0.045f), 64, 1.2f * s_);
+    static float spin = 0;
+    if (playing) spin += dt_ * 1.2f;
+    dl_->PathArcTo(P(cx, cy), (R - 26) * s_, spin, spin + 0.9f, 16);
+    dl_->PathStroke(White(0.12f), 0, 6 * s_);
+    dl_->PathArcTo(P(cx, cy), (R - 26) * s_, spin + 3.14f, spin + 4.04f, 16);
+    dl_->PathStroke(White(0.06f), 0, 6 * s_);
+    Glow(cx - 36, cy - 36, 72, 72, 36, WithAlpha(kAccent, 0.6f), 16);
+    dl_->AddCircleFilled(P(cx, cy), 36 * s_, kAccent, 40);
+    dl_->AddCircleFilled(P(cx, cy), 5 * s_, Rgba(16, 17, 21), 16);
+    py += ah + 24;
+    Text(a_.body_bold, 13, px, py, playing ? kAccent : White(0.5f), playing ? "PLAYING" : kind, 0, 3);
+    if (playing) Equalizer(px + pw - 36, py + 14, 16, kAccent);
+    py += 28;
+    py += Wrapped(a_.display, 38, px, py, pw, kText, name, 1.1f) + 12;
+    py = Facts(px, py, pw, {{"FILE", file}});
+    Wrapped(a_.body, 17, px, py + 6, pw, White(0.55f),
+            k < 0 ? "Plays behind the hub. Cross plays it now; R3 skips to the next one."
+                  : "In the game: Create An Entrance > Music > USER PLAYLIST, and My WWE > Jukebox > My Music.");
   });
 }
 
@@ -528,7 +603,7 @@ void Hub::DrawMovies() {
   List(rows, sel, 76, [&](int i, float ry, float over) {
     const Movie& m = movies_[size_t(i)];
     Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(0.94f), kInk, over), Fit(a_.body_bold, 24, m.name, w - 200));
-    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over),
+    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), White(0.82f), over),
          (m.id ? "Movie " + std::to_string(m.id) : std::string("New: numbered at the next start")) + "  \xC2\xB7  " +
              Size(m.bytes));
   });
@@ -576,7 +651,7 @@ void Hub::DrawSaves() {
       name = SaveKind(f.name), sub = f.name + "  \xC2\xB7  " + Size(f.bytes) + "  \xC2\xB7  " + Date(f.modified);
     }
     Text(a_.body_bold, 24, x + 24, ry + 9, Mix(White(0.94f), kInk, over), Fit(a_.body_bold, 24, name, w - 120));
-    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), Black(0.55f), over), Fit(a_.body, 18, sub, w - 120));
+    Text(a_.body, 18, x + 24, ry + 41, Mix(White(0.42f), White(0.82f), over), Fit(a_.body, 18, sub, w - 120));
   });
   Panel([&](float px, float py, float pw) {
     if (sel == 0) {
