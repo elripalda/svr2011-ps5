@@ -31,6 +31,14 @@ class InputSystem;
 
 namespace svr2011 {
 
+// [ps5 port] The send is the launcher's code (Windows) or the app's (Android); the PS5 has neither, so its OPTIONS
+// and pause menus leave the row out rather than open a form that can't be sent.
+#if defined(__PROSPERO__)
+inline constexpr bool kReportPageShown = false;
+#else
+inline constexpr bool kReportPageShown = true;
+#endif
+
 void InstallReportPage(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, rex::ui::Window* window,
                        rex::input::InputSystem* input, rex::memory::Memory* memory,
                        const std::filesystem::path& user_data);

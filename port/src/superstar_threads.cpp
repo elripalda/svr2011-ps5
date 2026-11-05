@@ -19,6 +19,7 @@
 // A mod's slots are kept by its folder (Saves\.threads\<folder>.bin), not by the id it holds this run: put
 // into its profile as it is set up (never the base's slots), written when the game saves.
 #include "big_roster.h"
+#include "host_case.h"
 #include "superstar_threads.h"
 #include "superstar_mods.h"
 
@@ -207,7 +208,8 @@ bool BuildThreadsOverlay(rex::memory::Memory* memory, const fs::path& game, cons
   fs::remove(out, ec);
   svrfmt::Bytes raw;
   svrfmt::Epac edit;
-  if (mods.empty() || !svrfmt::ReadFile((game / "pac" / "edit" / "edit.pac").string(), raw) ||
+  if (mods.empty() ||
+      !svrfmt::ReadFile(svr2011::HostCase(game / "pac" / "edit" / "edit.pac").string(), raw) ||  // [ps5 port]
       !svrfmt::EpacRead(raw, edit))
     return false;
   const svrfmt::EpacEntry* sstl = nullptr;
@@ -258,7 +260,7 @@ bool BuildThreadsOverlay(rex::memory::Memory* memory, const fs::path& game, cons
     const auto b = at.find(m.base);  // (end: the base isn't in Threads - the mod can still bring threads.txt)
     char nm[16];
     std::snprintf(nm, sizeof nm, "ch%03u.pac", m.base);
-    const auto base_models = Attire1Models(game / "pac" / "ch" / nm);
+    const auto base_models = Attire1Models(svr2011::HostCase(game / "pac" / "ch" / nm));  // [ps5 port]
     const auto own = Attire1Models(m.ch_pac);
     svrfmt::Bytes rec;
     std::string why, from;

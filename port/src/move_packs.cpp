@@ -1476,7 +1476,8 @@ std::string OverlayDamage(const fs::path& game, const fs::path& overlay, const s
   std::error_code ec;
   for (const auto& p : pacs) {
     if (std::string why = TocFits(overlay / PacPath(p)); !why.empty()) return why;
-    if (std::string why = KeepsEntries(game / "pac" / PacPath(p), overlay / PacPath(p)); !why.empty()) return why;
+    if (std::string why = KeepsEntries(svr2011::HostCase(game / "pac" / PacPath(p)), overlay / PacPath(p)); !why.empty())  // [ps5 port]
+      return why;
   }
   std::map<fs::path, std::vector<const DlcCopy*>> by_package;
   for (const auto& c : dlc) {
@@ -2024,7 +2025,7 @@ void InstallMovePacks(rex::filesystem::VirtualFileSystem* vfs, const fs::path& d
   {  // (the motions the game and the packs have: a pack motion going on to none of them is cleared, BankInsert)
     g_known_motions.assign(0x10000, false);
     for (const char* name : {"m.pac", "mpsp.pac"}) {
-      std::ifstream in(game / "pac" / name, std::ios::binary);
+      std::ifstream in(svr2011::HostCase(game / "pac" / name), std::ios::binary);  // [ps5 port]
       Bytes head, blob;
       std::vector<TocEntry> toc;
       if (!in || !ReadToc(in, head, toc)) continue;
@@ -2119,11 +2120,12 @@ void InstallMovePacks(rex::filesystem::VirtualFileSystem* vfs, const fs::path& d
   // (a merged pac that lost one of the game's entries - never wanted: a merge only adds or replaces - is served as the
   // game's own instead: without its packs, but the game finds every file it reads)
   for (const auto& p : pacs)
-    if (const std::string why = KeepsEntries(game / "pac" / PacPath(p), overlay / PacPath(p)); !why.empty()) {
+    if (const std::string why = KeepsEntries(svr2011::HostCase(game / "pac" / PacPath(p)), overlay / PacPath(p));  // [ps5 port]
+        !why.empty()) {
       REXLOG_ERROR("[svr2011] move packs: {} after the merge - the game's own {} is served instead (its packs left out)",
                    why, p);
       fs::remove(overlay / PacPath(p), ec);  // (a link to the game's file is only unlinked, never written through)
-      fs::copy_file(game / "pac" / PacPath(p), overlay / PacPath(p), ec);
+      fs::copy_file(svr2011::HostCase(game / "pac" / PacPath(p)), overlay / PacPath(p), ec);  // [ps5 port]
     }
   {  // (a package whose served files still don't match its catalogs: its own files play)
     std::map<fs::path, std::vector<const DlcCopy*>> by_package;

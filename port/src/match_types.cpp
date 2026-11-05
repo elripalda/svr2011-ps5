@@ -18,6 +18,7 @@
 #include "mystery_opponent.h"
 #include "no_mods.h"
 #include "pad_types.h"
+#include "report_page.h"
 
 #include <algorithm>
 #include <cctype>
@@ -452,7 +453,8 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
     out.insert(out.end(), rec, rec + kRec);
     // MY WWE -> OPTIONS -> REPORT A PROBLEM (report_page.h) after WEAPONS, the group's last: a copy of it (its node
     // id too, as menu.pac's port rows - game_files.cpp; menu.pac has no room left for one more record).
-    if (Rd32(rec) == kOptionsWeaponsLabel && Rd32(rec + 0x18) == kOptionsGroup && (Rd32(rec + 0x3C) & 2)) {
+    if (svr2011::kReportPageShown && Rd32(rec) == kOptionsWeaponsLabel && Rd32(rec + 0x18) == kOptionsGroup &&
+        (Rd32(rec + 0x3C) & 2)) {
       uint8_t* prev = out.data() + out.size() - kRec;
       std::vector<uint8_t> copy(prev, prev + kRec);
       Wr32(copy.data() + 0x00, kReportLabel);

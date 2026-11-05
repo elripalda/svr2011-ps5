@@ -868,7 +868,8 @@ std::vector<CardPic> CardPictures(int arena) {
   svrfmt::Epac e;
   char key[8];
   std::snprintf(key, sizeof key, "%04d", arena);
-  if (arena >= 0 && arena < 10000 && svrfmt::ReadFile((g_game / "pac" / "evt" / "evtgdhd.pac").string(), d) &&
+  if (arena >= 0 && arena < 10000 &&
+      svrfmt::ReadFile(svr2011::HostCase(g_game / "pac" / "evt" / "evtgdhd.pac").string(), d) &&  // [ps5 port]
       svrfmt::EpacRead(d, e))
     for (const auto& g : e.groups) {
       if (g.type != "ETEX") continue;
@@ -2000,7 +2001,7 @@ void RedirectArena(int arena, const std::string& file) {
     if (!relative_file.empty()) {
       std::vector<char> stock(0x4000);
       size_t got = 0;
-      if (FILE* f = std::fopen((g_game / "pac" / "bg" / name).string().c_str(), "rb")) {
+      if (FILE* f = std::fopen(svr2011::HostCase(g_game / "pac" / "bg" / name).string().c_str(), "rb")) {  // [ps5 port]
         got = std::fread(stock.data(), 1, stock.size(), f);
         std::fclose(f);
       }

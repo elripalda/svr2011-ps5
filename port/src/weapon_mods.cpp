@@ -11,6 +11,7 @@
 #include "weapon_mods.h"
 
 #include "crowd_fight.h"
+#include "host_case.h"
 
 #include <algorithm>
 #include <cstring>
@@ -336,7 +337,7 @@ void LoadWeaponMods() {
   if (g_mods.empty()) return;
   // The tables with the mods: built from the game's bgEtc.pac at each start (in memory only - its file is never
   // written, nor a copy of it).
-  const fs::path src = Game() / "pac" / "bg" / "bgEtc.pac";
+  const fs::path src = svr2011::HostCase(Game() / "pac" / "bg" / "bgEtc.pac");  // [ps5 port]
   svrfmt::Bytes data;
   svrfmt::Epac e;
   if (!svrfmt::ReadFile(src.string(), data) || !svrfmt::EpacRead(data, e)) {

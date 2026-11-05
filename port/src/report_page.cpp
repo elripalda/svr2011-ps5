@@ -1002,6 +1002,7 @@ REX_HOOK_RAW(sub_824271E8) {
   const uint32_t o = ctx.r3.u32;
   __imp__sub_824271E8(ctx, base);
   if (!o || Rd32(base + o) != kPauseVtable || !g_memory) return;
+  if (!svr2011::kReportPageShown) return;  // [ps5 port]
   if (svr2011::Lockstep()) return;  // (online: the match doesn't pause - no REPORT A PROBLEM there)
   const uint32_t items = Rd32(base + o + 40), count = Rd32(base + o + 44);
   if (!items || count == 0 || count + 1 > kMaxRows) return;
@@ -1049,7 +1050,7 @@ REX_HOOK_RAW(sub_824068A8) {
 namespace svr2011 {
 
 void ReportPagePad(uint8_t* base, uint8_t* state) {
-  if (!base || !state) return;
+  if (!base || !state || !kReportPageShown) return;  // [ps5 port] (no row: no screenshot kept at START either)
   const uint16_t b = uint16_t(state[4] << 8 | state[5]);
   const uint16_t edge = uint16_t(b & ~g_last_pad);
   g_last_pad = b;
