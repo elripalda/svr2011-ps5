@@ -90,6 +90,11 @@ using Request = std::function<int(const std::string&, const std::string&, const 
 using DlcInstall = std::function<bool(const std::filesystem::path&, const std::string&, install::Progress&,
                                       std::string&)>;
 
+// A piece of a file (Discovery's downloads): (url, first byte, last byte, the bytes out, the
+// file's whole size out when the server says) -> HTTP status (0: no answer; then the bytes
+// out say why). Runs on a thread of the hub's (it blocks).
+using Download = std::function<int(const std::string&, uint64_t, uint64_t, std::string*, uint64_t*)>;
+
 // The pages, in the order of the top bar.
 enum Tab {
   kHome, kSettingsTab, kModsTab, kRosterTab, kPacksTab, kMusicTab, kMoviesTab, kPaintTab, kSavesTab, kOnlineTab,
@@ -110,6 +115,7 @@ class Hub {
   void SetRequest(Request request) { request_ = std::move(request); }
   void SetTextures(Textures textures) { textures_ = std::move(textures); }
   void SetDlcInstall(DlcInstall install) { dlc_install_ = std::move(install); }
+  void SetDownload(Download download) { download_ = std::move(download); }
   // The loading screen from START GAME to the game's first picture (the mods
   // being set up): the home page's picture and logo, with what's being done
   // where START GAME was. Needs only the assets (no pages are read).
@@ -375,6 +381,23 @@ class Hub {
   void BrowserInput(uint32_t pressed);
   void DrawBrowser();
   float BrowserHints(float right);
+  // Discovery (hub_discover.cpp): the community's mods on the online server, from the Mods
+  // page (Triangle); a download installs the mod (task kind 7).
+  struct Discover;
+  std::shared_ptr<Discover> dv_;
+  Download download_;
+  int discover_task_id_ = 0;  // (the mod being downloaded)
+  void OpenDiscover();
+  bool DiscoverOpen() const;
+  void DiscoverLoad(int page);
+  void DiscoverPicture(int id, int64_t version, int n, bool thumb);
+  void DiscoverOpenMod();
+  void DiscoverDownload();
+  void DiscoverDownloaded(bool ok, const std::string& message);
+  void PollDiscover();
+  void DiscoverInput(uint32_t pressed);
+  float DiscoverHints(float right);
+  void DrawDiscover();
   // 0 not installed, 1 installed (this version), 2 installed (another version)
   int ModStatus(const install::ModInfo& info) const;
   // Installs .svrmod files where they are, one after another (task kind 5).
@@ -397,7 +420,7 @@ class Hub {
   uint64_t task_last_ = 0;
   float task_in_ = 0;
   int task_kind_ = 0;  // 1 install, 2 check, 3 a mod, 4 the bundled mods (at the first start), 5 mods found (Find Mods),
-                       // 6 DLC
+                       // 6 DLC, 7 a Discovery download
   DlcInstall dlc_install_;
   size_t dlc_count_ = 0;          // the DLC packages of the install running
   bool dlc_then_start_ = false;   // START GAME asked for it: the game starts after

@@ -421,6 +421,25 @@ class HubDialog final : public rex::ui::ImGuiDialog {
                                                              install::Progress& p, std::string& error) {
       return svr2011::ps5::InstallDlcPackage(package, user_data, name, p, error);
     });
+    // Discovery's downloads: a range of the file at a time (the server answers 206 with
+    // Content-Range: bytes a-b/total), or the whole file (200).
+    hub_.SetDownload([](const std::string& url, uint64_t from, uint64_t to, std::string* bytes, uint64_t* total) {
+      svr2011::net::Headers headers = {{"Range", "bytes=" + std::to_string(from) + "-" + std::to_string(to)}};
+      auto r = svr2011::net::Request("GET", url, headers);
+      if (!r) {
+        *bytes = svr2011::net::LastError();
+        return 0;
+      }
+      *total = 0;
+      if (auto it = r->headers.find("content-range"); it != r->headers.end()) {
+        const size_t slash = it->second.rfind('/');
+        if (slash != std::string::npos) *total = std::strtoull(it->second.c_str() + slash + 1, nullptr, 10);
+      } else if (r->status == 200) {
+        *total = r->body.size();
+      }
+      *bytes = std::move(r->body);
+      return r->status;
+    });
     hub_.SetRequest([](const std::string& method, const std::string& url, const std::string& body,
                        const std::string& token, std::string* answer) {
       svr2011::net::Headers headers = {{"Content-Type", "application/json"}};

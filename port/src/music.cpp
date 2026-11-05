@@ -757,7 +757,10 @@ class Player {
     Play(std::move(path));
   }
   bool Active() const { return voice_->Active(); }
-  void Play(std::filesystem::path path) {
+  void LogVolume() {}  // (the PC's volume log: the PS5's mixer has its own)
+  // As Play, at `gain` (a factor) for this file only (a clip's own level).
+  void PlayAt(std::filesystem::path path, float gain) { Play(std::move(path), gain); }
+  void Play(std::filesystem::path path, float gain = 1.0f) {
     sound::SetGameMuted(rex::cvar::GetFlagByName("audio_mute") == "true");
     auto source = sound::Open(path);
     if (!source) {
@@ -765,7 +768,7 @@ class Player {
       voice_->Stop();
       return;
     }
-    voice_->SetVolume(volume_);
+    voice_->SetVolume(std::clamp(volume_ * gain, 0.0f, 1.0f));
     voice_->Play(std::move(source), !once_);
   }
   void Stop() { voice_->Stop(); }

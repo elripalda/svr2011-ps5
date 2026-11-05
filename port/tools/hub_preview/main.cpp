@@ -13,6 +13,7 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <iterator>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -141,6 +142,37 @@ int main(int argc, char** argv) {
       std::ofstream(root + "/Headers/00000002/" + name + ".header") << "x";
       return true;
     });
+  // HUB_FAKE_SERVER=<dir>: Discovery from files - list.json for /api/mods?..., mod_<id>.json for /api/mods/<id>,
+  // img_<id>_<n>.jpg for its pictures; downloads come as 3 MB of zeros
+  if (const char* fake = std::getenv("HUB_FAKE_SERVER")) {
+    const std::string dir = fake;
+    auto read = [](const std::string& path, std::string* out) {
+      std::ifstream in(path, std::ios::binary);
+      if (!in) return false;
+      out->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+      return true;
+    };
+    hub.SetRequest([dir, read](const std::string&, const std::string& url, const std::string&, const std::string&,
+                               std::string* answer) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      const size_t at = url.find("/api/mods");
+      if (at == std::string::npos) return 404;
+      std::string rest = url.substr(at + 9);
+      if (rest.empty() || rest[0] == '?') return read(dir + "/list.json", answer) ? 200 : 404;
+      rest = rest.substr(1);
+      const std::string id = rest.substr(0, rest.find_first_of("/?"));
+      const size_t img = rest.find("/img/");
+      if (img != std::string::npos)
+        return read(dir + "/img_" + id + "_" + rest.substr(img + 5, 1) + ".jpg", answer) ? 200 : 404;
+      return read(dir + "/mod_" + id + ".json", answer) ? 200 : 404;
+    });
+    hub.SetDownload([](const std::string&, uint64_t from, uint64_t to, std::string* bytes, uint64_t* total) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      *total = 3u << 20;
+      *bytes = std::string(size_t(std::min<uint64_t>(to, *total - 1) - from + 1), '\0');
+      return 206;
+    });
+  }
   std::vector<uint32_t> script;
   for (int i = 8; i < argc; ++i) {
     std::string s = argv[i];

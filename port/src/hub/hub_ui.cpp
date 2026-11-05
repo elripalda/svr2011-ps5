@@ -676,6 +676,10 @@ void Hub::DrawHints() {
     r = Hint(r, kCircle, "Close");
     return;
   }
+  if (DiscoverOpen()) {
+    DiscoverHints(r);
+    return;
+  }
   if (br_.open) r = BrowserHints(r);
   if (!br_.open) {
   if (tab_ != kHome && state_.Installed()) r = Hint(r, kOptions, "Start Game");
@@ -684,7 +688,7 @@ void Hub::DrawHints() {
     case kHome: r = Hint(r, kCross, "Start Game"); break;
     case kSettingsTab: r = Hint(r, kLeft | kRight, "Change"); break;
     case kModsTab:
-      r = Hint(r, kTriangle, "Get Mods");
+      r = Hint(r, kTriangle, "Discover");
       r = Hint(r, kSquare, "Find Mods");
       if (item_[tab_] < int(drops_.size())) r = Hint(r, kCross, "Install");
       else if (!mods_.empty()) r = Hint(r, kCross, "Turn On / Off");
@@ -963,9 +967,9 @@ void Hub::DrawGetMods() {
   DrawQr(x + 14, y + 14, h - 28);
   const float tx = x + h + 8, tw = w - h - 26;
   Text(a_.body_bold, 15, tx, y + 18, White(0.5f), "GET MODS", 0, 3);
-  Wrapped(a_.body, 19, tx, y + 46, tw, White(0.78f), "Scan for the SmackDown vs. Raw Recomp Discord: its mods channel is full of .svrmod files.");
+  Wrapped(a_.body, 19, tx, y + 46, tw, White(0.78f), "Browse the community's mods online, or scan for the SmackDown vs. Raw Recomp Discord.");
   Glyph(kTriangle, tx + 11, y + h - 25, White(0.6f));
-  Text(a_.body_bold, 17, tx + 30, y + h - 37, White(0.6f), "Enlarge");
+  Text(a_.body_bold, 17, tx + 30, y + h - 37, White(0.6f), "Discover");
 }
 
 void Hub::DrawQrBig() {
@@ -1360,6 +1364,10 @@ void Hub::Navigate(const Pad& pad) {
     }
     return;
   }
+  if (DiscoverOpen()) {  // Discovery
+    DiscoverInput(p);
+    return;
+  }
   if (br_.open) {  // Find Mods
     BrowserInput(p);
     return;
@@ -1441,9 +1449,8 @@ void Hub::Navigate(const Pad& pad) {
     OpenBrowser();
     return;
   }
-  if (tab_ == kModsTab && (p & kTriangle)) {  // GET MODS, big
-    qr_open_ = true, qr_in_ = 0;
-    Play(Sound::kSelect);
+  if (tab_ == kModsTab && (p & kTriangle)) {  // Discovery
+    OpenDiscover();
     return;
   }
   const int n = Items();
@@ -1507,6 +1514,7 @@ bool Hub::Draw(const Pad& pad, float dt) {
   toast_time_ = std::max(0.0f, toast_time_ - dt_);
   PollJob();
   PollTask();
+  PollDiscover();
   Navigate(pad);
   if (launch_ && !leaving_) {
     leaving_ = true, press_ = 1;
@@ -1547,6 +1555,7 @@ bool Hub::Draw(const Pad& pad, float dt) {
   ox_ -= shift * s_;
   Fade(first, Smooth(page_in_));
   DrawBrowser();
+  DrawDiscover();
   DrawHints();
   DrawQrBig();
   DrawConfirm();

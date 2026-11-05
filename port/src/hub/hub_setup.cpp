@@ -6,25 +6,13 @@
 #include <thread>
 
 #include "hub_style.h"
+#include "hub_task.h"
 #include "hub_ui.h"
 
 namespace svr2011::hub {
 
 namespace fs = std::filesystem;
 
-// An installer job on its thread (one at a time).
-struct Hub::Task {
-  std::thread thread;
-  install::Progress p;
-  bool ok = false;  // (a mod: installed)
-  std::string message;
-  std::vector<std::string> failed;  // (DLC: the package files that didn't install)
-  void Cancel() { p.cancel = true; }
-  ~Task() {
-    p.cancel = true;  // (the hub closing: stops at the next piece)
-    if (thread.joinable()) thread.join();
-  }
-};
 
 namespace {
 
@@ -307,6 +295,10 @@ void Hub::PollTask() {
       Toast(t->message);
       if (start) press_ = 1, launch_ = true;
     }
+    return;
+  }
+  if (kind == 7) {  // a Discovery download (hub_discover.cpp)
+    DiscoverDownloaded(t->ok, t->message);
     return;
   }
   if (kind == 5) {  // mods found with Find Mods (their files kept)

@@ -16,6 +16,10 @@
 
 #include <dlfcn.h>
 #include <unistd.h>
+#if defined(__PROSPERO__)
+#include <pthread_np.h>
+#define gettid() pthread_getthreadid_np()  // [ps5 port]
+#endif
 
 #include <cstdint>
 #include <cstdio>
