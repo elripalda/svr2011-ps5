@@ -8,6 +8,7 @@
 	path = thirdparty/FFmpeg
 	url = https://github.com/wmarti/FFmpeg.git
 	branch = xenia-ffmpeg-canary-full
+	ignore = dirty
 [submodule "thirdparty/tomlplusplus"]
 	path = thirdparty/tomlplusplus
 	url = https://github.com/marzer/tomlplusplus.git
