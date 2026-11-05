@@ -220,7 +220,7 @@ if(PS5)
     list(APPEND SVR2011_SOURCES src/hub/hub_ui.cpp src/hub/ps5_hub.cpp src/hub/hub_pages.cpp src/hub/hub_sfx.cpp src/hub/hub_online.cpp
                                 src/hub/hub_setup.cpp src/hub/hub_install.cpp src/hub/hub_paint.cpp src/hub/hub_browse.cpp src/hub/hub_discover.cpp src/hub/hub_look.cpp
                                 src/ps5/sound.cpp src/ps5/dlc_install.cpp src/music.cpp
-                                launcher/bink_encode.c)  # (hd_movies.cpp links it; no decoder here, so unused)
+                                src/ps5/mp4_video.cpp launcher/bink_encode.c)  # (hd_movies.cpp: mods' .mp4 movies, their stubs)
     set_source_files_properties(src/hub/ps5_hub.cpp PROPERTIES
         COMPILE_DEFINITIONS "SVR2011_FONTS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts\""
         OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/inter-latin-400-normal.ttf")
@@ -334,6 +334,9 @@ if(TARGET svr2011_mbedtls)
     if(PS5)
         target_link_libraries(svr2011 PRIVATE SceRandom)  # (its randomness)
     endif()
+endif()
+if(PS5 AND TARGET libavcodec)
+    target_link_libraries(svr2011 PRIVATE libavcodec)  # [ps5 port] (ps5/mp4_video.cpp: the runtime's H.264 decoder)
 endif()
 # The SDK stages the GPU plugin (loaded at run time, never linked) only when
 # the exe relinks: a change to the plugin alone would leave a stale copy

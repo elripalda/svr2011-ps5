@@ -399,7 +399,13 @@ std::vector<MissingGameFile> MissingGameFiles() {
     if (Optional(p)) continue;
     std::string u;
     for (wchar_t c : p) u += char(c);  // (the list's names are ASCII)
+#if defined(__PROSPERO__)  // [ps5 port] (the list's folders end in a backslash: every one "missing" here; names in any case: host_case.h)
+    std::string rel = u;
+    std::replace(rel.begin(), rel.end(), '\\', '/');
+    if (fs::exists(svr2011::HostCase(g_game_root / fs::path(rel)), ec) && !(test && u == test)) continue;
+#else
     if (fs::exists(g_game_root / fs::path(p), ec) && !(test && u == test)) continue;
+#endif
     const bool essential = p == L"default.xex" || p.rfind(L"plist360", 0) == 0 || p.rfind(L"pac\\", 0) == 0;
     out.push_back({u, essential});
   }

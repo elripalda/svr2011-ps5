@@ -438,6 +438,7 @@ class HubDialog final : public rex::ui::ImGuiDialog {
     hub_.SetDownload([](const std::string& url, uint64_t from, const DownloadSink& sink, std::string* why) {
       return svr2011::net::StreamGet(url, from, sink, why);
     });
+    hub_.SetLog([](const std::string& line) { REXLOG_INFO("PS5 hub: {}", line); });
     hub_.SetRequest([](const std::string& method, const std::string& url, const std::string& body,
                        const std::string& token, std::string* answer) {
       svr2011::net::Headers headers = {{"Content-Type", "application/json"}};

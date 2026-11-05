@@ -122,6 +122,8 @@ class Hub {
   void SetTextures(Textures textures) { textures_ = std::move(textures); }
   void SetDlcInstall(DlcInstall install) { dlc_install_ = std::move(install); }
   void SetDownload(Download download) { download_ = std::move(download); }
+  // A line for the game's log (what a download installed, or why it didn't).
+  void SetLog(std::function<void(const std::string&)> log) { log_ = std::move(log); }
   // The loading screen from START GAME to the game's first picture (the mods
   // being set up): the home page's picture and logo, with what's being done
   // where START GAME was. Needs only the assets (no pages are read).
@@ -430,6 +432,7 @@ class Hub {
  private:
   std::shared_ptr<Discover> dv_;
   Download download_;
+  std::function<void(const std::string&)> log_;
   std::vector<std::shared_ptr<DownloadItem>> downloads_;
   bool dl_open_ = false;  // the downloads widget, opened (Triangle)
   int dl_sel_ = 0;

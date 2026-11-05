@@ -29,6 +29,8 @@
 // Android: the NDK's MediaExtractor + MediaCodec into an image reader (the
 // phone's own decoder), scaled to the frame size on the movie's thread; no
 // decoder for it on the phone: the fallback .bik.
+// [ps5 port] The PS5: FFmpeg's H.264 decoder on the movie's thread
+// (ps5/mp4_video.h), scaled to the frame size there.
 //
 // Test aid: SVR2011_TEST_HD_MOVIES=1 logs the decoders.
 
@@ -72,6 +74,10 @@ extern "C" {
 #include <initguid.h>  // (codecapi.h's GUIDs, defined here)
 #include <codecapi.h>
 using Microsoft::WRL::ComPtr;
+#elif defined(__PROSPERO__)
+#include <chrono>
+#include <string>
+#include "ps5/mp4_video.h"  // [ps5 port]
 #elif defined(__ANDROID__)
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -676,6 +682,89 @@ class Decoder : public DecoderBase {
       }
     }
     return true;
+  }
+};
+
+#elif defined(__PROSPERO__)
+
+// [ps5 port] The PS5: no system decoder a homebrew app can use - the .mp4 is
+// read and decoded on the movie's thread (FFmpeg's H.264 decoder,
+// ps5/mp4_video.h), scaled here to the frame size.
+
+// The mp4's length (s) and source size, and whether its first picture decodes.
+bool Probe(const fs::path& mp4, double* seconds, uint32_t* sw, uint32_t* sh) {
+  svr2011::ps5::Mp4Video video;
+  std::string why;
+  svr2011::ps5::VideoPicture p;
+  if (!video.Open(mp4, &why) || !video.Next(&p)) {
+    REXLOG_WARN("[svr2011] hd movies: {} doesn't decode ({})", mp4.string(), why.empty() ? "no picture" : why);
+    return false;
+  }
+  *seconds = video.Seconds();
+  *sw = uint32_t(p.width), *sh = uint32_t(p.height);
+  return p.width > 0 && p.height > 0;
+}
+
+class Decoder : public DecoderBase {
+ public:
+  explicit Decoder(HdMovie movie) : DecoderBase(std::move(movie)) { Start(); }
+  ~Decoder() override { Stop(); }
+
+ private:
+  void Run() override {
+    svr2011::ps5::Mp4Video video;
+    std::string why;
+    if (!video.Open(movie_.mp4, &why)) {
+      REXLOG_WARN("[svr2011] hd movies: can't decode {} ({})", movie_.mp4.string(), why);
+      return;
+    }
+    if (LogOn()) REXLOG_INFO("[svr2011] hd movies: decoding {} at {}x{} (CPU)", movie_.mp4.string(), w_, h_);
+    double last = -1;
+    bool ended = false;
+    while (!stop_) {
+      if (Looped(last)) {
+        video.Rewind();
+        last = -1;
+        ended = false;
+        Clear();
+      }
+      if (ended || Ahead(last)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        continue;
+      }
+      svr2011::ps5::VideoPicture p;
+      if (!video.Next(&p)) {
+        ended = true;  // (the end: the last frame stays until the game loops or closes)
+        continue;
+      }
+      Frame f;
+      f.nv12.resize(size_t(w_) * h_ * 3 / 2);
+      Scale(p, f.nv12.data());
+      f.time = p.time;
+      f.ready = true;
+      last = f.time;
+      Push(std::move(f));
+    }
+  }
+
+  // The picture to the frame's NV12 at w_ x h_ (nearest pixel, as Android's).
+  void Scale(const svr2011::ps5::VideoPicture& p, uint8_t* nv12) const {
+    for (uint32_t y = 0; y < h_; ++y) {
+      const uint8_t* src = p.plane[0] + size_t(int64_t(y) * p.height / h_) * p.pitch[0];
+      uint8_t* dst = nv12 + size_t(y) * w_;
+      for (uint32_t x = 0; x < w_; ++x) dst[x] = src[size_t(int64_t(x) * p.width / w_)];
+    }
+    uint8_t* uv = nv12 + size_t(w_) * h_;
+    for (uint32_t y = 0; y < h_ / 2; ++y) {
+      const size_t sy = size_t(int64_t(y) * 2 * p.height / h_) >> p.chroma_y;
+      const uint8_t* u = p.plane[1] + sy * p.pitch[1];
+      const uint8_t* v = p.plane[2] + sy * p.pitch[2];
+      uint8_t* dst = uv + size_t(y) * w_;
+      for (uint32_t x = 0; x < w_ / 2; ++x) {
+        const size_t sx = size_t(int64_t(x) * 2 * p.width / w_) >> p.chroma_x;
+        dst[2 * x] = u[sx], dst[2 * x + 1] = v[sx];
+      }
+    }
   }
 };
 

@@ -289,6 +289,7 @@ struct Hub::DownloadItem {
   uint64_t size = 0;
   int64_t pics = 0;
   bool auto_on = true;  // "Turn it on when it's done"
+  std::function<void(const std::string&)> log;  // (the hub's log_: what it installed)
   std::atomic<int> state{kWaiting};
   std::atomic<uint64_t> done{0}, total{0};
   std::atomic<bool> cancel{false}, finished{false};
@@ -671,6 +672,7 @@ void RunDownload(Item* q, Download dl, std::string url, fs::path game) {
   if (!why.empty()) {
     fs::remove(part, ec);
     q->message = why;
+    if (q->log) q->log("download: " + q->name + " stopped - " + why);
     q->finished = true;
     return;
   }
@@ -694,6 +696,23 @@ void RunDownload(Item* q, Download dl, std::string url, fs::path game) {
     q->folder = folder;
   }
   q->message = q->ok ? std::string() : (msg.empty() ? std::string("It didn't install.") : msg);
+  if (q->log) {
+    if (q->ok) {
+      // (the names under a folder: by their text - std::filesystem::relative gave nothing on the PS5)
+      const auto under = [](const fs::path& p, const fs::path& base) {
+        const std::string a = p.generic_string(), b = base.generic_string() + "/";
+        return a.compare(0, b.size(), b) == 0 ? a.substr(b.size()) : p.filename().string();
+      };
+      std::string files;
+      int n = 0;
+      for (const auto& e : fs::recursive_directory_iterator(folder, ec))
+        if (e.is_regular_file(ec) && ++n <= 24) files += (files.empty() ? "" : ", ") + under(e.path(), folder);
+      q->log("download: " + q->name + " " + q->version + " installed in " + under(folder, game) +
+             (q->auto_on ? " (on)" : " (off)") + " - " + std::to_string(n) + " files: " + files);
+    } else {
+      q->log("download: " + q->name + " didn't install - " + q->message);
+    }
+  }
   q->finished = true;
 }
 
@@ -739,6 +758,7 @@ void Hub::PollDownloads() {
     q.state = DownloadItem::kGoing;
     q.done = 0, q.total = 0, q.cancel = false, q.finished = false, q.may_install = false;
     q.ok = false, q.message.clear(), q.speed = 0, q.sample_t = 0, q.sample_done = 0;
+    q.log = log_;
     q.thread = std::thread(RunDownload, &q, download_, ServerUrl() + "/api/mods/" + std::to_string(q.id) + "/file",
                            paths_.game);
     break;
