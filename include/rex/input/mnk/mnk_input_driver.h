@@ -96,6 +96,9 @@ class MnkInputDriver final : public InputDriver,
   // Guest thread to UI thread. The queued flag coalesces the posts.
   std::atomic<bool> mouse_capture_requested_{false};
   std::atomic<bool> mouse_capture_update_queued_{false};
+  // [svr2011] what the UI thread last settled on (0 released, 1 captured, -1 nothing yet): the guest thread posts only
+  // when the request differs (the pad read runs every frame - each post pushed an SDL event)
+  std::atomic<int> mouse_capture_applied_{-1};
 
   // (the window's real focus: taken from it on attach, then its focus events -
   // never assumed, or a window that never had focus grabbed the mouse)

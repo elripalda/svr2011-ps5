@@ -230,6 +230,7 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
 
 bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
+#if REX_PLATFORM_MAC
   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
     // Cocoa stops making Metal drawables available as part of its termination
     // request. Handle the request synchronously while SDL is queueing it,
@@ -237,6 +238,12 @@ bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event)
     ++context->synchronously_handled_quit_events_;
     context->ProcessQuitRequest();
   }
+#else
+  // [svr2011] Elsewhere the quit goes through the message loop (ProcessEvent): handled here, inside SDL's event-watcher
+  // lock, it stops the guest threads while one of them can be pushing an event (waiting for that lock) - Alt+F4 hung.
+  (void)context;
+  (void)event;
+#endif
   return true;
 }
 
