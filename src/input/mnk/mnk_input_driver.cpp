@@ -444,17 +444,31 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
 
 void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
   mouse_capture_requested_.store(should_capture, std::memory_order_relaxed);
+  // [svr2011] nothing to change, nothing posted
+  if (mouse_capture_applied_.load(std::memory_order_relaxed) == int(should_capture)) {
+    return;
+  }
   bool already_queued = false;
   if (!mouse_capture_update_queued_.compare_exchange_strong(already_queued, true)) {
     return;
   }
-  std::lock_guard lock(state_mutex_);
-  if (!attached_window_) {
+  rex::ui::WindowedAppContext* context = nullptr;
+  {
+    std::lock_guard lock(state_mutex_);
+    if (attached_window_) {
+      context = &attached_window_->app_context();
+    }
+  }
+  if (!context) {
     mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
     return;
   }
   // Deferred, not CallInUIThread: running inline would re-enter state_mutex_.
-  attached_window_->app_context().CallInUIThreadDeferred([this] {
+  // [svr2011] Posted with state_mutex_ released: the post pushes an SDL event, which runs SDL's event watchers under
+  // its lock - the UI thread can be in one waiting for state_mutex_ (a quit handled there detaches this driver), and
+  // with the lock held here neither went on: the pad read stuck (the world update with it) and Alt+F4 hung (2.1.9,
+  // mnk_mode).
+  context->CallInUIThreadDeferred([this] {
     mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
     ApplyMouseCaptureFromUIThread();
   });
@@ -467,6 +481,7 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
   }
   bool should_capture = mouse_capture_requested_.load(std::memory_order_relaxed);
   if (should_capture == mouse_captured_) {
+    mouse_capture_applied_.store(int(mouse_captured_), std::memory_order_relaxed);
     return;
   }
   // (only for a window that really has the OS focus now - a test or game
@@ -476,6 +491,7 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
     return;
   }
   mouse_captured_ = true;
+  mouse_capture_applied_.store(1, std::memory_order_relaxed);
   precapture_cursor_visibility_ = window->GetCursorVisibility();
   window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
   window->CaptureMouse();
@@ -490,6 +506,7 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
 }
 
 void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
+  mouse_capture_applied_.store(0, std::memory_order_relaxed);
   if (!mouse_captured_) {
     return;
   }
