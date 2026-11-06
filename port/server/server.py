@@ -1141,7 +1141,7 @@ class Service:
 
     # The games' per-match connection reports (p2p.cpp): how online matches
     # connected - only counts per day, nothing about who or from where.
-    NET_PATHS = ("direct", "relay", "lan")
+    NET_PATHS = ("direct", "ipv6", "relay", "lan")
     NET_NATS = ("cone", "symmetric", "mapped", "open", "unknown")
     NET_RTT = (50, 100, 150, 250, 400, 100000)  # (upper bounds, ms)
 
@@ -1160,6 +1160,10 @@ class Service:
             rtt = max(0, int(body.get("rtt") or 0))
             version = re.sub(r"[^0-9A-Za-z.\-]", "", str(body.get("version") or ""))[:24] or "?"
             network = str(body.get("network") or "")  # (2.1.4 on: the match network it played on)
+            # (2.2.0 on: "ipv6": true beside path "direct". A server before that doesn't know the field and counts a
+            # direct match; a path it doesn't know it would refuse, and the report would be lost)
+            if path == "direct" and body.get("ipv6") is True:
+                path = "ipv6"
         except (ValueError, TypeError, AttributeError):
             return web.json_response({"ok": False}, status=400)
         if path not in self.NET_PATHS or nat not in self.NET_NATS:
@@ -2228,6 +2232,8 @@ class Service:
         for n, img in sorted(images.items()):
             if not reports.image_ext(img):
                 return no(400, "image%d: only PNG, JPEG or WebP pictures." % n)
+        if reports.has_url(text):
+            return no(400, reports.url_refusal())
         if text and self.names.check(text):
             return no(400, "Your answer has a word that isn't allowed - please write it without it.")
         ip = self.client_ip(request)
@@ -2294,6 +2300,8 @@ class Service:
         for n, img in sorted(images.items()):
             if not reports.image_ext(img):
                 return no(400, "image%d: only PNG, JPEG or WebP pictures." % n)
+        if any(reports.has_url(t) for t in (what, before, contact)):
+            return no(400, reports.url_refusal())
         if any(t and self.names.check(t) for t in (what, before, contact)):
             return no(400, "Your text has a word that isn't allowed - please write it without it.")
         ip = self.client_ip(request)

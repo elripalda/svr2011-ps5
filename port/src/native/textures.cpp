@@ -687,15 +687,22 @@ uint64_t ContentHash(const xenos::xe_gpu_texture_fetch_t& fetch,
   data.resize(size_t(row_bytes) * blocks_y);
   const uint32_t address = base_page << 12;
   const texture_util::TextureGuestLayout::Level& gl = layout.base;
+  // A texture whose top level sits inside the packed tail (a side of 16 or less) has it away from the start, where
+  // Upload reads it. This used to read the start: other bytes, not the picture. Pack files made from those dumps drew
+  // junk (report 11308c: black rows on the ring mat). These textures' hashes changed with this, so such files do nothing.
+  uint32_t ox = 0, oy = 0, oz = 0;
+  if (layout.packed_level == 0) texture_util::GetPackedMipOffset(width, height, 1, fetch.format, 0, ox, oy, oz);
   if (!fetch.tiled) {
     for (uint32_t by = 0; by < blocks_y; ++by)
-      ReadGuestRun(data.data() + size_t(by) * row_bytes, address + by * gl.row_pitch_bytes, row_bytes, mask);
+      ReadGuestRun(data.data() + size_t(by) * row_bytes, address + (by + oy) * gl.row_pitch_bytes + ox * bpb, row_bytes,
+                   mask);
   } else {
     const uint32_t pitch_blocks = gl.row_pitch_bytes / bpb, bpb_log2 = Log2(bpb);
     uint8_t* out = data.data();
     for (uint32_t by = 0; by < blocks_y; ++by) {
       for (uint32_t bx = 0; bx < blocks_x; ++bx, out += bpb) {
-        const int64_t offset = texture_util::GetTiledOffset2D(int32_t(bx), int32_t(by), pitch_blocks, bpb_log2);
+        const int64_t offset =
+            texture_util::GetTiledOffset2D(int32_t(bx + ox), int32_t(by + oy), pitch_blocks, bpb_log2);
         ReadGuest(out, uint32_t(address + offset), bpb, mask);
       }
     }
@@ -1356,6 +1363,20 @@ bool Replace(const Context& ctx, Entry& e, const xenos::xe_gpu_texture_fetch_t& 
 
 // The cache's key: everything but the sampler state (clamp, filters, LOD
 // bias, border).
+// Textures that change all the time (movies: 3 planes each, every frame). A copy can't run inside a render pass, so
+// one found changed at its draw ends the pass, and on a tiled GPU (phones) the whole screen is written out and read
+// back: UploadChanging does them before the frame's first pass.
+struct Changing {
+  uint64_t key = 0;
+  uint32_t fetch[6] = {};
+  uint32_t dimension = 0;
+  uint64_t last_change = 0;
+};
+std::vector<Changing> g_changing;
+constexpr uint32_t kChangingAfter = 8;  // changes: a texture rewritten a few times isn't one of these
+constexpr size_t kChangingMax = 16;
+constexpr uint64_t kChangingForget = 60;  // frames with no change or no draw
+
 uint64_t TextureKey(const uint32_t fetch_dwords[6], uint32_t dimension) {
   const uint32_t key_dwords[7] = {fetch_dwords[0] & 0xFFC003FFu, fetch_dwords[1], fetch_dwords[2],
                                   fetch_dwords[3] & 0x7FFFFu,     fetch_dwords[4] & 0x3FCu,
@@ -1487,6 +1508,17 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
       ++e.changes;
       ++g_generation;
       Upload(ctx, fetch, dimension, e);
+      if (e.changes >= kChangingAfter && g_changing.size() < kChangingMax) {
+        const uint64_t key = TextureKey(fetch_dwords, dimension);
+        if (std::none_of(g_changing.begin(), g_changing.end(), [key](const Changing& c) { return c.key == key; })) {
+          Changing c;
+          c.key = key;
+          std::memcpy(c.fetch, fetch_dwords, sizeof(c.fetch));
+          c.dimension = dimension;
+          c.last_change = ctx.frame;
+          g_changing.push_back(c);
+        }
+      }
     } else if (e.dynamic) {
       e.interval = uint32_t(std::min<uint64_t>(uint64_t(e.interval) * 2, kRecheckFrames));
     }
@@ -1499,6 +1531,34 @@ uint32_t Texture(const Context& ctx, const uint32_t fetch_dwords[6], uint32_t di
   }
   e.used_frame = ctx.frame;
   return e.srv;
+}
+
+void UploadChanging(const Context& ctx) {
+  static const bool off = std::getenv("SVR2011_TEST_NO_UPLOAD_CHANGING") != nullptr;  // (test aid: as before)
+  if (off || g_changing.empty() || g_no_cache || g_check_every_use) return;
+  for (size_t i = g_changing.size(); i-- > 0;) {
+    Changing& c = g_changing[i];
+    auto it = g_textures.find(c.key);
+    xenos::xe_gpu_texture_fetch_t fetch;
+    std::memcpy(&fetch, c.fetch, sizeof(fetch));
+    // (anything unusual: Texture deals with it at the draw, as for any other)
+    if (it == g_textures.end() || !it->second.resource || it->second.failed || it->second.replaced ||
+        it->second.pending || it->second.written || g_resolved.count(fetch.base_address) ||
+        ctx.frame > c.last_change + kChangingForget || ctx.frame > it->second.used_frame + kChangingForget) {
+      g_changing.erase(g_changing.begin() + i);
+      continue;
+    }
+    Entry& e = it->second;
+    // Every frame: the game can write the next picture after this check, before its draw, so a same answer here
+    // mustn't space the checks out (the movie would drop to half its speed). It's seen at the next frame's start.
+    e.interval = 1;
+    e.checked_frame = ctx.frame;
+    if (GuestHash(e) == e.hash) continue;
+    ++e.changes;
+    ++g_generation;
+    c.last_change = ctx.frame;
+    Upload(ctx, fetch, c.dimension, e);
+  }
 }
 
 uint64_t Generation() { return g_generation.load(std::memory_order_relaxed); }

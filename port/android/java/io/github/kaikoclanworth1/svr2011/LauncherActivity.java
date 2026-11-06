@@ -58,6 +58,7 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        ProblemReport.ctx = getApplicationContext();  // (report.txt's "last exit" lines)
         InstallActivity.init(this);
         getWindow().setStatusBarColor(kBackground);
         getWindow().setNavigationBarColor(kBackground);
@@ -411,6 +412,10 @@ public class LauncherActivity extends Activity {
         Button mine = button("My reports", kBackground);
         mine.setOnClickListener(v -> ReportsList.show(this));
         c.addView(mine, fullWidth(8));
+        // My suggestions: send an idea, and our answers (Sure / No / Done in - SuggestionsList).
+        Button ideas = button("My suggestions", kBackground);
+        ideas.setOnClickListener(v -> SuggestionsList.show(this));
+        c.addView(ideas, fullWidth(8));
 
         TextView tips = text("Play with a controller or the on-screen touch controls (Settings → Touch "
             + "controls). Display options are also in game: MY WWE → Options → Graphics.", 13, kDim);
@@ -528,7 +533,8 @@ public class LauncherActivity extends Activity {
 
     void play() {
         if (!InstallActivity.installed()) {
-            status_.setText("The game isn't installed.");
+            String incomplete = InstallActivity.incompleteText();
+            status_.setText(incomplete != null ? incomplete : "The game isn't installed.");
             startActivity(new Intent(this, InstallActivity.class));
             return;
         }

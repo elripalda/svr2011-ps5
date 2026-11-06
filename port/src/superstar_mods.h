@@ -22,8 +22,10 @@ void InstallSuperstarMods(rex::memory::Memory* memory, rex::filesystem::VirtualF
 // Attire mods that replace an attire a stock superstar's own pac has: a move
 // pack each (Mods/SuperstarOverlay/attirepacks/<folder>: "pacentry
 // ch\chNNN.pac EMD <entry> <file>"), merged by InstallMovePacks into an overlay
-// copy of the game's pac. Called by InstallMovePacks before it lists the packs.
-void PrepareAttirePacks(const std::filesystem::path& game);
+// copy of the game's pac. Called by InstallMovePacks before it lists the packs. dlc_root: the installed DLC
+// packages (their pac\ch\ch<id>_dlcNN.pac: the DLC superstars' attires and DLC attires of disc superstars count
+// as the superstar's own; an attire mod replacing one of those is mounted as a guest pac, LoadAttireMods).
+void PrepareAttirePacks(const std::filesystem::path& game, const std::filesystem::path& dlc_root);
 // Before the Custom Movies folder is mounted (its device lists the files
 // once): the mods' entrance movies are copied into it.
 void CopySuperstarMovies(const std::filesystem::path& movies);
@@ -65,11 +67,20 @@ void SuperstarModHandovers(uint8_t* base);
 void CheckModProfiles(uint8_t* base);
 // A mod's base character id (its manifest's base=), else 0.
 uint32_t SuperstarModBase(uint32_t id);
+// The id of the installed mod in folder (Mods/Superstars/<folder>; not a fetched one), else 0.
+uint32_t SuperstarModIdOf(const std::string& folder);
+// The saves folder SetSuperstarModsSaves was given ("" before).
+std::filesystem::path SuperstarModsSavesDir();
 // The game's text for string id (menu_hooks.cpp's lookup): a mod's attire
 // names, else 0.
 uint32_t SuperstarModString(uint32_t id);
 // Another pac in Mods/SuperstarOverlay to mount with the mods' (media mods);
 // before InstallSuperstarMods.
 void AddOverlayMount(const std::string& file);
+
+// CREATE AN ENTRANCE: a superstar picked / his entrance scene asked for / the menu's load came first: the back-out's log line.
+void CaePicked(uint32_t id);
+void CaeSceneAsked();
+void CaeMenuLoads();
 
 }  // namespace svr2011

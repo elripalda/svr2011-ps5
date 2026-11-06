@@ -389,7 +389,7 @@ uint32_t OnlineString(uint32_t id) {
     const std::string why = P2PHiddenReason(&sessions);
     if (why.empty()) return 0;
     // (the game's own wording - its C67E / C67C messages - then the details)
-    const bool mods = why.rfind("Your mods", 0) == 0;
+    const bool mods = why.rfind("Your mods", 0) == 0 || why.rfind("Your downloadable content", 0) == 0;
     const std::string head = mods ? "Unable to join the session due to a difference in downloadable content."
                                   : "Unable to join the session due to a difference in game versions.";
     if (id == kNoSessionsId)
@@ -729,10 +729,13 @@ REX_HOOK_RAW(sub_8273BB60) {
   __imp__sub_8273BB60(ctx, base);
 }
 
+namespace svr2011 { void MotionFileRead(PPCContext& ctx, uint8_t* base); }  // (model_mem.cpp)
+
 // Test aid (SVR2011_TEST_IMG_LOG): the pictures the menus load by name
 // (sub_826A2FA8(image, "/DSC1/R123", ...), 16 characters at most).
 REX_EXTERN(__imp__sub_826A2FA8);
 REX_HOOK_RAW(sub_826A2FA8) {
+  svr2011::MotionFileRead(ctx, base);  // (a match's motion file that doesn't fit its buffer: model_mem.cpp)
   static const bool log = std::getenv("SVR2011_TEST_IMG_LOG") != nullptr;
   if (log && ctx.r4.u32) {
     const char* p = reinterpret_cast<const char*>(base + ctx.r4.u32);

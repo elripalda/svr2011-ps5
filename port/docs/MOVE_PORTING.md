@@ -46,6 +46,23 @@ page (`port/docs/MOVE_MODDING.md`).
   (a player's 2K17 Blue Thunder Bomb, Sami Zayn). A move ported with 2.1.5 or older from these games has to be
   ported again.
 
+### 2.3b No empty records in a motion
+
+A keyframe motion's record is `0x60 + u16 size` or `0x60 + size`. The game has no size check: an empty record (`60 00 00`,
+a key whose only events were dropped) makes it read what follows as that key's record, so pose bytes run as events - no
+stock track has one (0 of 24746). Sabu's Springboard DDT 3 ended early at key 111, where `36 BF 5A` read as a jump to
+motion 23231, which no bank has, and both wrestlers stayed in it (report 7017d6). `ymks.build_stream` writes a one-key
+skip instead; `move_packs` does the same to a pack's keyframe motions when it merges (`DropEmptyRecords`, movepacks 15),
+so existing mods need no new port. Test aids: `SVR2011_TEST_HW_WATCH_MOTION=<person>,<motion>` (who writes the next
+motion), `SVR2011_TEST_FOLLOW_LOG=1` (a jump event's bytes and address).
+
+### 2.3c Templates a match type alone has
+
+A move only in a match type's banks (Rumble's 83xx / 84xx: `MOT/RU*` + `MVMT/RUMB`) has no motions in other matches: both
+wrestlers stand still in it. A template search with no category skips them (`choose_template`). The moveset's rope
+elimination slots (0x026-0x02A, 0x088 and kin, bank RUMB) ask for RUMB by name and rightly get them, so a move in such a
+slot can't be tested with a forced start in a normal match.
+
 ### 2.4 Ids
 
 - **Below every template bank's last id.** A bank's directory is sorted and ends at its highest id (16000 in
@@ -55,6 +72,14 @@ page (`port/docs/MOVE_MODDING.md`).
 - **Not 9000-9999 for a keyframe move.** The game treats 9000-9779 as streamed (YMBs) motions by its flag
   table; a keyframe move there plays through the wrong path.
 - The converter picks a free record (one 2011 keeps without motions) within those limits; `--id` chooses.
+- **Not 16000 and up outside the template's thousand** (the game never starts it: move_packs.cpp NeverStarts),
+  **nor a DLC move**: 2011's DLC brings 282 records the disc keeps cut back to life with its own motions and adds
+  18 (`tools/dlc_move_ids.json`, 303 ids) - 273 of the disc's "free" records. One rule for every picker:
+  `Game11.free_ids` (free_record, moveset_port, the Mod Doctor's renumber); a passed `--id` outside it is picked
+  again (4 Nov, reports db3291 / d97b88 / e47af7 / 3b5056).
+- **A move on YMBs banks (a submission) takes minutes**: 2K15's Kimura Lock solves 5 hold phases in ~172 s. The
+  move-set port's limit (120 s a move) gives such a move `YMBS_EXTRA` (480 s) more - before, it was stopped and the
+  base move kept ("missing from CREATE A MOVE-SET").
 
 ### 2.5 The template
 
@@ -115,9 +140,19 @@ page (`port/docs/MOVE_MODDING.md`).
   closest length) before the category vote - a coded category mixes holds with other moves (2K15's M013 is
   mostly reversals: its vote said STAT and the Patriot Lock got Mule Kick Reversal 2; now Single Leg Boston
   Crab 21308).
-- Open: a forced ported hold doesn't play out (25 Oct: it stays in the motion for the whole run, Ankle Lock 3
-  or Boston Crab alike; before it played x 0 and ended): it doesn't run the hold / struggle loop the stock one
-  does (the loop comes from the template's records and the game's submission state, not yet matched).
+- **Open: the game tells a submission by its id** (4 Nov): in a hold = the motion in 21000-21499 (sub_821B57F8 for
+  an id, sub_821B58F8 a fighter's current one), standing 21000-21099 (sub_821B2540), the sub-kinds 21100s / 21200-249 /
+  21250-299 / 21300-349 / 21350-399 / 21400-449 / 21450-499 (sub_821B2560 / 5818 / 5838 / 5858 / 5878 / 5898 / 58B8),
+  a front grapple 4500-5549 ... (sub_821B9E80), submissions among the moveset's slots 101-103 / 107-109
+  (sub_821BBAF0). Every 21000s record is a stock submission, so a ported hold sits elsewhere: its victim stands up when
+  x 0 ends. Tried (branch kimura-ground, not merged): those four tests answering for the move's wazecopy source - a
+  forced hold then stayed in its hold, but one the CPU applied (SVR2011_TEST_SLOT_MOVE + SVR2011_TEST_MOMENTUM) never
+  ended (230 s; the stock Crossface the same way ended in 40 s) - a stuck match, worse than the stand-up: taken out.
+  A forced start skips the game's submission state (stock holds loop forever too): taps and breaks need a CPU-applied
+  hold.
+- **Standing or on the mat**: choose_submission takes the template whose victim is as high as the source's at the
+  start and in the hold (x 2; standing holds keep him at -7..-11 model units, mat holds -1..-5). 2K15's Kimura Lock
+  (standing start, on the mat: -8.8 / -3.3) got Bearhug, a standing hold - now Crossface 21004 (-8.8 / -1.5).
 
 ## 3. Testing a ported move
 

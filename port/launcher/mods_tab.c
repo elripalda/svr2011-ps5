@@ -188,7 +188,7 @@ static int maker_present(void);
 static void scan(void)
 {
     static const WCHAR *const types[] = { L"Arenas", L"Superstars", L"Signs", L"Media", L"Backstage", L"Moves", L"MatchTypes",
-                                         L"Backgrounds", L"Attires" };
+                                         L"Backgrounds", L"Attires", L"Titles" };
     int t;
     s_nmods = 0;
     if (!s_game[0]) return;
@@ -387,19 +387,14 @@ static const WCHAR *roster_name(int id, WCHAR *buf, size_t n)
     return buf;
 }
 
-/* Attires 1-4 (bits 0-3) the superstar's own pac has; *gear: it also has other model kinds for attire 1 (the
-   entrance gear superstars - Undertaker, CM Punk, Cena, Shawn Michaels, Morrison: kind 4). A new attire for
-   them doesn't load in the game yet (src/superstar_mods.cpp ExtraKinds): only their own can be replaced. */
-static unsigned own_attires(const WCHAR *game, int id, int *gear)
+/* One model pac's attires 1-4 for superstar id (bits 0-3) and whether it has other model kinds for attire 1. */
+static unsigned pac_attires(const WCHAR *path, int id, int *gear)
 {
-    WCHAR path[MAX_PATH];
     unsigned char d[0x4000];
     unsigned mask = 0;
     char want[8];
     size_t p;
     FILE *f = NULL;
-    swprintf_s(path, MAX_PATH, L"%s\\pac\\ch\\ch%03d.pac", game, id);
-    *gear = 0;
     if (_wfopen_s(&f, path, L"rb") || !f) return 0;
     p = fread(d, 1, sizeof d, f);
     fclose(f);
@@ -419,6 +414,51 @@ static unsigned own_attires(const WCHAR *game, int id, int *gear)
             }
     }
     return mask;
+}
+
+/* Attires 1-4 (bits 0-3) the superstar's own pacs have - the game's pac\ch\chNNN.pac and the installed DLC's
+   pac\ch\ch<id>_dlcNN.pac (UserData\0000000000000000\5451085D\00000002\<package>: a DLC superstar's own, ids
+   51-58, and DLC attires of disc superstars); *gear: one has other model kinds for attire 1 (the entrance gear
+   superstars - Undertaker, CM Punk, Cena, Shawn Michaels, Morrison: kind 4). A new attire for them doesn't load in
+   the game yet (src/superstar_mods.cpp ExtraKinds): only their own can be replaced. */
+static unsigned own_attires(const WCHAR *game, int id, int *gear)
+{
+    WCHAR path[MAX_PATH], pat[MAX_PATH];
+    WIN32_FIND_DATAW pk, fd;
+    HANDLE hp, hf;
+    unsigned mask = 0;
+    *gear = 0;
+    if (id >= 100) {
+        swprintf_s(path, MAX_PATH, L"%s\\pac\\ch\\ch%03d.pac", game, id);
+        mask |= pac_attires(path, id, gear);
+    }
+    swprintf_s(pat, MAX_PATH, L"%s\\UserData\\0000000000000000\\5451085D\\00000002\\*", game);
+    hp = FindFirstFileW(pat, &pk);
+    if (hp == INVALID_HANDLE_VALUE) return mask;
+    do {
+        if (!(pk.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || pk.cFileName[0] == L'.') continue;
+        swprintf_s(pat, MAX_PATH, L"%s\\UserData\\0000000000000000\\5451085D\\00000002\\%s\\pac\\ch\\ch%d_dlc*.pac", game,
+                   pk.cFileName, id);
+        hf = FindFirstFileW(pat, &fd);
+        if (hf == INVALID_HANDLE_VALUE) continue;
+        do {
+            int g = 0;
+            swprintf_s(path, MAX_PATH, L"%s\\UserData\\0000000000000000\\5451085D\\00000002\\%s\\pac\\ch\\%s", game,
+                       pk.cFileName, fd.cFileName);
+            mask |= pac_attires(path, id, &g);
+            if (g) *gear = 1;
+        } while (FindNextFileW(hf, &fd));
+        FindClose(hf);
+    } while (FindNextFileW(hp, &pk));
+    FindClose(hp);
+    return mask;
+}
+
+/* A DLC superstar the player has installed (ids below 100: only DLC model pacs). */
+static int dlc_superstar(const WCHAR *game, int id)
+{
+    int gear = 0;
+    return id > 0 && id < 100 && own_attires(game, id, &gear) != 0;
 }
 
 typedef struct {
@@ -500,7 +540,8 @@ int mods_attire_guard(const WCHAR *game, const WCHAR *fresh, WCHAR *report, size
             else if (!strcmp(line, "model") && *eq) strncpy_s(model, MAX_PATH, eq, _TRUNCATE);
         }
         fclose(f);
-        if (!attire_mod || a->id < 100 || a->id > 321 || a->attire < 0 || a->attire > 4) continue;
+        if (!attire_mod || ((a->id < 100 || a->id > 321) && !dlc_superstar(game, a->id)) || a->attire < 0 || a->attire > 4)
+            continue;
         /* no model: only an entrance for one of the superstar's own attires (Simple entrance porting) - it holds no
            attire, so it isn't moved (the game: the first folder A-Z keeps an attire's entrance) */
         MultiByteToWideChar(CP_UTF8, 0, model, -1, wmodel, MAX_PATH);
@@ -814,7 +855,7 @@ static const WCHAR *kind_folder(const WCHAR *type)
     static const struct { const WCHAR *type, *folder; } k[] = {
         {L"superstar", L"Superstars"}, {L"arena", L"Arenas"}, {L"backstage", L"Backstage"}, {L"signs", L"Signs"},
         {L"media", L"Media"}, {L"matchtype", L"MatchTypes"}, {L"background", L"Backgrounds"}, {L"attire", L"Attires"},
-        {L"moves", L"Moves"},
+        {L"moves", L"Moves"}, {L"title", L"Titles"},
     };
     int i;
     for (i = 0; i < (int)(sizeof k / sizeof *k); ++i)
@@ -1885,9 +1926,10 @@ static int install_file(const WCHAR *zip)
         const int match_type = !_wcsicmp(m.type, L"matchtype");
         const int background = !_wcsicmp(m.type, L"background");
         const int attire = !_wcsicmp(m.type, L"attire");
+        const int title = !_wcsicmp(m.type, L"title");  /* a championship's name / belt / pictures (Mods/Titles) */
         WCHAR need1[MAX_PATH], need2[MAX_PATH];
-        if (signs || media || match_type) {
-            wcsncpy_s(kind, 32, signs ? L"Signs" : media ? L"Media" : L"MatchTypes", _TRUNCATE);
+        if (signs || media || match_type || title) {
+            wcsncpy_s(kind, 32, signs ? L"Signs" : media ? L"Media" : title ? L"Titles" : L"MatchTypes", _TRUNCATE);
             goto place;
         }
         if (background) {  /* main menu pictures: picture.dds or a pack's *.dds (1024 x 512 DXT5) */
@@ -2016,6 +2058,8 @@ place:
                        : !wcscmp(kind, L"Backgrounds") ? L"Installed \"%s\". The main menu shows it after its own "
                                                          L"12 pictures."
                        : !wcscmp(kind, L"Signs") ? L"Installed \"%s\". The crowd holds these signs up in every match."
+                       : !wcscmp(kind, L"Titles") ? L"Installed \"%s\". The game shows the title's new name, belt and "
+                                                    L"picture the next time it starts."
                        : !wcscmp(kind, L"Attires") ? L"Installed \"%s\". The superstar has it on CHANGE ATTIRE the next "
                                                      L"time the game starts."
                        : wcscmp(kind, L"Arenas") ? L"Installed \"%s\". It is under the M tile of the character "

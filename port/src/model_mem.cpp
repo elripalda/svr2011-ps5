@@ -20,6 +20,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -395,6 +396,13 @@ REX_HOOK_RAW(sub_8215A380) {
 // sub_8269B2D0, whose hook hands such a block back), so the match loads instead of hanging.
 // Test aids: SVR2011_TEST_CACHE_LOG=1 - every request of 1 MB or more; SVR2011_TEST_CACHE_FULL=<bytes> - the
 // cache finds no room for a request of at least that size (the hang, on purpose).
+namespace svr2011 {
+// (match_types.cpp: the cell's extra rule motions' read, '/MOT/RUWM' while pending)
+extern const char* const kExtraRuleMotionsRead;
+bool ExtraRuleMotionsPending();
+void ExtraRuleMotionsRead();
+}  // namespace svr2011
+
 namespace {
 constexpr uint32_t kLoaderCache = 0x82ED5FE8;
 
@@ -503,6 +511,7 @@ REX_HOOK_RAW(sub_826BA928) {
     REXLOG_INFO("[svr2011] file cache: {} {} bytes -> {:08X} after {:.1f} s ({} tries)", name, size, ctx.r3.u32, s,
                 t_alloc.tries);
   t_alloc.active = false;
+  if (name == svr2011::kExtraRuleMotionsRead) svr2011::ExtraRuleMotionsRead();
 }
 
 // (inside sub_826BA928's retry loop: one call per failed try; r3 after it = the idle files it could still free)
@@ -515,10 +524,20 @@ REX_HOOK_RAW(sub_826B9FB8) {
   ++r.tries;
   if (r.stuck || ctx.r3.u32 != 0) return;
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - r.t0).count();
-  if (s < 3.0) return;
+  // (the cell's extra rule motions - match_types.cpp: Extreme Rules' RUWM read after the cell's own, when heap 16
+  // already holds the arena, the stage and the weapons' models - from the fallback memory at once, no 3 s wait)
+  // (nor for a file bigger than the cache's whole heap, with nothing idle left to free: packs' /MOTP/GAME, 30 MB in 20
+  // MB, waited 3 s at every match)
+  const uint32_t heap = Rd32(base, cache + 76), table = Rd32(base, 0x82EC5F48);
+  const bool too_big = heap < 54 && table && r.size > Rd32(base, table + heap * 36 + 4) - Rd32(base, table + heap * 36);
+  const bool at_once = too_big || (svr2011::ExtraRuleMotionsPending() && RequestName(base) == svr2011::kExtraRuleMotionsRead);
+  if (s < 3.0 && !at_once) return;
   r.stuck = true;
   r.name = RequestName(base);
-  LogLoaderCache(base, cache, r, s);
+  if (at_once)
+    REXLOG_INFO("[svr2011] file cache: no room for {} ({} bytes) - from the fallback memory", r.name, r.size);
+  else
+    LogLoaderCache(base, cache, r, s);
 }
 
 namespace svr2011 {
@@ -549,3 +568,83 @@ uint32_t LoaderCacheFallback(uint32_t size) {
   return p;
 }
 }  // namespace svr2011
+
+// -- A match's motion files ----------------------------------------------------
+//
+// A match's motions live in one 36 MB buffer of heap 42 (sub_821636D8: table +344 the buffer, +336 its size, +340 what
+// is used; the table's two sets: table + 352 * set, the one loading = *(table + 704) ^ 1). Each file of the group -
+// MOT/BM00, BM01, BM02, BM03 ... - is read so that it ENDS at the buffer's top (sub_82162960, sub_82162890: dest = buffer
+// + size - file), and sub_821646E8 trims its banks down to the used end (sub_82163808: only the motions this match can
+// play). Nothing compares the two: packs grew MOT/BM01 from 17 MB to 35 MB and its read landed on the banks BM00 had
+// already left there - slots 3 to 7 of the motion list junk (report d10f64: every motion of a strike bank gone, the
+// wrestlers stand in a motion no bank has; 89cfee: the game's search crashed on them). Such a file is read into the
+// fallback memory instead, and given back when its banks have been copied (sub_826A2D78: the read's answer).
+// Test aid SVR2011_TEST_BANK_FILE_OFF=1: the game's place (the report's junk).
+namespace {
+thread_local uint32_t t_motion_table = 0;  // (sub_82162960 / sub_82162890 running: the table)
+constexpr uint32_t kMotionFileMargin = 0x1000;
+struct MotionFileBlock {
+  uint32_t reader, block;
+};
+std::mutex g_motion_file_mutex;
+std::vector<MotionFileBlock> g_motion_file_blocks;
+}  // namespace
+
+namespace svr2011 {
+// (online.cpp's sub_826A2FA8 hook, before the game's: r3 the reader, r4 the name, r5 where it goes)
+void MotionFileRead(PPCContext& ctx, uint8_t* base) {
+  const uint32_t table = t_motion_table;
+  if (!table || !ctx.r5.u32) return;
+  static const bool off = std::getenv("SVR2011_TEST_BANK_FILE_OFF") != nullptr;
+  if (off) return;
+  const uint32_t set = table + 352 * (Rd32(base, table + 704) ^ 1), buffer = Rd32(base, set + 344);
+  const uint32_t size = Rd32(base, set + 336), used = Rd32(base, set + 340), dest = ctx.r5.u32;
+  if (dest >= buffer + used + kMotionFileMargin) return;
+  const uint32_t bytes = buffer + size - dest;  // (the game's place: its size, rounded up to 2 KB)
+  // (the virtual system heap: only the CPU reads it, and the physical pool may have no 37 MB in one piece by now)
+  const uint32_t block = FallbackBlock(bytes, true, 0x1000);
+  const std::string name = GuestName(base, ctx.r4.u32);
+  if (!block) {
+    REXLOG_ERROR("[svr2011] motion file {} ({} bytes): no fallback memory - it overwrites the motions before it", name, bytes);
+    return;
+  }
+  {
+    std::lock_guard lock(g_motion_file_mutex);
+    g_motion_file_blocks.push_back({ctx.r3.u32, block});
+  }
+  static int told = 0;
+  if (told++ < 8)
+    REXLOG_WARN("[svr2011] motion file {} ({:.1f} MB) doesn't fit above the {:.1f} MB of motions before it in the {:.0f} MB "
+                "buffer - read into the fallback memory, at {:08X}", name, bytes / 1048576.0, used / 1048576.0,
+                size / 1048576.0, block);
+  ctx.r5.u64 = block;
+}
+}  // namespace svr2011
+
+REX_EXTERN(__imp__sub_82162960);
+REX_HOOK_RAW(sub_82162960) {
+  t_motion_table = ctx.r4.u32;
+  __imp__sub_82162960(ctx, base);
+  t_motion_table = 0;
+}
+
+REX_EXTERN(__imp__sub_82162890);
+REX_HOOK_RAW(sub_82162890) {
+  t_motion_table = ctx.r4.u32;
+  __imp__sub_82162890(ctx, base);
+  t_motion_table = 0;
+}
+
+// sub_826A2D78(.., .., reader): a read has come - its answer (for a motion file, sub_821646E8) copies what it keeps
+REX_EXTERN(__imp__sub_826A2D78);
+REX_HOOK_RAW(sub_826A2D78) {
+  const uint32_t reader = ctx.r5.u32;
+  __imp__sub_826A2D78(ctx, base);
+  std::lock_guard lock(g_motion_file_mutex);
+  for (size_t i = 0; i < g_motion_file_blocks.size(); ++i)
+    if (g_motion_file_blocks[i].reader == reader) {
+      svr2011::CawHeapFree(g_motion_file_blocks[i].block);
+      g_motion_file_blocks.erase(g_motion_file_blocks.begin() + long(i));
+      break;
+    }
+}

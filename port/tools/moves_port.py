@@ -5,6 +5,13 @@ docs/MOVE_PACKS.md).
     py moves_port.py games
     py moves_port.py list    --game <id> --src <ISO or extract folder> [--pac11 <2011 pac>]
     py moves_port.py convert --game <id> --src <...> --item <move id> --out <dir> [options]
+    py moves_port.py renumber --mod <installed mod or move pack folder> [--pac11 <2011 pac>] [--mods <Mods>]
+                     [--dry 1]
+            an installed mod's moves on ids of 16000 and up (older ports) moved to free records (free_ids) below
+            their banks' last ids: the game leaves such a body motion out of MOT/BM00 (move_packs.cpp) and the
+            move played as nothing - the wrestler slid off and froze (report a745b2, Sin Cara's 30073). pack.txt,
+            the motions' follow-ups (op 49), the moves list(s) and the manifest's version change; a backup zip of
+            the files before goes into tools/work/renumber_backup. --dry 1: the plan only.
 
 stdout is only JSON; logs go to stderr, with progress lines `progress <0-100> <text>`.
 Exit 0 ok, 2 bad input, 3 failed.
@@ -117,6 +124,18 @@ STAGES = None     # (a list: each progress step's (text, time) is added - movese
 
 class TimeLimit(Exception):
     pass
+
+
+# (a move on YMBs banks - a submission, a taunt - solves the limb IK per phase and bank: 2K15's Kimura Lock (5 hold
+# phases) took 184 s and moveset_port's 120 s a move stopped it - the base move kept, "missing from CREATE A MOVE-SET",
+# report 20261104-093125. Such a move gets this much more once.)
+YMBS_EXTRA = 480
+
+
+def extend_deadline():
+    global DEADLINE
+    if DEADLINE is not None:
+        DEADLINE += YMBS_EXTRA
 
 
 def progress(pct, text):
@@ -622,6 +641,17 @@ def convert0789(a, rep, outdir, g):
             tid = choose_template(g11, SINGLES, nf, gap, family, paired)
             if tid:
                 how = 'the 2011 moves named "%s ...", the closest start gap and length' % name
+        # (a signature / finisher - moveset_port's special slots: 2011's own signatures / finishers of the move's
+        # situation first - SvR 2008's Rated RKO, a corner finisher, got Corner Forehand Chop 5728, a corner strike's
+        # record and menus, report 20261104-071454; 2011 has corner finishers - Twist of Fate 2 5706 ...)
+        if not tid and a.get('special'):
+            special = {i for i in g11.special_ids() if i in motp and usable11(g11.waze, i)
+                       and (sit is None or g11.situation.get(i) == sit) and (not holds or i in held)}
+            if special:
+                tid = choose_template(g11, SINGLES, nf, gap, special, paired)
+                if tid:
+                    how = '2011\'s signatures / finishers%s, the closest start gap and length' % (
+                        ', situation %s' % sit if sit is not None else '')
         for cs, where, same_sit, hold in ([] if tid else tries):
             tid = (dive and choose_template(g11, cs, nf, gap, pool(same_sit, hold), paired, ringside=False)) or \
                 choose_template(g11, cs, nf, gap, pool(same_sit, hold), paired)
@@ -649,6 +679,17 @@ def convert0789(a, rep, outdir, g):
         new_id, why = mid, 'the same id: a record 2011 keeps without a motion'
     else:
         new_id, why = g11.free_record(name, limit=g11.id_limit(btid))
+    # (an id the game never starts - 16000 and up outside the template's thousand (move_packs.cpp NeverStarts: the
+    # move isn't usable, movesets keep the base's) - or past its banks' last id: another free record. moveset_port's
+    # pool gave SvR 2009's Hunting RKO 16126 on Viper RKO 6863's banks - in CREATE A MOVE-SET, never in a match,
+    # report 20261104-072336)
+    lim = g11.id_limit(btid)
+    own = new_id == mid and why.startswith('the same id')   # (the move's own cut record: kept unless the game can't use it)
+    if new_id and ((new_id >= 16000 and new_id // 1000 != btid // 1000) or (lim is not None and new_id > lim) or
+                   (not own and new_id not in g11.free_ids(lim))):
+        old = new_id
+        new_id, why = g11.free_record(name, limit=lim, avoid=a.get('_avoid'))
+        rep['warnings'].append('id %d is one the game never starts with template %d: %s instead' % (old, btid, new_id))
     if not new_id:
         raise RuntimeError('no free 2011 move record')
     rep['notes'].append('template %d %s (%s)' % (tid, g11.waze[tid][1], how))
@@ -703,8 +744,10 @@ def convert0789(a, rep, outdir, g):
         cues = g11.cue_ids()
         for e in tracks:
             x, y = e['x'], e['y']
-            if path.startswith('MVMT') and (x, y) not in ((0, 0), (0, 1)) and not any(xx == x for xx, yy in ks):
-                continue   # (menu banks: the body tracks only)
+            # (menu banks: the body tracks only - of every phase of the move: SvR 2008's Rated RKO keeps the move in x 5
+            # after a 13-frame x 0, and its menu bank had x 0 alone - report 20261104-071454)
+            if path.startswith('MVMT') and not (y in (0, 1) and x < 90) and not any(xx == x for xx, yy in ks):
+                continue
             p = pk_tracks.get((x, y)) if packed else None
             if p is not None:   # (SvR 2009's own match copy, as it is: the same packed codec)
                 data = fix_track(p['data'], pk.T, y in (0, 1) and ymks.is_packed_motion(p['data'], pk.T), mid, new_id,
@@ -769,6 +812,33 @@ def convert0789(a, rep, outdir, g):
     return rep
 
 
+def retime_camera(data, scale, nframes, old, new):
+    """a camera track (y 50-57: unpacked records - a camera key, count + pose, after an optional event block) stretched
+    in time by `scale` to `nframes`: each key's frame and its count (the frames it takes to reach that shot) scaled,
+    its events moved with it, jumps to the template pointed at the new move"""
+    import ymks
+    out = []
+    last = -1
+    for f, r in ymks.parse_stream(data).records():
+        ev, pose = ymks.split_record(r, False)
+        try:   # (a key size ymks doesn't read - 11 bytes in some tracks - keeps its bytes, only moved in time)
+            cam = ymks.decode_camera(pose) if pose else None
+        except ValueError:
+            cam = None
+        if cam:
+            cam['count'] = max(0, min(255, int(round((cam['count'] + 1) * scale)) - 1))
+            pose = ymks.encode_camera(cam)
+        if ev and old != new:
+            e2 = bytearray(ev)
+            if e2[0] in (49, 50) and len(e2) >= 3 and struct.unpack_from('<H', e2, 1)[0] == old:
+                struct.pack_into('<H', e2, 1, new)
+            ev = bytes(e2)
+        nf = max(last + 1, min(nframes - 1, int(round(f * scale))))
+        last = nf
+        out.append((nf, ymks.join_record(ev, pose, False)))
+    return ymks.build_stream(ymks.make_stream(out, max(nframes, last + 1)))
+
+
 def fix_track(data, T, packed, old, new, keep, cues=None):
     """a track copied as it is (cameras, ropes, props; SvR 2009's packed people): its events as clean_events08"""
     import ymks
@@ -816,6 +886,20 @@ def usable11(waze, mid):
     profiles hold a few it can't (RVD's 10280 and 35781 have no record): never a template or a pick."""
     r = waze.get(mid)
     return bool(r and any(r[0]))
+
+
+_DLC_IDS = None
+
+
+def dlc_move_ids():
+    """SvR 2011's DLC move ids (dlc_move_ids.json next to this file) - never a ported move's record"""
+    global _DLC_IDS
+    if _DLC_IDS is None:
+        try:
+            _DLC_IDS = frozenset(json.load(open(os.path.join(HERE, 'dlc_move_ids.json')))['ids'])
+        except (OSError, ValueError, KeyError):
+            _DLC_IDS = frozenset()
+    return _DLC_IDS
 
 
 class Game11:
@@ -934,6 +1018,42 @@ class Game11:
             pass
         return self._cues
 
+    def hold_heights(self, tid):
+        """(start, hold) of a 2011 YMBs submission's victim: its root height (model units) at x 0's first frame and the
+        median through x 2 (the struggle loop - in the hold); kept with the start gaps. None if unread"""
+        import statistics
+        import ymbs
+        import ymbs_retarget as YR
+        if self._gaps is None:
+            self._gaps_stamp = None
+            m = os.path.join(self.pac11, 'm.pac')
+            self._gaps_stamp = (os.path.getsize(m), int(os.path.getmtime(m)))
+            try:
+                stamp, self._gaps = __import__('pickle').load(open(self._gaps_file, 'rb'))
+                if stamp != self._gaps_stamp:
+                    self._gaps = {}
+            except Exception:   # noqa: BLE001
+                self._gaps = {}
+        k = ('hold heights', tid)
+        if k not in self._gaps:
+            out = None
+            for path, kind, ks in self.banks_of(tid):
+                if kind != 'YMBs' or (0, 1) not in ks or (2, 1) not in ks:
+                    continue
+                try:
+                    b = ymbs.Bank(self.bank_raw(path)[1])
+                    k0, k2 = b.find(tid, 0, 1), b.find(tid, 2, 1)
+                    d0, d2 = b.decode(k0)[0], b.decode(k2)[0]
+                    n2 = max(1, b.dir[k2][4])
+                    out = (float(YR.frame_values(d0, 0)['root_t'][1]),
+                           float(statistics.median(YR.frame_values(d2, f)['root_t'][1] for f in range(0, n2, max(1, n2 // 8)))))
+                except (IndexError, KeyError, ValueError, TypeError):
+                    out = None
+                break
+            self._gaps[k] = out
+            self._gaps_dirty = True
+        return self._gaps[k]
+
     def save_gaps(self):
         import pickle
         if self._gaps_dirty:
@@ -994,20 +1114,41 @@ class Game11:
         tops = [max(k[0] for k in self.idx[p][1]) for p, kind, xs in self.banks_of(tid) if self.idx[p][1]]
         return min(tops) - 1 if tops else None
 
-    def free_record(self, name=None, near=None, limit=None, avoid=None):
-        """a record 2011 keeps without motions (a cut move): the one named `name`, else the first. near: a
-        template id - only records in its thousand (a taunt in 9000-9999: an in-match taunt on a record
-        elsewhere, 3894, wasn't found - Sabu's 9040 was). limit: the highest id that fits (id_limit)"""
+    def special_ids(self):
+        """the moves 2011's own profiles have as signatures / finishers (slots 0x1E-0x24)"""
+        if getattr(self, '_special', None) is None:
+            import svr10_superstar as SS
+            self._special = set()
+            for r in SS.Game(self.pac11, 11).pro.values():
+                if len(r) >= 0x26:
+                    self._special.update(struct.unpack_from('<4H', r, 0x1E))
+        return self._special
+
+    def free_ids(self, limit=None, avoid=(), near=None):
+        """the free move records, sorted - the one rule for every picker (free_record, moveset_port, the Mod Doctor's
+        renumber): a record 2011 keeps without motions (a cut move), above 1000, in no 2011 profile, not in `avoid`,
+        at most `limit` (id_limit). near: a template id - only records in its thousand when there are any (a taunt in
+        9000-9999: an in-match taunt on a record elsewhere, 3894, wasn't found - Sabu's 9040 was); without one no
+        9000s (the game's streamed (YMBs) motions are 9000-9779 by its flag table: a keyframe move there played as one)"""
+        # (nor a DLC move: 2011's DLC brings 282 records the disc keeps cut back to life, with its own motions, and adds
+        # 18 - dlc_move_ids.json. A ported move on one collided with the DLC's own for every player with the DLC: 273
+        # of the "free" records were such - Brock Lesnar 2K14 / 2K15 ports, reports 20261104-091730 / -093125)
+        dlc = dlc_move_ids()
         free = [i for i in sorted(self.waze) if i not in self.moved and i > 1000 and i not in self.in_profiles()
-                and (limit is None or i <= limit) and not (avoid and i in avoid)]
+                and (limit is None or i <= limit) and i not in avoid and i not in dlc]
         # (not 16000 and up outside the template's own thousand: a move there never starts - the game doesn't even
-        # ask for its motion. WWE '12's Octopus Stretch on 17071 dropped both people to stance; on 5198 it played.
-        # Likely the same as 2K15's AA on 17013 and Mankind '13's Mandible Claw on 17038.)
+        # ask for its motion (move_packs.cpp NeverStarts). WWE '12's Octopus Stretch on 17071 dropped both people to
+        # stance; on 5198 it played. 2K15's AA on 17013, Mankind '13's Mandible Claw on 17038, SvR 2009's Hunting RKO
+        # on 16126 - report 20261104-072336.)
         free = [i for i in free if i < 16000 or (near is not None and i // 1000 == near // 1000)]
         if near is not None and any(i // 1000 == near // 1000 for i in free):
-            free = [i for i in free if i // 1000 == near // 1000]
-        elif near is None:   # (a keyframe move: not in 9000-9999 - the game's streamed (YMBs) motions are 9000-9779 by
-            free = [i for i in free if i // 1000 != 9]   # its flag table, and a YMKs move there played as one)
+            return [i for i in free if i // 1000 == near // 1000]
+        return [i for i in free if i // 1000 != 9] if near is None else free
+
+    def free_record(self, name=None, near=None, limit=None, avoid=None):
+        """a record 2011 keeps without motions (a cut move) - free_ids: the one named `name`, else one picked by the
+        name. limit: the highest id that fits (id_limit)"""
+        free = self.free_ids(limit, avoid or (), near)
         if name:
             for i in free:
                 if norm(self.waze[i][1]) == norm(name):
@@ -1018,6 +1159,206 @@ class Game11:
         # the Mod Maker passes --id to keep clear of the packs already installed)
         h = zlib.crc32((name or '').encode('utf-8'))
         return free[h % len(free)], 'a free record picked by the name (%d free; --id to choose)' % len(free)
+
+
+# --------------------------------------------------------------------------- renumber
+
+def read_lines(path):
+    """(lines without their ends, crlf)"""
+    raw = open(path, 'rb').read()
+    return raw.decode('utf-8').replace('\r\n', '\n').split('\n'), b'\r\n' in raw
+
+
+def write_lines(path, lines, crlf):
+    text = '\n'.join(lines)
+    open(path, 'wb').write((text.replace('\n', '\r\n') if crlf else text).encode('utf-8'))
+
+
+def pack_defines(lines):
+    """the move ids a pack.txt's lines give: {id: dict(paths, ymbs, name)} - motion, waze, wazecopy, wazename"""
+    out = {}
+    blank = lambda: dict(paths=set(), ymbs=False, name='')   # noqa: E731
+    for l in lines:
+        f = l.split()
+        if len(f) < 2 or f[0].startswith('#'):
+            continue
+        if f[0] == 'motion' and len(f) >= 8 and f[3].isdigit():
+            d = out.setdefault(int(f[3]), blank())
+            d['paths'].add(f[2])
+            d['ymbs'] |= len(f) >= 9 and len(f[8]) == 40   # (a 20-byte YMBs header: a streamed motion)
+        elif f[0] in ('waze', 'wazecopy') and f[1].isdigit():
+            out.setdefault(int(f[1]), blank())
+        elif f[0] == 'wazename' and f[1].isdigit() and len(f) >= 3:
+            out.setdefault(int(f[1]), blank())['name'] = l.split(None, 2)[2].strip()
+    return out
+
+
+def pack_dir(mod):
+    for d in (os.path.join(mod, 'moves'), mod):
+        if os.path.isfile(os.path.join(d, 'pack.txt')):
+            return d
+    raise BadInput('no moves/pack.txt or pack.txt in %s' % mod)
+
+
+def manifest_get(mod, key, default=''):
+    try:
+        for l in read_lines(os.path.join(mod, 'manifest.txt'))[0]:
+            if l.startswith(key + '='):
+                return l[len(key) + 1:].strip()
+    except OSError:
+        pass
+    return default
+
+
+def renumber(a):
+    """renumber --mod: see the top of the file. -> the report"""
+    import svr10_moves as SM
+    mod = os.path.abspath(a['mod'])
+    pdir = pack_dir(mod)
+    lines, crlf = read_lines(os.path.join(pdir, 'pack.txt'))
+    defs = pack_defines(lines)
+    g11 = Game11(a['pac11'], a.get('work') or os.path.join(HERE, 'work', 'renumber'))
+    mods_root = os.path.abspath(a.get('mods') or os.path.join(os.path.dirname(os.path.abspath(a['pac11'])), 'Mods'))
+    # the ids every other installed pack gives (a new id must be none of them)
+    taken, others = set(defs), []
+    for root, dirs, files in os.walk(mods_root):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('PacOverlay', 'SuperstarOverlay')]
+        if 'pack.txt' in files and os.path.abspath(root) != pdir:
+            taken |= set(pack_defines(read_lines(os.path.join(root, 'pack.txt'))[0]))
+    tops = {}
+    for path, (kind, keys, size) in g11.idx.items():
+        if keys:
+            tops[path] = max(k[0] for k in keys)
+    pmap, kept, rows = {}, [], []
+    for old in sorted(i for i in defs if i >= 16000 and i not in g11.moved):   # (a 2011 motion's own id: the game's)
+        d = defs[old]
+        t = [tops[p] for p in d['paths'] if p in tops]
+        limit = min([15999] + [x - 1 for x in t])   # (id_limit for a mod: its banks' last ids)
+        near = 9000 if d['ymbs'] else None          # (a streamed motion: the 9000s, where the game's are)
+        free = g11.free_ids(limit, taken | set(pmap.values()), near)
+        name = d['name'] or (g11.waze.get(old, (None, ''))[1] if old in g11.waze else '')
+        if not free:
+            kept.append(dict(old=old, name=name, why='no free record below %d' % (limit + 1)))
+            continue
+        same = [i for i in free if name and norm(g11.waze[i][1]) == norm(name)]
+        new = same[0] if same else free[zlib.crc32(('%s %d' % (name, old)).encode('utf-8')) % len(free)]
+        pmap[old] = new
+        rows.append(dict(old=old, new=new, name=name, limit=limit))
+    rep = dict(ok=True, mod=mod, renumbered=rows, kept=kept, changed=[], backup=None, dry=bool(a.get('dry')))
+    if not pmap or a.get('dry'):
+        return rep
+    m = lambda i: pmap.get(i, i)   # noqa: E731
+
+    def num(tok):
+        return str(m(int(tok))) if tok.isdigit() else tok
+    # pack.txt
+    new_lines, motion_files = [], {}
+    for l in lines:
+        f = l.split(' ')
+        if l.startswith('# svr2011 move pack: moves'):
+            head, ids = l.split('moves', 1)
+            l = head + 'moves' + ' '.join(num(x) for x in ids.split(' '))
+        elif f[0] == 'motion' and len(f) >= 8:
+            if f[3].isdigit() and f[5].isdigit() and int(f[5]) < 50:   # (y 50+ tracks don't read as this layout)
+                motion_files[f[7]] = f[2].startswith('MOTP')
+            f[3] = num(f[3])
+            l = ' '.join(f)
+        elif f[0] in ('waze', 'wazename') and len(f) >= 2:
+            f[1] = num(f[1])
+            l = ' '.join(f)
+        elif f[0] == 'wazecopy' and len(f) >= 3:
+            f[1], f[2] = num(f[1]), num(f[2])
+            l = ' '.join(f)
+        elif f[0] in ('exh', 'evt', 'mbd') and len(f) >= 3 and len(f[2]) >= 4:
+            rid = struct.unpack('<H', bytes.fromhex(f[2][:4]))[0]
+            if rid in pmap:
+                f[2] = struct.pack('<H', pmap[rid]).hex() + f[2][4:]
+                l = ' '.join(f)
+        new_lines.append(l)
+    # the motions' follow-ups (the last op 49) naming a renumbered move
+    T = SM.tree_get(SM.entry_get(g11.groups('m.pac'), *SM.path_split('MVMT/CORN/f')[:2]),
+                    SM.path_split('MVMT/CORN/f')[2])[0x10:0x110]
+    fixed_files = {}
+    for fn, motp in sorted(motion_files.items()):
+        fp = os.path.join(pdir, fn)
+        try:
+            data = open(fp, 'rb').read()
+            at, tgt = SM.end_chain(data, T, motp)
+        except (OSError, ValueError, IndexError):
+            continue
+        if at is not None and tgt in pmap:
+            b = bytearray(data)
+            struct.pack_into('<H', b, at, pmap[tgt])
+            fixed_files[fp] = bytes(b)
+    # the moves lists naming them: this mod's, and for a move pack every installed superstar mod's
+    lists = [os.path.join(mod, manifest_get(mod, 'moves', 'moves.txt'))]
+    if pdir == mod:
+        stars = os.path.join(mods_root, 'Superstars')
+        for d in sorted(os.listdir(stars)) if os.path.isdir(stars) else []:
+            sd = os.path.join(stars, d)
+            if os.path.isdir(sd) and not os.path.isfile(os.path.join(sd, 'moves', 'pack.txt')):
+                lists.append(os.path.join(sd, manifest_get(sd, 'moves', 'moves.txt')))
+    list_edits = {}
+    for lp in lists:
+        if not os.path.isfile(lp):
+            continue
+        ls, lcrlf = read_lines(lp)
+        out = []
+        for l in ls:
+            k, eq, v = l.partition('=')
+            out.append(k + '=' + num(v.strip()) if eq and v.strip().isdigit() and int(v.strip()) in pmap else l)
+        if out != ls:
+            list_edits[lp] = (out, lcrlf)
+    # backup, then write
+    import zipfile
+    changed = ([os.path.join(pdir, 'pack.txt'), os.path.join(mod, 'manifest.txt')] + list(fixed_files) + list(list_edits) +
+               [os.path.join(os.path.dirname(lp), 'manifest.txt') for lp in list_edits if os.path.dirname(lp) != mod])
+    bdir = os.path.join(HERE, 'work', 'renumber_backup')
+    os.makedirs(bdir, exist_ok=True)
+    bzip = os.path.join(bdir, '%s_%s.zip' % (os.path.basename(mod), time.strftime('%Y%m%d-%H%M%S')))
+    with zipfile.ZipFile(bzip, 'w', zipfile.ZIP_DEFLATED) as z:
+        for fp in changed:
+            if os.path.isfile(fp):
+                z.write(fp, os.path.relpath(fp, mods_root) if fp.startswith(mods_root) else os.path.basename(fp))
+    write_lines(os.path.join(pdir, 'pack.txt'), new_lines, crlf)
+    for fp, data in fixed_files.items():
+        open(fp, 'wb').write(data)
+    for lp, (out, lcrlf) in list_edits.items():
+        write_lines(lp, out, lcrlf)
+    # the manifests: a new version (lobbies and the launcher see the mod changed) and renumbered=<old>><new> - a save
+    # made with the old version holds the old ids, the game puts the new ones in (superstar_mods.cpp)
+    for md in sorted({mod} | {os.path.dirname(lp) for lp in list_edits}):
+        mp = os.path.join(md, 'manifest.txt')
+        if not os.path.isfile(mp):
+            continue
+        man, mcrlf = read_lines(mp)
+        was, at = {}, None
+        for i, l in enumerate(man):
+            if l.startswith('renumbered='):
+                at = i
+                for t in l[11:].split():
+                    o, _, n = t.partition('>')
+                    if o.isdigit() and n.isdigit():
+                        was[int(o)] = int(n)
+        was = {o: pmap.get(n, n) for o, n in was.items()}   # (renumbered again: the old ids go to the newest)
+        was.update(pmap)
+        line = 'renumbered=' + ' '.join('%d>%d' % kv for kv in sorted(was.items()))
+        if at is None:
+            while man and man[-1] == '':
+                man.pop()
+            man += [line, '']
+        else:
+            man[at] = line
+        if md == mod:
+            for i, l in enumerate(man):
+                if l.startswith('version='):   # (its last number one up: 1.2 -> 1.3, 1.3.1 -> 1.3.2)
+                    v = re.match(r'(.*?)(\d+)(\D*)$', l[8:].strip())
+                    if v:
+                        man[i] = 'version=%s%d%s' % (v[1], int(v[2]) + 1, v[3])
+        write_lines(mp, man, mcrlf)
+    rep.update(changed=[os.path.relpath(fp, mod) if fp.startswith(mod) else fp for fp in changed if os.path.isfile(fp)],
+               backup=bzip)
+    return rep
 
 
 # --------------------------------------------------------------------------- convert
@@ -1142,6 +1483,12 @@ def choose_template(g11, cat, frames, gap=None, allowed=None, paired=True, attac
                     continue
                 if not reversals and 'reversal' in g11.waze[e['id']][1].lower():
                     continue
+                # (no category asked: only a move a one-on-one match has. A move only in a match type's banks - Rumble's
+                # 83xx / 84xx, MOT/RU* + MVMT/RUMB - has no motions in other matches: both wrestlers stand still in it.
+                # A Rumble elimination slot asks for RUMB by name and still gets them)
+                if cats == [''] and not any(p.startswith('MVMT/') and p.split('/')[1].strip() in SINGLES
+                                            for p, kd, ks in g11.banks_of(e['id'])):
+                    continue
                 # (a move from the top rope or onto an opponent seated on the turnbuckle - WAZE situation 9-11, 13,
                 # 14 - only when corner moves are asked for: 2K17's Blue Thunder Bomb, a standing powerbomb, got DDT
                 # 14 (23153, situation 13) through the categories its namesakes voted for)
@@ -1208,9 +1555,12 @@ def coded_category(g, g11, cat0):
     return [c for c, v in votes.most_common() if v * 4 >= top]
 
 
-def choose_submission(g11, frames, phases):
+def choose_submission(g11, frames, phases, heights=None):
     """the 2011 submission (a YMBs move in MVMT/ANAS, attacker and victim at x 0) most like a source hold: the
-    most phases in common, then the closest length"""
+    most phases in common, then - heights (the source victim's root height at the start and in the hold, x 2, model
+    units) - a hold as high (standing) or as low (on the mat) as the source's, then the closest length. 2K15's Kimura
+    Lock goes to the mat: on Bearhug 21007 (a standing hold, its victim at -11 all through) the victim let go and stood
+    while the attacker held on alone on the mat, report 20261104-093125"""
     best = None
     for path, (kind, keys, size) in g11.idx.items():
         if not path.startswith('MVMT/ANAS') or kind != 'YMBs':
@@ -1223,8 +1573,13 @@ def choose_submission(g11, frames, phases):
         for e in bank.entries:
             if e['id'] in pairs and e['x'] == 0 and e['y'] == 0 and usable11(g11.waze, e['id']):
                 score = -10 * len(xs[e['id']] & phases) + abs(e['frames'] - frames) / 10.0
+                th = g11.hold_heights(e['id']) if heights else None
+                if th:   # (the hold's height first: standing holds keep the victim at -7..-11, mat holds at -1..-5)
+                    score += 6.0 * abs(th[1] - heights[1]) + 3.0 * abs(th[0] - heights[0])
                 if best is None or score < best[0]:
                     best = (score, e['id'])
+    if hasattr(g11, 'save_gaps'):
+        g11.save_gaps()
     return best[1] if best else None
 
 
@@ -1481,11 +1836,22 @@ def convert(a, rep):
     # are a dive's hit / miss branches - WWE '12's Shooting Star Press 4 has 30 / 40 / 50 - and 90-92 reversals.)
     src_phases = {int(p) for p, d in by.items() if p.isdigit() and 0 < int(p) < 30 and 0 in d and 1 in d}
     if not tid and vic is not None and {1, 2, 4} <= src_phases:
-        sub = choose_submission(g11, nf, src_phases)
+        # (where the source victim is - at the start and in the hold, phase 2: standing or on the mat - in model units,
+        # as the YMBs templates' root heights)
+        hh = None
+        try:
+            p2 = next(p for p, d in by.items() if p.isdigit() and int(p) == 2 and 1 in d)
+            hk = R0.keys(by[p2][1], max(2, (by[p2][1]['frames'] - 1) // 2))
+            hh = (R0.keys(vic, 2)[0][0][1] / 100.0, sorted(k[0][1] for k in hk)[len(hk) // 2] / 100.0)
+        except (StopIteration, IndexError, KeyError, TypeError):
+            hh = None
+        sub = choose_submission(g11, nf, src_phases, hh)
         if sub:
             tid, cat11 = sub, ['ANAS']
             rep['notes'].append('a submission (source phases %s): a 2011 submission (MVMT/ANAS) as the template' %
-                                ', '.join(str(x) for x in sorted(src_phases)))
+                                ', '.join(str(x) for x in sorted(src_phases)) +
+                                ('; the victim at %.1f at the start, %.1f in the hold - %s %.1f / %.1f' % (
+                                    hh[0], hh[1], g11.waze[sub][1], *(g11.hold_heights(sub) or (0, 0))) if hh else ''))
     # (a reversal as the template only for a reversal: WWE '12's G.T.S. and World's Strongest Slam, filed under
     # its STAT, got Ankle Lock Reversal)
     rev = 'reversal' in (name or '').lower()
@@ -1522,13 +1888,17 @@ def convert(a, rep):
     lim = g11.id_limit(tid)
     if a.get('id'):
         new_id, why = int(a['id']), 'option'
-        # (an id given by a caller - moveset_port's pick - that no template bank can take: picked again under the
-        # limit; it went into no bank and the game never played it - Mankind '13's Mandible Claw on 17038)
-        if (lim is not None and new_id > lim) or (not ymb and new_id // 1000 == 9):
+        # (an id given by a caller - moveset_port's or the Mod Maker's pick - outside free_ids' rule is picked again:
+        # past the template banks' last id it went into no bank (Mankind '13's Mandible Claw on 17038), 16000+ outside
+        # the template's thousand the game never starts it (move_packs.cpp NeverStarts - 2.1.9's Brock Lesnar 2K14 / 2K15
+        # ports, reports 20261104-091730 / -093125), 9000-9999 are streamed motions)
+        if new_id not in g11.free_ids(lim, near=tid if ymb else None):
             nid, why2 = g11.free_record(name, tid if ymb else None, lim, avoid=a.get('_avoid'))
             if nid:
-                rep['warnings'].append("id %d is past what %d's banks take (%s): %d instead" % (
-                    new_id, tid, 'their last id %d' % (lim + 1) if lim is not None and new_id > lim else '9000-9999 are streamed motions', nid))
+                rep['warnings'].append("id %d isn't free for a move on %d's banks (%s): %d instead" % (
+                    new_id, tid, 'a DLC move' if new_id in dlc_move_ids() else
+                    'past their last id' if lim is not None and new_id > lim else
+                    'one the game never starts' if new_id >= 16000 else 'a stock or streamed record', nid))
                 new_id, why = nid, why2
     else:
         new_id, why = g11.free_record(name, tid if ymb else None, lim)
@@ -1631,6 +2001,8 @@ def convert(a, rep):
     ymb_ns, ymb_solved, ymb_built = None, {}, {}
     ymb_shift = None   # (YMBs: the source moved so its attacker starts where the template's does - as the YMKs path)
     landing = {}   # (a dive's drop to the mat: from the keyframe bank, the packed copies too - fall_tail)
+    if any(kd == 'YMBs' for p, kd, ks in g11.banks_of(tid)):   # (the slow limb-IK path: more time - YMBS_EXTRA)
+        extend_deadline()
     for path, kind, ks in g11.banks_of(tid):
         if kind == 'YMBs':   # (taunts, submissions: ADPCM channels with limb IK - ymbs_retarget)
             import ymbs
@@ -1757,6 +2129,15 @@ def convert(a, rep):
                 data, frames = ymks.build_motion(ks_, n + 1, packed=packed), n + 1
             else:
                 data, frames = e['data'], e['frames']   # (props, cameras, reversal branches: the template's)
+                # (a camera, y 50-57, of a phase the source has: timed to the ported length, as the events are - a
+                # template's 99-frame camera on a 144-frame move ended early and held its last shot; Goldberg 2K14's
+                # finishers, report 20261104-103857)
+                body = phase_keys(x)[0] if 50 <= y <= 57 and x < 90 else None
+                if body and frames and len(body) != frames:
+                    try:
+                        data, frames = retime_camera(e['data'], len(body) / float(frames), len(body), tid, new_id), len(body)
+                    except (ValueError, IndexError):
+                        data, frames = e['data'], e['frames']
             fn = 'motions/%d_%d_%d%s.ymk' % (new_id, x, y, '_p' if packed else '')
             open(os.path.join(pd, fn), 'wb').write(data)
             lines.append('motion %s %s %d %d %d %d %s' % (pac, path, new_id, x, y, frames, fn))
@@ -1830,6 +2211,10 @@ def main(argv):
     try:
         if cmd == 'games':
             res = GAMES
+        elif cmd == 'renumber':
+            if not a.get('mod'):
+                raise BadInput('renumber needs --mod <installed mod folder>')
+            res = renumber(a)
         elif cmd in ('list', 'convert'):
             if a.get('game') not in {g['id'] for g in GAMES}:
                 raise BadInput('unknown --game %r (see games)' % a.get('game'))

@@ -24,6 +24,7 @@
 #include "mod_check.h"
 #include "tool_run.h"
 #include "../launcher/report_send.h"
+#include "../launcher/report_urls.h"
 #include "../launcher/update_log.h"
 #include "../launcher/report_receipts.h"
 
@@ -130,7 +131,8 @@ std::string SystemText() {
   t += "settings: text size " + std::to_string(g_settings.font) + " px, UI scale " + scale + ", log " +
        (g_settings.log_open ? "open" : "closed") + ", Bink 2 tool " +
        (g_settings.bink2_tool.empty() ? std::string("(look for one)") : Utf8(g_settings.bink2_tool)) + "\n";
-  for (const auto& d : g_settings.my_discs) t += "my game discs: " + d.key + " (" + d.id + ") " + Utf8(d.path) + "\n";
+  for (const auto& d : g_settings.my_discs)
+    t += "my game discs: " + d.key + " (" + d.id + ") " + Utf8(d.path) + (d.dlc.empty() ? "" : ", DLC " + Utf8(d.dlc)) + "\n";
   if (g_settings.my_discs.empty()) t += "my game discs: (none set)\n";
   for (const auto& r : g_settings.recent) t += "settings: recent project " + Utf8(r) + "\n";
   return t;
@@ -828,15 +830,20 @@ void Window() {
     ImGui::Spacing();
     const bool said = g_what[0] != 0;
     ImGui::BeginDisabled(!said);
+    static bool has_url = false;  // (the server's rule too: no web addresses)
     if (ImGui::Button("Send report")) {
-      g_description = Describe();
-      g_sent_done = false;
-      StartReport(g_description, false, true);
+      has_url = report_text_has_url(g_what) || report_text_has_url(g_before) || report_text_has_url(g_contact);
+      if (!has_url) {
+        g_description = Describe();
+        g_sent_done = false;
+        StartReport(g_description, false, true);
+      }
     }
     ImGui::EndDisabled();
     if (!said && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Say what happened first.");
     ImGui::SameLine();
-    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Cancel")) has_url = false, ImGui::CloseCurrentPopup();
+    if (has_url) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1), "%s", REPORT_NO_URLS);
   } else if (g_sent_done && g_sent.id[0]) {
     ImGui::TextWrapped("Your report reached us. Report id:  %s", g_sent.id);
     if (g_sent.seen_before > 0)

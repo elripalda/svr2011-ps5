@@ -47,6 +47,7 @@
 #include "weapons_page.h"
 #include "discord_presence.h"
 #include "online.h"
+#include "title_mods.h"
 #include "caw_limits.h"
 #include "match_record.h"
 #include "match_types.h"
@@ -376,6 +377,10 @@ std::string GameString(PPCContext& ctx, uint8_t* base, uint32_t id) { return Lab
 REX_EXTERN(__imp__sub_82153EF8);
 REX_HOOK_RAW(sub_82153EF8) {
   if (!g_string_manager) g_string_manager = ctx.r3.u32;  // (for the log's menu names)
+  if (const uint32_t s = svr2011::TitleModString(ctx, base)) {  // (title mods' names: title_mods.h)
+    ctx.r3.u64 = s;
+    return;
+  }
   if (const uint32_t s = svr2011::OnlineString(ctx.r4.u32)) {  // (online.h)
     ctx.r3.u64 = s;
     return;
@@ -581,8 +586,12 @@ void ArmWatch(uint8_t* base);
 // the matching constants; sub_826E1D28 restores it). Never done: the game's
 // world stays at its 60 Hz steps (frame_rate.h); with the setting off the
 // entrance is drawn at 30 frames a second instead, as the original.
+// "entrances over" is logged once per entrances (or match) - sub_826E1D28 also runs every frame in Story
+// Designer's scene editor (thousands of lines in a report's log).
+std::atomic<bool> g_entrances_over_told{false};
 REX_EXTERN(__imp__sub_826E1C88);
 REX_HOOK_RAW(sub_826E1C88) {
+  g_entrances_over_told = false;
   svr2011::TouchGameInMatch(true);  // entrances: a match (the touch controller's MATCH layout)
   svr2011::SetFrameRateInMatch(true);  // (the chosen frame rate)
   svr2011::native::SetMatchScene(true);  // (wide screens: full width)
@@ -618,6 +627,7 @@ REX_HOOK_RAW(sub_823EEB98) {
     svr2011::SetFrameRateInMatch(true);  // (the chosen frame rate)
     svr2011::MysteryOpponentReveal("the match runs");  // (mystery_opponent.h)
   });
+  g_entrances_over_told = false;
   svr2011::MatchRecordMatchLoads();  // (the match's rand() seed: match_record.h)
   svr2011::NoteMatchLoading(true);    // (model_mem.cpp's load watch)
   svr2011::ArenaPlaysAsAtLoad(base);  // (a custom arena on another arena's tile: its arena now - arena_mods.h)
@@ -627,7 +637,7 @@ REX_HOOK_RAW(sub_823EEB98) {
 // The entrances' end: sub_826E1D28 restores the frame rate - the match starts.
 REX_EXTERN(__imp__sub_826E1D28);
 REX_HOOK_RAW(sub_826E1D28) {
-  REXLOG_INFO("[svr2011] entrances over");
+  if (!g_entrances_over_told.exchange(true)) REXLOG_INFO("[svr2011] entrances over");
 #if SVR2011_DEBUG_SUITE
   svr2011::dbg::OnEntrances(false);
 #endif

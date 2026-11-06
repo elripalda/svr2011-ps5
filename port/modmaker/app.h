@@ -215,6 +215,13 @@ struct StarInfo {
 // Loaded on first use (quick).
 const std::vector<StarInfo>& Stars();
 const StarInfo* StarById(int id);
+// The installed DLC's superstars (ids 51-58: a model pac pac\ch\ch<id>_dlcNN.pac in a package the game unpacked,
+// <game>\UserData\0000000000000000\5451085D\00000002\<package>; names from its chEtc.pac, "(DLC)" added), sorted by
+// name - attire mods can take them (the Attires page). DlcModelPacs: a superstar's model pacs in those packages (a
+// DLC superstar's own; DLC attires of disc superstars, e.g. ch145_dlc02.pac). StarOrDlcById: either list.
+const std::vector<StarInfo>& DlcStars();
+std::vector<std::filesystem::path> DlcModelPacs(int id);
+const StarInfo* StarOrDlcById(int id);
 // A superstar's 7 ratings (record +0..+6), 74 if unknown.
 int StarRating(int id, int k);
 // A superstar's body scale (record +28, 4.12 fixed point: the game stretches the
@@ -336,7 +343,7 @@ struct ProjectIn {
 
 // The project's type is its page. Pages the rail shows.
 enum class PageId { kArena, kEditor, kBackstage, kStar, kMoves, kSigns, kBackgrounds, kMedia, kMatch, kOther, kCaw, kAssets, kAnims, kIcons, kHelp, kPort, kAttire, kInstalled, kDiscs, kPortEntrance, kPortMoves, kPortTaunts,
-                    kStarPort, kArenaPort, kMovesPort, kBelts, kThreads, kCount };  // (the last four: "From another game" / belt tabs)
+                    kStarPort, kArenaPort, kMovesPort, kBelts, kThreads, kTitle, kCount };  // (the last four: "From another game" / belt tabs)
 // What only a project holds (materials, the FBX steps, Reduce detail, gear picks, an arena's camera...) for a mod:
 // the page's project keys without its files, every absolute path cut to its file name (nothing of the author's
 // folders goes out with a shared mod). UI thread (it reads the page). "" for a page with no project keys.
@@ -390,6 +397,7 @@ struct Settings {
   struct MyDisc {
     std::string key, id;
     std::wstring path;
+    std::wstring dlc;  // the game's DLC packages: a folder (superstar_port --dlc), "" none
   };
   std::vector<MyDisc> my_discs;
   bool discs_seeded = false;  // the old disc folders were searched once to fill My game discs
@@ -483,6 +491,7 @@ namespace signs_page { extern PageHooks hooks; void TestStart(const std::vector<
                        std::vector<ZipEntry> PackFiles(const std::string& id, const std::string& name, const std::string& author,
                                                        const std::vector<std::pair<std::string, Image>>& signs);
                        bool InstallPack(const std::string& id, const std::vector<ZipEntry>& files); }
+namespace title_page { extern PageHooks hooks; void TestStart(const std::wstring& spec, const std::wstring& save); }
 namespace backgrounds_page { extern PageHooks hooks; void TestStart(const std::vector<std::wstring>& files, const std::wstring& save); }
 namespace media_page { extern PageHooks hooks; void SetTab(int tab); int Tab();  // 0 videos, 1 menus & renders, 2 audio
                        void TestStart(int arena, const std::wstring& video,

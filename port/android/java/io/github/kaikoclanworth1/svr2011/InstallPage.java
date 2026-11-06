@@ -75,7 +75,8 @@ final class InstallPage {
     }
 
     void refresh() {
-        state_.setText(InstallActivity.installed()
+        String incomplete = InstallActivity.incompleteText();
+        state_.setText(incomplete != null ? incomplete : InstallActivity.installed()
             ? "Installed in games/" + InstallActivity.kFolderName + " (" + FileOps.human(free()) + " free)."
             : "Not installed yet.");
     }
@@ -383,6 +384,10 @@ final class InstallPage {
                         out.mkdirs();
                         continue;
                     }
+                    if (InstallActivity.keptIfThere(entry.getName()) && out.exists()) {
+                        done += Math.max(0, entry.getSize());
+                        continue;
+                    }
                     out.getParentFile().mkdirs();
                     try (InputStream in = zip.getInputStream(entry); OutputStream os = new FileOutputStream(out)) {
                         int n;
@@ -395,7 +400,7 @@ final class InstallPage {
                 }
             }
             Shaders.install(a_);
-            return "Installed from the package. Press Play.";
+            return "Installed from the package. Your saves and mods were kept. Press Play.";
         } catch (Exception e) {
             return "Installing failed: " + e.getMessage();
         } finally {

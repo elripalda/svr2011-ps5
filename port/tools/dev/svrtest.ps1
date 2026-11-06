@@ -17,6 +17,7 @@
 #         --fresh (the user data may have no save: a first-start test - else svrtest refuses one without
 #         Saves\SaveData.dat, the game would sit in its first-time screens)
 #         --arg "<game option>" (more of the game's --options, repeatable)
+#         --keep-overlay (Mods\PacOverlay as the last run left it: a start that finds the overlay up to date)
 #
 # Each run: refuses when the player's game runs or 4 test games already do (any chat); refreshes the private
 # game folder runs\svrtest\game (the exe + DLLs copied; pac's own files private copies - the game patches some at
@@ -56,7 +57,7 @@ public static class SvrTestWin {
 
 # ---- options
 $o = @{ p = @{}; exe = "release"; backend = ""; mods = "none"; perf = ""; loglevel = "info"; name = ""; keep = $false; args = @()
-        attire = ""; arena = ""; rule = ""; entrances = $false; shot = @(); every = ""; until = ""; quit = ""; userdata = ""; target = ""; state = @(); fast = ""; boot = $false; cpu = ""; fresh = $false; slot = "" }
+        attire = ""; arena = ""; rule = ""; entrances = $false; shot = @(); every = ""; until = ""; quit = ""; userdata = ""; target = ""; state = @(); fast = ""; boot = $false; cpu = ""; fresh = $false; slot = ""; slots = ""; keyfile = "" }
 for ($i = 0; $i -lt $Rest.Count; $i++) {
     $a = $Rest[$i]; $v = if ($i + 1 -lt $Rest.Count) { $Rest[$i + 1] } else { "" }
     switch -regex ($a) {
@@ -78,11 +79,14 @@ for ($i = 0; $i -lt $Rest.Count; $i++) {
         '^--backend$' { $o.backend = $v; $i++; continue }
         '^--mods$' { $o.mods = $v; $i++; continue }
         '^--userdata$' { $o.userdata = $v; $i++; continue }
+        '^--slots$' { $o.slots = $v; $i++; continue }
+        '^--keys$' { $o.keyfile = $v; $i++; continue }
         '^--slot$' { $o.slot = $v; $i++; continue }  # (a game folder of its own: runs\svrtest\game<n> - runs side by side)
         '^--perf$' { $o.perf = $v; $i++; continue }
         '^--log-level$' { $o.loglevel = $v; $i++; continue }
         '^--name$' { $o.name = $v; $i++; continue }
         '^--keep$' { $o.keep = $true; continue }
+        '^--keep-overlay$' { $o.keepoverlay = $true; continue }
         '^--arg$' { $o.args += $v; $i++; continue }
         default { if (-not $o.target -and $a -notlike "--*") { $o.target = $a } else { throw "svrtest: unknown option $a" } }
     }
@@ -155,8 +159,8 @@ foreach ($f in $exeName, "rexruntime.dll", "rexgpu-xenos.dll") {
     }
 }
 # its Mods: only --mods (a mod folder is placed by its manifest's type)
-$kinds = @{ superstar = "Superstars"; attire = "Attires"; arena = "Arenas"; moves = "Moves"; backstage = "Backstage"; signs = "Signs"; media = "Media"; backgrounds = "Backgrounds"; matchtype = "MatchTypes"; weapon = "Weapons" }
-Get-ChildItem (Join-Path $game "Mods") -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".convert" } | Remove-Item -Recurse -Force
+$kinds = @{ superstar = "Superstars"; attire = "Attires"; arena = "Arenas"; moves = "Moves"; backstage = "Backstage"; signs = "Signs"; media = "Media"; backgrounds = "Backgrounds"; matchtype = "MatchTypes"; weapon = "Weapons"; title = "Titles" }
+Get-ChildItem (Join-Path $game "Mods") -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".convert" -and -not ($o.keepoverlay -and $_.Name -eq "PacOverlay") } | Remove-Item -Recurse -Force
 if ($o.mods -and $o.mods -ne "none") {
     foreach ($m in $o.mods -split ',') {
         $man = Join-Path $m "manifest.txt"
@@ -166,6 +170,16 @@ if ($o.mods -and $o.mods -ne "none") {
         New-Item -ItemType Directory -Force (Join-Path $game "Mods\$kind") | Out-Null
         Copy-Item -Recurse $m (Join-Path $game "Mods\$kind\$(Split-Path $m -Leaf)")
     }
+}
+# --slots <file>: its superstar mods' ids (Mods\Superstars\slots.txt, "<folder><TAB><id>" a line) - e.g. a mod on a DLC id
+if ($o.slots) {
+    New-Item -ItemType Directory -Force (Join-Path $game "Mods\Superstars") | Out-Null
+    Copy-Item $o.slots (Join-Path $game "Mods\Superstars\slots.txt")
+}
+# --keys <file>: its superstar mods' keys (Mods\Superstars\keys.txt, "<folder><TAB><key>" a line) - e.g. a mod already on key 512
+if ($o.keyfile) {
+    New-Item -ItemType Directory -Force (Join-Path $game "Mods\Superstars") | Out-Null
+    Copy-Item $o.keyfile (Join-Path $game "Mods\Superstars\keys.txt")
 }
 # (prepare: only the game folder, for svrtest_lan.ps1 - its last output line)
 if ($Command -eq "prepare") { $game; exit 0 }

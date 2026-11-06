@@ -34,6 +34,7 @@
  *                        --clean-save <saves folder> <Mods\Superstars> [--with-off] [--apply]   (save cleaner)
  *                        --adb-install <game folder>   (Install to phone over USB, no window)
  *                        --setup-check <game folder>   (the Setup tab's rows, no window)
+ *                        --nat-check <game folder>   (the Online tab's connection check, no window)
  *                        --setup-install <game folder> <python|ffmpeg|all> --yes   (its downloads, no window)
  */
 #ifndef WIN32_LEAN_AND_MEAN
@@ -64,12 +65,15 @@
 #include <wchar.h>
 
 #include "apk_package.h"
+#include "report_urls.h"
 #include "mods_tab.h"
 #include "report_receipts.h"
 #include "reports_tab.h"
+#include "suggestions_tab.h"
 #include "music_tab.h"
 #include "texpacks_tab.h"
 #include "setup_tab.h"
+#include "nat_check.h"
 #include "discover_tab.h"
 #include "test_run.h"
 static void setup_go_install(void);
@@ -126,7 +130,7 @@ static void setup_console_progress(int permille, const WCHAR *text);
 
 /* ── state ─────────────────────────────────────────────────────────────── */
 
-enum { TAB_PLAY, TAB_SETTINGS, TAB_ONLINE, TAB_INSTALL, TAB_DLC, TAB_SAVES, TAB_PAINT, TAB_MOVIES, TAB_ANDROID, TAB_MODS, TAB_MUSIC, TAB_ROSTER, TAB_TEXPACKS, TAB_SETUP, TAB_DISCOVER, TAB_TOOLS, TAB_REPORTS, TAB_COUNT };
+enum { TAB_PLAY, TAB_SETTINGS, TAB_ONLINE, TAB_INSTALL, TAB_DLC, TAB_SAVES, TAB_PAINT, TAB_MOVIES, TAB_ANDROID, TAB_MODS, TAB_MUSIC, TAB_ROSTER, TAB_TEXPACKS, TAB_SETUP, TAB_DISCOVER, TAB_TOOLS, TAB_REPORTS, TAB_SUGGESTIONS, TAB_COUNT };
 #define ID_MODS_BASE 900  /* the Mods tab's controls (mods_tab.c) */
 #define ID_MUSIC_BASE 950 /* the Music tab's (music_tab.c) */
 #define ID_ROSTER_BASE 1000 /* the Roster tab's (roster_tab.c) */
@@ -134,6 +138,7 @@ enum { TAB_PLAY, TAB_SETTINGS, TAB_ONLINE, TAB_INSTALL, TAB_DLC, TAB_SAVES, TAB_
 #define ID_SETUP_BASE 1200 /* the Setup tab's (setup_tab.c) */
 #define ID_DISCOVER_BASE 1300 /* Mods -> Discovery's (discover_tab.c) */
 #define ID_REPORTS_BASE 1400 /* the Reports tab's (reports_tab.c) */
+#define ID_SUGGEST_BASE 1450 /* the Suggestions tab's (suggestions_tab.c) */
 
 enum {
     ID_TAB = 100,
@@ -148,6 +153,7 @@ enum {
     ID_ON_ENABLE, ID_ON_NAME, ID_ON_SERVER, ID_ON_SERVER_KIND, ID_ON_SAVE, ID_ON_STATUS,
     ID_ON_PASSWORD, ID_ON_SIGNIN, ID_ON_REGISTER, ID_ON_SIGNOUT, ID_ON_ACCOUNT, ID_ON_SERVER_LABEL, ID_ON_PEERS, ID_ON_ROUTE,
     ID_FR_LIST, ID_FR_NAME, ID_FR_ADD, ID_FR_REMOVE, ID_FR_STATUS, ID_FR_GROUP, ID_FR_INFO,
+    ID_ON_NAT_CHECK, ID_ON_NAT_GROUP, ID_ON_NAT_TEXT,
     ID_ON_SHARE, ID_ON_MODS_FOLD, ID_ON_MODS_GROUP, ID_ON_UP_KBS, ID_ON_UP_PEERS, ID_ON_MOD_MB, ID_ON_MODS_MB,
     ID_ON_MODS_L1, ID_ON_MODS_L2, ID_ON_MODS_L3, ID_ON_MODS_L4, ID_ON_MODS_INFO,
     ID_ON_L_NAME, ID_ON_L_PASS, ID_ON_L_CODE, ID_ON_CODE, ID_ON_STEP, ID_ON_BACK, ID_ON_FORGOT, ID_ON_INFO,
@@ -187,6 +193,7 @@ enum {
 #define WM_APP_UPD_FINISHED (WM_APP + 13) /* wParam 1 ok, lParam heap error text */
 #define WM_APP_VERIFY   (WM_APP + 12)    /* wParam permille, or 1001: done (s_verify) */
 #define WM_APP_FRIENDS  (WM_APP + 11)    /* wParam HTTP status (0: no answer), lParam heap char* answer */
+#define WM_APP_NATCHECK (WM_APP + 16)    /* the connection check is done (s_nat_result) */
 #define WM_APP_SIZE     (WM_APP + 14)    /* the Play page's game size / file check is in (size_thread) */
 #define WM_APP_BUNDLED  (WM_APP + 15)    /* wParam n << 16 | total installing, or 0xFFFFFFFF: done (bundled_thread) */
 #define HERO_TIMER      0x5F02           /* the Play page's picture scrolling */
@@ -502,6 +509,20 @@ static int is_game_folder(const WCHAR *dir)
 {
     WCHAR a[MAX_PATH];
     return dir[0] && join(a, dir, L"default.xex") && file_exists(a);
+}
+
+/* The first file every install has that the game folder lacks, or NULL. default.xex alone isn't enough: a folder with
+   it and none of the disc's files could press Play (2.1.9 report 181cb0, Android). Install again keeps what is there. */
+static const WCHAR *install_missing(const WCHAR *dir)
+{
+    static const WCHAR *must[] = { L"plist360.arc", L"pac\\_startup.pac", L"pac\\m.pac", L"pac\\plist360.h",
+                                   L"sound\\System.pck" };
+    WCHAR a[MAX_PATH];
+    int i;
+    for (i = 0; i < (int)(sizeof must / sizeof must[0]); i++)
+        if (!join(a, dir, must[i]) || !file_exists(a))
+            return must[i];
+    return NULL;
 }
 
 static int has_program(const WCHAR *dir)
@@ -974,6 +995,7 @@ static DWORD WINAPI bundled_thread(LPVOID arg)
 }
 
 static void refresh_play(void);
+static void show_tab(int t);
 
 static void start_bundled(void)
 {
@@ -1437,6 +1459,7 @@ static int toml_get(const char *key, char *out, size_t n);
    (<game>\logs\svr2011_*.log, newest first). s_route_kind: 1 direct, 2 relay - direct failed, 3 relay - the
    server's choice, 0 none (no line shown). */
 static int s_route_kind;
+static int s_route_mapped;  /* (the last "router port mapping" line in the logs: 1 it opened the port, -1 not, 0 none) */
 static void online_route_show(void)
 {
     typedef struct { WCHAR name[MAX_PATH]; ULONGLONG t; } Log;
@@ -1444,8 +1467,9 @@ static void online_route_show(void)
     WCHAR pat[MAX_PATH], path[MAX_PATH], t[400];
     WIN32_FIND_DATAW fd;
     HANDLE h;
-    int n = 0, i, k;
+    int n = 0, i, k, mapping = 0;
     s_route_kind = 0;
+    s_route_mapped = 0;
     swprintf_s(pat, MAX_PATH, L"%s\\logs\\svr2011_*.log", s_game_dir);
     h = s_game_dir[0] ? FindFirstFileW(pat, &fd) : INVALID_HANDLE_VALUE;
     if (h != INVALID_HANDLE_VALUE) {
@@ -1461,7 +1485,7 @@ static void online_route_show(void)
     for (i = 0; i < n; i++)   /* (newest first) */
         for (k = i + 1; k < n; k++)
             if (logs[k].t > logs[i].t) { Log x = logs[i]; logs[i] = logs[k]; logs[k] = x; }
-    for (i = 0; i < n && i < 6 && !s_route_kind; i++) {
+    for (i = 0; i < n && i < 6 && (!s_route_kind || !mapping); i++) {
         FILE *f = NULL;
         char *buf;
         long size;
@@ -1478,7 +1502,14 @@ static void online_route_show(void)
                 const char *e = strchr(p, '\n'), *pl = strstr(p, " plays ");
                 if (pl && (!e || pl < e)) last = pl + 7;
             }
-            if (last)
+            if (!mapping)
+                for (p = buf; (p = strstr(p, "p2p: router port mapping")) != NULL; p++) {
+                    mapping = 1;
+                    /* (" UDP <port> -> ...": it opened; ": none", ": UPnP ... refused"; "removed" at the game's end) */
+                    if (!strncmp(p + 24, " UDP ", 5)) s_route_mapped = 1;
+                    else if (strncmp(p + 24, " removed", 8)) s_route_mapped = -1;
+                }
+            if (last && !s_route_kind)
                 s_route_kind = !strncmp(last, "direct", 6) ? 1 : strstr(last, "(set so)") && (!strchr(last, '\n') ||
                                strstr(last, "(set so)") < strchr(last, '\n')) ? 3 : 2;
             free(buf);
@@ -2833,6 +2864,8 @@ static void refresh_play(void)
         t = L"The game folder does not exist. Choose another one, or install the game on the Install tab.";
     else if (!is_game_folder(s_game_dir))
         t = L"Game files not installed \x2014 use the Install tab.";
+    else if (install_missing(s_game_dir))
+        t = L"Your install isn't complete - install again";  /* (the status line's room; the start opens the Install tab) */
     else if (!has_program(s_game_dir))
         t = GAME_EXE L" is missing from the game folder \x2014 copy the port's program files into it, "
             L"or install again from the Install tab.";
@@ -2931,6 +2964,11 @@ static void play_with(int no_mods)
     }
     if (s_busy) {  /* (an install or repair is running: Play is disabled then - a click that got through says why) */
         set_text(ID_PLAY_STATUS, L"An install is running - Play when it's done.");
+        return;
+    }
+    if (is_game_folder(s_game_dir) && install_missing(s_game_dir)) {
+        refresh_play();
+        show_tab(TAB_INSTALL);
         return;
     }
     if (!is_game_folder(s_game_dir) || !has_program(s_game_dir)) {
@@ -3085,7 +3123,7 @@ static const struct { int tab; WCHAR icon; const WCHAR *name; } k_nav[] = {
     /* (below the line) */
     { TAB_ONLINE, 0xE774, L"Online" },      { TAB_MUSIC, 0xE8D6, L"Music" },
     { TAB_MOVIES, 0xE714, L"Movies" },      { TAB_PAINT, 0xE790, L"Paint Tool" },
-    { TAB_REPORTS, 0xED15, L"Reports" },
+    { TAB_REPORTS, 0xED15, L"Reports" },    { TAB_SUGGESTIONS, 0xEA80, L"Suggestions" },
 };
 
 /* Mods, in three tabs: the installed mods (TAB_MODS), Discovery, Texture packs - a tab bar on top of each
@@ -3137,11 +3175,12 @@ static RECT nav_rect(int k)
 typedef struct { int tab, x, y, w, h, id; WCHAR title[64]; } Card;
 static Card s_cards[96];
 static int  s_ncards;
-/* The Online tab's "Mod sharing" fold: its card and rows in the Friends card's place while open. */
+/* The Online tab's folds: their cards and rows in the Friends card's place while open (1 Mod sharing, 2 Connection). */
 static int s_mods_fold;
 static int card_hidden(const Card *cd)
 {
-    return (cd->id == ID_FR_GROUP && s_mods_fold) || (cd->id == ID_ON_MODS_GROUP && !s_mods_fold);
+    return (cd->id == ID_FR_GROUP && s_mods_fold) || (cd->id == ID_ON_MODS_GROUP && s_mods_fold != 1) ||
+           (cd->id == ID_ON_NAT_GROUP && s_mods_fold != 2);
 }
 /* Push buttons, drawn by the window (rounded; red for the main actions). */
 typedef struct { HWND h; int primary; } Btn;
@@ -3363,6 +3402,55 @@ static void pt_refresh(void);
 static void mv_refresh(void);
 static volatile LONG s_up_busy;
 
+/* The Online tab's connection check (nat_check.h), off the window's thread. */
+static NatCheck s_nat_result;
+static volatile LONG s_nat_busy;
+static HWND s_nat_notify;
+static int nat_check_port(void)
+{
+    char v[16] = "";
+    const int port = toml_get("p2p_port", v, sizeof v) && v[0] ? atoi(v) : 36000;
+    return port > 0 && port < 65536 ? port : 36000;
+}
+static void nat_check_do(void)
+{
+    char stun[128] = "";
+    WCHAR exe[MAX_PATH] = L"";
+    if (!toml_get("p2p_stun", stun, sizeof stun)) stun[0] = 0;
+    join(exe, s_game_dir, GAME_EXE);
+    nat_check_run(stun, nat_check_port(), exe, &s_nat_result);
+}
+static DWORD WINAPI nat_check_thread(void *unused)
+{
+    (void)unused;
+    nat_check_do();
+    PostMessageW(s_nat_notify, WM_APP_NATCHECK, 0, 0);
+    return 0;
+}
+static void nat_check_start(void)
+{
+    HANDLE t;
+    if (InterlockedCompareExchange(&s_nat_busy, 1, 0)) return;
+    set_text(ID_ON_NAT_TEXT, L"Checking your connection\x2026");
+    EnableWindow(ctl(ID_ON_NAT_CHECK), FALSE);
+    s_nat_notify = s_wnd;
+    t = CreateThread(NULL, 0, nat_check_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    else {
+        InterlockedExchange(&s_nat_busy, 0);
+        EnableWindow(ctl(ID_ON_NAT_CHECK), TRUE);
+    }
+}
+static void nat_check_show(void)
+{
+    WCHAR t[1400];
+    online_route_show();  /* (s_route_mapped: from the logs, as they are now) */
+    nat_check_text(&s_nat_result, nat_check_port(), s_route_mapped, t, 1400);
+    set_text(ID_ON_NAT_TEXT, t);
+    EnableWindow(ctl(ID_ON_NAT_CHECK), TRUE);
+    InterlockedExchange(&s_nat_busy, 0);
+}
+
 static void online_mods_fold_apply(void)
 {
     static const int friends[] = { ID_FR_LIST, ID_FR_NAME, ID_FR_ADD, ID_FR_REMOVE, ID_FR_INFO, ID_FR_STATUS };
@@ -3373,7 +3461,9 @@ static void online_mods_fold_apply(void)
     for (i = 0; i < sizeof friends / sizeof friends[0]; i++)
         ShowWindow(ctl(friends[i]), shown && !s_mods_fold ? SW_SHOW : SW_HIDE);
     for (i = 0; i < sizeof mods / sizeof mods[0]; i++)
-        ShowWindow(ctl(mods[i]), shown && s_mods_fold ? SW_SHOW : SW_HIDE);
+        ShowWindow(ctl(mods[i]), shown && s_mods_fold == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(ctl(ID_ON_NAT_TEXT), shown && s_mods_fold == 2 ? SW_SHOW : SW_HIDE);
+    SetWindowTextW(ctl(ID_ON_NAT_CHECK), s_mods_fold == 2 ? L"Check again" : L"Connection \x25B8");
     SetWindowTextW(ctl(ID_ON_MODS_FOLD), s_mods_fold ? L"Friends \x25B8" : L"Mod sharing \x25B8");
     InvalidateRect(s_wnd, NULL, TRUE);  /* (the cards: drawn by the window) */
 }
@@ -3426,6 +3516,8 @@ static void show_tab(int t)
         discover_show(s_game_dir);
     if (t == TAB_REPORTS)
         reports_show(s_game_dir);
+    if (t == TAB_SUGGESTIONS)
+        suggestions_show(s_game_dir);
     if (t == TAB_SETUP || t == TAB_TOOLS)
         setup_show(s_game_dir, s_launcher_dir);
     if (t == TAB_PLAY && !s_up_busy)
@@ -3963,6 +4055,12 @@ static LRESULT CALLBACK rep_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
                 SetFocus(GetDlgItem(w, REP_WHAT));
                 return 0;
             }
+            if (report_text_has_url(s_rep_what) || report_text_has_url(s_rep_before) || report_text_has_url(s_rep_contact)) {
+                SetDlgItemTextW(w, REP_STATUS, REPORT_NO_URLS_W);
+                SetFocus(GetDlgItem(w, report_text_has_url(s_rep_what) ? REP_WHAT
+                                       : report_text_has_url(s_rep_before) ? REP_BEFORE : REP_CONTACT));
+                return 0;
+            }
             /* (the match goes as its own part: not in the zip; a try again makes it again) */
             rep_drop_zip();
             if (!report_make_match(s_game_dir, PORT_VERSION, utf8, NULL, IsDlgButtonChecked(w, REP_INCSAVE) == BST_CHECKED,
@@ -4259,7 +4357,7 @@ static void build_ui(void)
     HWND h;
     WCHAR v[64];
     int i;
-    static const WCHAR *names[TAB_COUNT] = { L"Play", L"Settings", L"Online", L"Install", L"DLC", L"Saves", L"Paint Tool", L"Movies", L"Android Install", L"Mods", L"Music", L"Roster", L"Texture packs", L"Setup", L"Discovery", L"Tools", L"Reports" };
+    static const WCHAR *names[TAB_COUNT] = { L"Play", L"Settings", L"Online", L"Install", L"DLC", L"Saves", L"Paint Tool", L"Movies", L"Android Install", L"Mods", L"Music", L"Roster", L"Texture packs", L"Setup", L"Discovery", L"Tools", L"Reports", L"Suggestions" };
 
     /* The tabs (never shown: the sidebar picks them; --capture and show_tab
        still use its selection). */
@@ -4402,7 +4500,8 @@ static void build_ui(void)
 
     /* Online */
     /* the last online match's connection (online_route_show: the game's log) */
-    add(TAB_ONLINE, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0, 16, 560, 34, ID_ON_ROUTE);
+    add(TAB_ONLINE, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0, 16, 440, 34, ID_ON_ROUTE);
+    add(TAB_ONLINE, L"Button", L"Connection \x25B8", BS_PUSHBUTTON | WS_TABSTOP, X0 + 452, 16, 108, 26, ID_ON_NAT_CHECK);
     add(TAB_ONLINE, L"Static", L"Community Creations and online matches (Player Match, Royal Rumble) through a "
                                L"Community Creations server - the original servers closed in 2014.",
         SS_LEFT, X0, 54, 560, 36, 0);
@@ -4458,6 +4557,8 @@ static void build_ui(void)
     add(TAB_ONLINE, L"Static", L"Online: in the game's ONLINE menus. Friends' matches show in the game's searches.",
         SS_LEFT | SS_NOPREFIX, X0 + 380, 414, 166, 60, ID_FR_INFO);
     /* Mod sharing (the fold: in the Friends box's place while open) - the game's online mod settings */
+    add(TAB_ONLINE, L"Button", L"Your connection", BS_GROUPBOX, X0, 328, 560, 202, ID_ON_NAT_GROUP);
+    add(TAB_ONLINE, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0 + 16, 352, 530, 142, ID_ON_NAT_TEXT);
     add(TAB_ONLINE, L"Button", L"Mods in online sessions", BS_GROUPBOX, X0, 328, 560, 202, ID_ON_MODS_GROUP);
     add(TAB_ONLINE, L"Static", L"Upload speed (KB/s, all joiners)", SS_LEFT, X0 + 16, 354, 250, 20, ID_ON_MODS_L1);
     h = add(TAB_ONLINE, L"Edit", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X0 + 280, 350, 90, 24, ID_ON_UP_KBS);
@@ -4647,6 +4748,8 @@ static void build_ui(void)
     discover_build(s_wnd, add, TAB_DISCOVER, ID_DISCOVER_BASE, discover_server, discover_account);
     receipts_set_guard(test_run_refuses_url);   /* (a test run: never a server off this PC) */
     reports_build(s_wnd, add, TAB_REPORTS, ID_REPORTS_BASE, discover_server, reports_token);
+    suggestions_build(s_wnd, add, TAB_SUGGESTIONS, ID_SUGGEST_BASE, discover_server, reports_token, test_run_refuses_url,
+                      PORT_VERSION);
     discover_set_ini(s_launcher_ini);
     /* Setup: what's needed, found or missing; the Mod Maker's tools (setup_tab.c) */
     setup_build(s_wnd, add, TAB_SETUP, TAB_TOOLS, ID_SETUP_BASE, setup_go_install);
@@ -8886,7 +8989,7 @@ static void paint_window(HDC dc)
     static const WCHAR *const titles[TAB_COUNT] = { L"Play", L"Settings", L"Online", L"Setup", L"Setup",
                                                     L"Saves", L"Paint Tool", L"Movies", L"Setup", L"Mods",
                                                     L"Music", L"Roster: sort categories", L"Mods",
-                                                    L"Setup", L"Mods", L"Setup", L"Reports" };
+                                                    L"Setup", L"Mods", L"Setup", L"Reports", L"Suggestions" };
     RECT cl, r;
     HBRUSH sb = CreateSolidBrush(C_SIDEBAR);
     HGDIOBJ old;
@@ -9039,7 +9142,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
                 set_text(ID_FR_NAME, name);
             }
         }
-        if (n->idFrom != ID_TAB && n->idFrom != ID_FR_LIST && !texpacks_notify(n) && !discover_notify(n) && !reports_notify(n)) {
+        if (n->idFrom != ID_TAB && n->idFrom != ID_FR_LIST && !texpacks_notify(n) && !discover_notify(n) && !reports_notify(n) &&
+            !suggestions_notify(n)) {
             const int r = mods_notify(n);
             if (r == 2 || r == 3) return r == 2;  /* (renaming a background: mods_tab.c) */
         }
@@ -9048,7 +9152,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         if (mv_command(LOWORD(wp), HIWORD(wp)) || up_command(LOWORD(wp), HIWORD(wp)) ||
             mods_command(LOWORD(wp), HIWORD(wp)) || music_command(LOWORD(wp), HIWORD(wp)) ||
-            reports_command(LOWORD(wp), HIWORD(wp)) ||
+            reports_command(LOWORD(wp), HIWORD(wp)) || suggestions_command(LOWORD(wp), HIWORD(wp)) ||
             roster_command(LOWORD(wp), HIWORD(wp)) || texpacks_command(LOWORD(wp), HIWORD(wp)) ||
             discover_command(LOWORD(wp), HIWORD(wp)) ||
             setup_command(LOWORD(wp), HIWORD(wp)))
@@ -9132,6 +9236,11 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         case ID_ON_MODS_FOLD:
             s_mods_fold = !s_mods_fold;
             online_mods_fold_apply();
+            break;
+        case ID_ON_NAT_CHECK:
+            s_mods_fold = 2;
+            online_mods_fold_apply();
+            nat_check_start();
             break;
         case ID_ON_ENABLE: case ID_ON_SHARE:
             if (HIWORD(wp) == BN_CLICKED) {
@@ -9342,6 +9451,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             SendMessageW(ctl(ID_PROGRESS), PBM_SETPOS, wp, 0);
         }
         return 0;
+    case WM_APP_NATCHECK:
+        nat_check_show();
+        return 0;
     case WM_APP_FRIENDS:
         friends_show((int)wp, (char *)lp);
         free((void *)lp);
@@ -9473,6 +9585,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_APP_REPORTS:
         reports_message(m, wp, lp);
+        return 0;
+    case WM_APP_SUGGESTIONS:
+        suggestions_message(m, wp, lp);
         return 0;
     case WM_LBUTTONDOWN: {
         const POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -9668,6 +9783,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     ULONGLONG t_shown = 0;
     const WCHAR *capture_music = NULL, *const *capture_tag = NULL, *const *capture_mods = NULL;
     int capture_mods_show = 0;
+    int capture_nat = 0;
     WCHAR **argv = CommandLineToArgvW(GetCommandLineW(), &argc), *slash, *capture_file = NULL, **capture_account = NULL;
     (void)prev; (void)cmd;
 
@@ -9813,6 +9929,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         setup_check(argv[2], s_launcher_dir, rows);
         for (k = 0; k < SETUP_N; k++)
             wprintf(L"%s: %s - %s\n", rows[k].name, state[rows[k].state], rows[k].detail);
+        return 0;
+    }
+    if (argv && argc >= 3 && !wcscmp(argv[1], L"--nat-check")) {   /* <game folder>: the Online tab's connection check */
+        WCHAR t[1400];
+        console_setup();
+        wcscpy_s(s_game_dir, MAX_PATH, argv[2]);
+        nat_check_do();
+        online_route_show();
+        nat_check_text(&s_nat_result, nat_check_port(), s_route_mapped, t, 1400);
+        wprintf(L"kind=%d step=%d shared=%d v6=%d fw=%d mapped=%d\n%s\n", s_nat_result.kind, s_nat_result.step,
+                s_nat_result.shared, s_nat_result.v6, s_nat_result.fw, s_route_mapped, t);
         return 0;
     }
     if (argv && argc >= 4 && !wcscmp(argv[1], L"--setup-install")) {   /* <game folder> <python|ffmpeg|all> --yes */
@@ -10176,7 +10303,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         return 0;
     }
     if (argv && argc >= 4 && !wcscmp(argv[1], L"--capture")) {
-        static const WCHAR *names[TAB_COUNT] = { L"play", L"settings", L"online", L"install", L"dlc", L"saves", L"paint", L"movies", L"android", L"mods", L"music", L"roster", L"texpacks", L"setup", L"discover", L"tools", L"reports" };
+        static const WCHAR *names[TAB_COUNT] = { L"play", L"settings", L"online", L"install", L"dlc", L"saves", L"paint", L"movies", L"android", L"mods", L"music", L"roster", L"texpacks", L"setup", L"discover", L"tools", L"reports", L"suggestions" };
         int i;
         const WCHAR *p = argv[2];
         /* A comma list: each tab is shown in turn (after 300 ms), the last captured. */
@@ -10215,6 +10342,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
             capture_mods = argv + 5;
         if (argc >= 6 && !wcscmp(argv[4], L"--online-mods") && !wcscmp(argv[5], L"show"))  /* (only the fold, as loaded) */
             capture_mods_show = 1;
+        /* ... --nat-check: the connection check run, its fold captured open. */
+        if (argc >= 5 && !wcscmp(argv[4], L"--nat-check"))
+            capture_nat = 1;
         /* ... --report-window <1|2>: Report a problem's window (questions / where to post) is captured instead. */
         if (argc >= 6 && !wcscmp(argv[4], L"--report-window"))
             capture_report = _wtoi(argv[5]);
@@ -10286,12 +10416,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     }
     if (capture_mods_show)
         s_mods_fold = 1;
+    if (capture_nat) {  /* (as its button does: the thread, its message; waiting here for the picture) */
+        const ULONGLONG t0 = GetTickCount64();
+        s_mods_fold = 2;
+        SendMessageW(s_wnd, WM_COMMAND, MAKEWPARAM(ID_ON_NAT_CHECK, BN_CLICKED), (LPARAM)ctl(ID_ON_NAT_CHECK));
+        while (s_nat_busy && GetTickCount64() - t0 < 20000) {
+            MSG m;
+            while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            Sleep(10);
+        }
+    }
     /* The first start (launcher.ini SetupShown): the Setup tab, what's found and what's missing. */
     if (capture_tab < 0 && !GetPrivateProfileIntW(L"Launcher", L"SetupShown", 0, s_launcher_ini)) {
         WritePrivateProfileStringW(L"Launcher", L"SetupShown", L"1", s_launcher_ini);
         capture_tab = TAB_SETUP;
     }
-    show_tab(capture_tab >= 0 ? capture_tab : (is_game_folder(s_game_dir) ? TAB_PLAY : TAB_INSTALL));
+    show_tab(capture_tab >= 0 ? capture_tab
+                             : (is_game_folder(s_game_dir) && !install_missing(s_game_dir) ? TAB_PLAY : TAB_INSTALL));
     if (capture_file) {
         /* Drawn off-screen, never activated (tests run beside the user's work). */
         SetWindowPos(s_wnd, NULL, -8000, -8000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -10392,7 +10536,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
             /* (the Online tab: until the Friends list is in, 5 s at most) */
             while (GetTickCount64() - t0 < 400 || (s_fr_busy && GetTickCount64() - t0 < 5000) ||
                    (s_cur_tab == TAB_DISCOVER && GetTickCount64() - t0 < 4000) ||   /* (its list and pictures) */
-                   (s_cur_tab == TAB_REPORTS && reports_test_state(NULL, NULL, 0) && GetTickCount64() - t0 < 10000))
+                   (s_cur_tab == TAB_REPORTS && reports_test_state(NULL, NULL, 0) && GetTickCount64() - t0 < 10000) ||
+                   (s_cur_tab == TAB_SUGGESTIONS && suggestions_test_state(NULL, NULL, 0) && GetTickCount64() - t0 < 10000))
                 while (PeekMessageW(&pm, NULL, 0, 0, PM_REMOVE)) {
                     TranslateMessage(&pm);
                     DispatchMessageW(&pm);
@@ -10412,6 +10557,40 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
             if (!_wfopen_s(&f, log, L"w, ccs=UTF-8") && f) {
                 fwprintf(f, L"reports: %d\nstatus: %s\n", n, line);
                 reports_test_dump(f);
+                fclose(f);
+            }
+        }
+        if (s_cur_tab == TAB_SUGGESTIONS) {
+            /* Suggestions: SVR2011_SUGGEST_SEND=<title>|<text>[|<picture>] sends one as the Send button does (its
+               answer waited for, 15 s at most), SVR2011_SUGGEST_PICK=<row> selects one; the list and the status line
+               in <file>.suggestions.txt */
+            WCHAR log[MAX_PATH], line[400];
+            FILE *f = NULL;
+            int n = 0;
+            const char *send = getenv("SVR2011_SUGGEST_SEND"), *pick = getenv("SVR2011_SUGGEST_PICK");
+            if (send) {
+                char buf[2000], *text, *pic;
+                WCHAR wpic[MAX_PATH] = L"";
+                ULONGLONG t1;
+                strcpy_s(buf, sizeof buf, send);
+                if ((text = strchr(buf, '|')) != NULL) *text++ = 0;
+                if (text && (pic = strchr(text, '|')) != NULL) {
+                    *pic++ = 0;
+                    MultiByteToWideChar(CP_UTF8, 0, pic, -1, wpic, MAX_PATH);
+                }
+                suggestions_test_send(buf, text ? text : "", wpic);
+                for (t1 = GetTickCount64(); suggestions_test_state(NULL, NULL, 0) && GetTickCount64() - t1 < 15000;)
+                    while (PeekMessageW(&pm, NULL, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&pm);
+                        DispatchMessageW(&pm);
+                    }
+            }
+            if (pick) suggestions_test_pick(atoi(pick));
+            suggestions_test_state(&n, line, 400);
+            swprintf_s(log, MAX_PATH, L"%s.suggestions.txt", capture_file);
+            if (!_wfopen_s(&f, log, L"w, ccs=UTF-8") && f) {
+                fwprintf(f, L"suggestions: %d\nstatus: %s\n", n, line);
+                suggestions_test_dump(f);
                 fclose(f);
             }
         }
