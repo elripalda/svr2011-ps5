@@ -1287,7 +1287,7 @@ std::set<uint16_t> LeftOutNow(const fs::path& game, const Packs& packs) {
         if (!read) {
           read = true;
           svr2011::KeepWindowAlive();
-          if (!ReadEntry(game / "pac" / svr2011::Lower(pac), type_name, blob)) blob.clear();
+          if (!ReadEntry(svr2011::HostCase(game / "pac" / svr2011::Lower(pac)), type_name, blob)) blob.clear();  // [ps5 port]
         }
         if (blob.empty()) break;
         uint32_t last = 0;
@@ -1469,11 +1469,11 @@ std::vector<DlcCopy> DlcCopies(const fs::path& dlc_root, const fs::path& overlay
   std::error_code ec;
   if (dlc_root.empty() || !fs::is_directory(dlc_root, ec)) return out;
   for (const auto& pkg : fs::directory_iterator(dlc_root, ec)) {
-    const fs::path dir = pkg.path() / "pac";
+    const fs::path dir = svr2011::HostCase(pkg.path() / "pac");  // [ps5 port] (host_case.h)
     if (!fs::is_directory(dir, ec)) continue;
     for (const auto& p : pacs) {  // (pacentry lines into the package's own files; the first package having it)
       if (!DlcEntryPac(p)) continue;
-      const fs::path f = dir / PacPath(p.substr(std::strlen(kDlcEntryPrefix)));
+      const fs::path f = svr2011::HostCase(dir / PacPath(p.substr(std::strlen(kDlcEntryPrefix))));  // [ps5 port]
       if (!fs::is_regular_file(f, ec)) continue;
       bool taken = false;
       for (const auto& c : out) taken |= c.pac == p;

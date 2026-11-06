@@ -592,7 +592,8 @@ bool Newer(const std::string& a, const std::string& b) {
 }
 
 // The Mods/ folders, one per type (as the PC launcher keeps them).
-const char* const kModFolders[] = {"Arenas", "Superstars", "Signs", "Media", "Backstage", "Moves", "MatchTypes"};
+const char* const kModFolders[] = {"Arenas", "Superstars", "Signs", "Media", "Backstage", "Moves", "MatchTypes",
+                                   "Backgrounds", "Attires", "Titles"};
 
 }  // namespace
 
@@ -1152,7 +1153,26 @@ bool InstallMod(const fs::path& game, const fs::path& svrmod, bool bundled, std:
   if (type == "signs") kind = "Signs";
   else if (type == "media") kind = "Media";
   else if (type == "matchtype") kind = "MatchTypes";
-  else if (type == "moves") {
+  else if (type == "title") kind = "Titles";  // (a championship's name, belt and pictures: title_mods.cpp)
+  else if (type == "background") {  // (main menu pictures: picture.dds or a pack's *.dds)
+    bool dds = false;
+    for (const ZipEntry& e : entries) {
+      const std::string n = Lower(e.name);
+      dds |= n.compare(0, prefix.size(), Lower(prefix)) == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, ".dds") == 0 &&
+             n.find('/', prefix.size()) == std::string::npos;
+    }
+    if (!dds) {
+      *message = "That background mod is incomplete (it has no pictures: picture.dds).";
+      return false;
+    }
+    kind = "Backgrounds";
+  } else if (type == "attire") {  // (an attire for a superstar: manifest + attire.pac)
+    if (!has("attire.pac")) {
+      *message = "That attire mod is incomplete (it needs attire.pac).";
+      return false;
+    }
+    kind = "Attires";
+  } else if (type == "moves") {
     if (!has("pack.txt")) {
       *message = "That move pack is incomplete (it needs pack.txt).";
       return false;
@@ -1206,6 +1226,9 @@ bool InstallMod(const fs::path& game, const fs::path& svrmod, bool bundled, std:
   *message = kind == "Arenas"       ? shown + " is installed: it's on the arena select pages."
              : kind == "Superstars" ? shown + " is installed: under the M tile of the character select."
              : kind == "MatchTypes" ? shown + " is installed: it's in the game's match types."
+             : kind == "Titles"     ? shown + " is installed: the title's new name, belt and picture show at the next start."
+             : kind == "Attires"    ? shown + " is installed: it's on CHANGE ATTIRE at the next start."
+             : kind == "Backgrounds" ? shown + " is installed: the main menu shows it after its own pictures."
                                     : shown + " is installed.";
   return true;
 }

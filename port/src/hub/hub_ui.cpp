@@ -77,6 +77,8 @@ std::string TypeName(const std::string& type) {
   if (type == "Backgrounds") return "Background";
   if (type == "Signs") return "Sign pack";
   if (type == "Media") return "Media pack";
+  if (type == "Titles") return "Title";
+  if (type == "Attires") return "Attire";
   return type;
 }
 
@@ -233,8 +235,8 @@ void Hub::LoadMods() {
   }
   // (superstars first, then arenas and match types: My Mods' tabs in that order)
   auto rank = [](const std::string& t) {
-    const char* order[] = {"Superstars", "Arenas", "MatchTypes", "Backgrounds", "Media", "Signs"};
-    for (int i = 0; i < 6; ++i)
+    const char* order[] = {"Superstars", "Attires", "Arenas", "MatchTypes", "Titles", "Backgrounds", "Media", "Signs"};
+    for (int i = 0; i < 8; ++i)
       if (t == order[i]) return i;
     return 9;
   };
@@ -1128,6 +1130,8 @@ TypeLook LookOf(const std::string& type) {
   if (type == "Backgrounds") return {Rgba(37, 165, 179), Rgba(11, 52, 56), kIconImage};
   if (type == "Signs") return {Rgba(47, 154, 102), Rgba(14, 51, 34), kIconImage};
   if (type == "Media") return {Rgba(226, 116, 46), Rgba(74, 26, 8), kIconMovies};
+  if (type == "Titles") return {Rgba(214, 168, 52), Rgba(66, 47, 9), kIconStar};
+  if (type == "Attires") return {Rgba(196, 72, 140), Rgba(58, 16, 40), kIconStar};
   return {Rgba(106, 109, 121), Rgba(20, 21, 25), kIconMods};
 }
 }  // namespace

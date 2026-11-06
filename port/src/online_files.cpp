@@ -672,9 +672,9 @@ const std::string& DlcSet() {
       if (!pkg.is_directory(ec)) continue;
       // (its game files: names and sizes, the pac folder's - movies, sounds and the catalog don't play)
       std::vector<std::pair<std::string, uint64_t>> files;
-      for (const auto& f : fs::recursive_directory_iterator(pkg.path() / "pac", ec)) {
+      for (const auto& f : fs::recursive_directory_iterator(svr2011::HostCase(pkg.path() / "pac"), ec)) {  // [ps5 port]
         if (!f.is_regular_file(ec)) continue;
-        std::string rel = fs::relative(f.path(), pkg.path(), ec).generic_string();
+        std::string rel = svr2011::RelativePath(f.path(), pkg.path()).generic_string();  // [ps5 port] (host_case.h)
         std::transform(rel.begin(), rel.end(), rel.begin(), [](unsigned char c) { return char(std::tolower(c)); });
         if (rel.rfind("pac/string", 0) == 0) continue;  // (PatchOnlineStrings: the wording)
         files.push_back({rel, uint64_t(f.file_size(ec))});

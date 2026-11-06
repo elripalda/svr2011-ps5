@@ -39,6 +39,7 @@
 #include "universe_welcome.h"
 #include "move_packs.h"
 #include "startup_pump.h"
+#include "host_case.h"  // [ps5 port] game files in any letter case
 
 #include <algorithm>
 #include <atomic>
@@ -1227,7 +1228,7 @@ const std::vector<std::pair<uint32_t, fs::path>>& DlcCharacterPacs() {
   listed = true;
   std::error_code ec;
   for (const auto& pkg : fs::directory_iterator(g_attire_dlc, ec))
-    for (const auto& e : fs::directory_iterator(pkg.path() / "pac" / "ch", ec)) {
+    for (const auto& e : fs::directory_iterator(svr2011::HostCase(pkg.path() / "pac" / "ch"), ec)) {  // [ps5 port]
       const std::string n = e.path().filename().string();
       unsigned id = 0, nn = 0;
       char tail[8] = {};
@@ -1249,7 +1250,7 @@ bool DlcSuperstar(uint32_t id) {
 uint32_t OwnAttires(uint32_t id, bool* gear = nullptr) {
   char stock[32];
   std::snprintf(stock, sizeof stock, "ch%03u.pac", id);
-  const fs::path disc = g_game / "pac" / "ch" / stock;
+  const fs::path disc = svr2011::HostCase(g_game / "pac" / "ch" / stock);  // [ps5 port] (host_case.h)
   uint32_t mask = id >= 100 ? AttireMask(disc, id) : 0;
   bool g = id >= 100 && ExtraKinds(disc, id);
   g_attire_disc[id] = mask;
@@ -4681,7 +4682,7 @@ void PrepareAttirePacks(const fs::path& game, const fs::path& dlc_root) {
     // the pac with that attire: the game's (pac list name ch\chNNN.pac), else a DLC package's (dlc\ch\ch<id>_dlcNN.pac:
     // move_packs' DLC copies - the package's catalogs say where the game reads it, a guest pac's same name loses)
     std::string target;
-    if (id >= 100 && (AttireMask(game / "pac" / "ch" / stock, id) >> a & 1))
+    if (id >= 100 && (AttireMask(svr2011::HostCase(game / "pac" / "ch" / stock), id) >> a & 1))  // [ps5 port]
       target = std::string("ch\\") + stock;
     else
       for (const auto& p : DlcCharacterPacs())

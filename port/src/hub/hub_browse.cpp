@@ -43,7 +43,8 @@ std::vector<std::pair<std::string, fs::path>> Places(const fs::path& game) {
 std::string TypeName(const std::string& type) {
   const std::string t = LowerCase(type);
   return t == "superstar" ? "Superstar" : t == "arena" ? "Arena" : t == "backstage" ? "Backstage" : t == "moves" ? "Move pack"
-         : t == "signs" ? "Crowd signs" : t == "media" ? "Media" : t == "matchtype" ? "Match type" : type;
+         : t == "signs" ? "Crowd signs" : t == "media" ? "Media" : t == "matchtype" ? "Match type"
+         : t == "title" ? "Title" : t == "attire" ? "Attire" : t == "background" ? "Background" : type;
 }
 
 }  // namespace
